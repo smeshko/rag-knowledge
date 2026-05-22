@@ -43,9 +43,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/rag_recipes"]
 
-[tool.uv]
-package = false
-
 [tool.ruff]
 line-length = 100
 target-version = "py312"
