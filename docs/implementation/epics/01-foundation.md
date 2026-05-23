@@ -154,13 +154,13 @@ Run the app, hit `/health`, run `alembic current` — all without errors.
 
 ---
 
-## Phase 1.4 — Developer setup (Makefile + README quickstart)
+## Phase 1.4 — Developer setup (justfile + README quickstart)
 
 **Goal**: A new developer can clone the repo and be running the backend in under five minutes with a single command.
 
 ### What to build
 
-- **`Makefile`** with targets (use `.PHONY` for all):
+- **`justfile`** with recipes:
   - `setup` — `uv sync`; copy `.env.example` to `.env` if missing; `docker compose up -d`; wait for Postgres healthy; `alembic upgrade head`
   - `dev` — runs the FastAPI app with `--reload` and (no-op until Epic 7) the `arq` worker
   - `dev-api` — only the FastAPI server
@@ -171,28 +171,28 @@ Run the app, hit `/health`, run `alembic current` — all without errors.
   - `lint` — `uv run ruff check src/ tests/ && uv run mypy src/`
   - `format` — `uv run ruff format src/ tests/`
   - `migrate` — `uv run alembic upgrade head`
-  - `migration MSG="..."` — `uv run alembic revision --autogenerate -m "$(MSG)"`
+  - `migration MSG` — `uv run alembic revision --autogenerate -m "{{MSG}}"`
   - `down` — `docker compose down`
   - `clean` — `docker compose down -v` (destructive; remove all volumes)
 - **`README.md`** quickstart section:
-  - Prerequisites (Docker, `uv` or Python 3.12+, OpenAI API key)
-  - Bootstrap: `cp .env.example .env`, fill `OPENAI_API_KEY`, then `make setup`
-  - Run: `make dev`
-  - Test: `make test`
+  - Prerequisites (Docker, `uv` or Python 3.12+, `just`, OpenAI API key)
+  - Bootstrap: `cp .env.example .env`, fill `OPENAI_API_KEY`, then `just setup`
+  - Run: `just dev`
+  - Test: `just test`
   - Pointers to `docs/architecture/` and `docs/implementation/EPICS.md`
 
 ### Acceptance criteria
 
-- [ ] `make setup` on a fresh clone brings up all services and applies migrations end-to-end
-- [ ] `make dev` runs the API at `localhost:8000`
-- [ ] `make test`, `make lint`, `make migrate` all succeed
-- [ ] `make down` stops services without removing volumes
-- [ ] `make clean` removes volumes (with a confirmation prompt if practical)
+- [ ] `just setup` on a fresh clone brings up all services and applies migrations end-to-end
+- [ ] `just dev` runs the API at `localhost:8000`
+- [ ] `just test`, `just lint`, `just migrate` all succeed
+- [ ] `just down` stops services without removing volumes
+- [ ] `just clean` removes volumes (with a confirmation prompt if practical)
 - [ ] README quickstart is accurate end-to-end (manually verified by re-cloning into a fresh directory)
 
 ### Validation
 
-On a fresh clone with an empty `.env`: copy example, set `OPENAI_API_KEY`, run `make setup`, then `make dev`, then `curl localhost:8000/api/v1/health` — all green within five minutes.
+On a fresh clone with an empty `.env`: copy example, set `OPENAI_API_KEY`, run `just setup`, then `just dev`, then `curl localhost:8000/api/v1/health` — all green within five minutes.
 
 ---
 
@@ -220,7 +220,7 @@ Doc 13 §13 originally anticipated Langfuse as "two extra containers", but Langf
   - `LANGFUSE_MINIO_ROOT_USER`, `LANGFUSE_MINIO_ROOT_PASSWORD`
   - `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_SALT`
 - **README quickstart addition**: short section on bringing up Langfuse, creating a project in the UI, and copying the resulting public/secret keys into `.env`. Note that project creation is a one-time manual step (Langfuse has no idempotent bootstrap CLI).
-- **Phase 1.4 Makefile touch-up if needed**: `make setup` already runs `docker compose up -d`, so it will bring up Langfuse automatically after this phase. Add a brief post-setup note pointing the user at `http://localhost:3000` for the manual project-creation step.
+- **Phase 1.4 justfile touch-up if needed**: `just setup` already runs `docker compose up -d`, so it will bring up Langfuse automatically after this phase. Add a brief post-setup note pointing the user at `http://localhost:3000` for the manual project-creation step.
 
 ### Acceptance criteria
 
@@ -240,8 +240,8 @@ Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3000
 ## Epic-level acceptance criteria
 
 - [ ] All five phases complete and merged
-- [ ] Fresh-clone bootstrap to a working `/health` endpoint is a single command sequence (`make setup && make dev`)
-- [ ] `make test`, `make lint`, `make migrate` all run green on the empty codebase
+- [ ] Fresh-clone bootstrap to a working `/health` endpoint is a single command sequence (`just setup && just dev`)
+- [ ] `just test`, `just lint`, `just migrate` all run green on the empty codebase
 - [ ] All services (Postgres+pgvector, Redis, Langfuse) accessible locally
 - [ ] No business logic — this is purely infrastructure
 - [ ] Status in [`EPICS.md`](../EPICS.md) updated to `Done`; Epic 2 unblocked
