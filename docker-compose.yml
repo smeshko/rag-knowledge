@@ -120,6 +120,14 @@ services:
       SALT: ${LANGFUSE_SALT}
       REDIS_HOST: redis
       REDIS_PORT: 6379
+    healthcheck:
+      # Worker exposes /api/health on port 3030 (LANGFUSE_WORKER_PORT default).
+      # 127.0.0.1 (not localhost) for the same IPv4/IPv6 reason as clickhouse.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3030/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   langfuse-web:
     image: langfuse/langfuse:3
@@ -131,7 +139,7 @@ services:
       langfuse-minio:
         condition: service_healthy
       langfuse-worker:
-        condition: service_started
+        condition: service_healthy
     # Host port 3001 (not 3000) to avoid clashing with frontend dev servers,
     # and bound to loopback because Langfuse is seeded with committed dev creds.
     ports:
