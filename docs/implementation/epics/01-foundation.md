@@ -86,32 +86,33 @@ None. This epic unblocks everything else.
 
 ---
 
-## Phase 1.2 — Docker Compose stack
+## Phase 1.2 — Docker Compose stack (Postgres + Redis)
 
-**Goal**: A single `docker compose up -d` brings up all services required for local development.
+**Goal**: A single `docker compose up -d` brings up the app's local infra — Postgres with pgvector and Redis — both healthy and reachable. The Langfuse self-hosted stack is delivered separately in [Phase 1.5](#phase-15--langfuse-self-hosted-observability-stack); see the note below.
 
 ### What to build
 
 - **`docker-compose.yml`** with services:
-  - `postgres` — image `pgvector/pgvector:pg17`, port `5432`, named volume, healthcheck on `pg_isready`, env vars for user/password/db (dev credentials, NOT production secrets)
-  - `redis` — image `redis:7-alpine`, port `6379`, healthcheck on `redis-cli ping`
-  - `langfuse-postgres`, `langfuse-clickhouse`, `langfuse-web` — per the [Langfuse self-hosting guide](https://langfuse.com/self-hosting/docker-compose); Langfuse UI exposed on port `3000`
-  - Named volumes for all stateful services
+  - `postgres` — image `pgvector/pgvector:pg17`, port `5432`, named volume `postgres-data`, healthcheck on `pg_isready`, env vars for user/password/db read from the project `.env` (dev credentials, NOT production secrets)
+  - `redis` — image `redis:7-alpine`, port `6379`, healthcheck on `redis-cli ping`, no persistence (ephemeral)
+  - A one-line TODO comment marking where the Phase 1.5 Langfuse services will slot in
 - **`.dockerignore`** to keep build context small
-- Dev credentials live in the compose file or a separate `.env.docker` — distinct from the app's `.env`
+- **`.env.example`** updated with the Postgres infra vars (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`)
+- Dev credentials live in the project's `.env` (single config surface shared with the future Python app — no separate `.env.docker`)
+
+> **Why Langfuse is split out:** doc 13 §13 originally described Langfuse self-hosting as "two extra containers", but Langfuse v3 actually requires a heavier stack (separate Langfuse Postgres, ClickHouse, S3-compatible blob storage, web, worker, plus several secrets — five+ containers). Bundling it into Phase 1.2 would have ballooned the slice; the bring-up is now Phase 1.5, after the rest of Epic 1 is in place and before Epic 1 closes.
 
 ### Acceptance criteria
 
-- [ ] `docker compose up -d` starts all services without errors
-- [ ] `docker compose ps` shows all services as healthy
-- [ ] `psql -h localhost -p 5432 -U postgres -d postgres` from the host succeeds
-- [ ] `redis-cli -h localhost ping` returns `PONG`
-- [ ] Langfuse UI is accessible at `http://localhost:3000`
-- [ ] `docker compose down -v` removes containers and volumes cleanly
+- [ ] `docker compose up -d` starts both services without errors
+- [ ] `docker compose ps` shows `postgres` and `redis` as healthy
+- [ ] `docker compose exec postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"` succeeds
+- [ ] `docker compose exec redis redis-cli ping` returns `PONG`
+- [ ] `docker compose down -v` removes containers and the `postgres-data` volume cleanly
 
 ### Validation
 
-Fresh `docker compose up -d`, wait until healthchecks pass, run the three connectivity checks above, then `docker compose down -v` to confirm clean teardown.
+Fresh `docker compose up -d`, wait until healthchecks pass, run the two connectivity checks above, then `docker compose down -v` to confirm clean teardown.
 
 ---
 
@@ -195,9 +196,50 @@ On a fresh clone with an empty `.env`: copy example, set `OPENAI_API_KEY`, run `
 
 ---
 
+## Phase 1.5 — Langfuse self-hosted observability stack
+
+**Goal**: Extend the compose stack with the Langfuse v3 self-hosted services so LLM call tracing can be wired up in a later epic. By the end of this phase, the Langfuse UI is reachable locally and a developer can create a project to obtain the `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` that the app will consume.
+
+### Background
+
+Doc 13 §13 originally anticipated Langfuse as "two extra containers", but Langfuse v3 self-hosting requires a heavier stack: a separate Langfuse Postgres (distinct from the app DB), ClickHouse for event analytics, S3-compatible blob storage (MinIO) for large payloads, a worker for background event processing, the web UI, and a handful of secrets (NextAuth, encryption, salt). Phase 1.2 was scoped to the lean app-infra stack (Postgres + Redis) so the rest of Epic 1 could move forward; Phase 1.5 picks the Langfuse work up as its own slice. Consumption of Langfuse (instrumenting LLM calls) is owned by Epic 5.
+
+### What to build
+
+- **Extend `docker-compose.yml`** with the Langfuse v3 services per the [Langfuse self-hosting guide](https://langfuse.com/self-hosting/docker-compose):
+  - `langfuse-postgres` — Langfuse's own metadata DB (separate from the app `postgres`)
+  - `langfuse-clickhouse` — event / analytics store
+  - `langfuse-minio` — S3-compatible blob storage for large payloads
+  - `langfuse-worker` — background event-processing worker
+  - `langfuse-web` — Langfuse UI on port `3000`
+  - Healthchecks on each stateful service; named volumes for `langfuse-postgres-data`, `langfuse-clickhouse-data`, `langfuse-minio-data`
+  - Replace the Phase 1.2 TODO comment with the actual services
+- **`.env.example` additions** for the Langfuse infra-only vars (the app-side `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_ENABLED` already exist from Phase 1.1):
+  - `LANGFUSE_POSTGRES_USER`, `LANGFUSE_POSTGRES_PASSWORD`, `LANGFUSE_POSTGRES_DB`
+  - `LANGFUSE_CLICKHOUSE_USER`, `LANGFUSE_CLICKHOUSE_PASSWORD`
+  - `LANGFUSE_MINIO_ROOT_USER`, `LANGFUSE_MINIO_ROOT_PASSWORD`
+  - `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_SALT`
+- **README quickstart addition**: short section on bringing up Langfuse, creating a project in the UI, and copying the resulting public/secret keys into `.env`. Note that project creation is a one-time manual step (Langfuse has no idempotent bootstrap CLI).
+- **Phase 1.4 Makefile touch-up if needed**: `make setup` already runs `docker compose up -d`, so it will bring up Langfuse automatically after this phase. Add a brief post-setup note pointing the user at `http://localhost:3000` for the manual project-creation step.
+
+### Acceptance criteria
+
+- [ ] `docker compose up -d` brings up the Langfuse services healthy alongside `postgres` and `redis`
+- [ ] `docker compose ps` shows `langfuse-postgres`, `langfuse-clickhouse`, `langfuse-minio`, `langfuse-worker`, `langfuse-web` as healthy
+- [ ] Langfuse UI is accessible at `http://localhost:3000`
+- [ ] A developer can create a Langfuse project via the UI and paste the public/secret keys into `.env`
+- [ ] `docker compose down -v` cleanly removes all Langfuse containers and named volumes
+- [ ] No app-side code changes — the Langfuse client integration is owned by Epic 5
+
+### Validation
+
+Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3000`, create a project, copy the keys into `.env`, then `docker compose down -v` to confirm clean teardown.
+
+---
+
 ## Epic-level acceptance criteria
 
-- [ ] All four phases complete and merged
+- [ ] All five phases complete and merged
 - [ ] Fresh-clone bootstrap to a working `/health` endpoint is a single command sequence (`make setup && make dev`)
 - [ ] `make test`, `make lint`, `make migrate` all run green on the empty codebase
 - [ ] All services (Postgres+pgvector, Redis, Langfuse) accessible locally
