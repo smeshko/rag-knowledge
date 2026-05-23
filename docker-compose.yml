@@ -75,10 +75,11 @@ services:
     environment:
       MINIO_ROOT_USER: ${LANGFUSE_MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_ROOT_PASSWORD}
-    # Host ports remapped off the upstream 9000/9001 defaults to avoid clashes.
+    # Host ports remapped off the upstream 9000/9001 defaults to avoid clashes,
+    # and bound to loopback because MinIO is seeded with committed dev creds.
     ports:
-      - "9090:9000"
-      - "9091:9001"
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9091:9001"
     volumes:
       - langfuse-minio-data:/data
     healthcheck:
@@ -131,9 +132,10 @@ services:
         condition: service_healthy
       langfuse-worker:
         condition: service_started
-    # Host port 3001 (not 3000) to avoid clashing with frontend dev servers.
+    # Host port 3001 (not 3000) to avoid clashing with frontend dev servers,
+    # and bound to loopback because Langfuse is seeded with committed dev creds.
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER}:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB}
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
