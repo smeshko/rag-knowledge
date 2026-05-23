@@ -198,7 +198,7 @@ On a fresh clone with an empty `.env`: copy example, set `OPENAI_API_KEY`, run `
 
 ## Phase 1.5 — Langfuse self-hosted observability stack
 
-**Goal**: Extend the compose stack with the Langfuse v3 self-hosted services so LLM call tracing can be wired up in a later epic. By the end of this phase, the Langfuse UI is reachable locally and a developer can create a project to obtain the `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` that the app will consume.
+**Goal**: Extend the compose stack with the Langfuse v3 self-hosted services so LLM call tracing can be wired up in a later epic. By the end of this phase, the Langfuse UI is reachable locally and an org / project / user / API keys are auto-provisioned on first boot via `LANGFUSE_INIT_*` env vars, so the app-side `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are already valid the moment `.env` is in place.
 
 ### Background
 
@@ -206,34 +206,35 @@ Doc 13 §13 originally anticipated Langfuse as "two extra containers", but Langf
 
 ### What to build
 
-- **Extend `docker-compose.yml`** with the Langfuse v3 services per the [Langfuse self-hosting guide](https://langfuse.com/self-hosting/docker-compose):
-  - `langfuse-postgres` — Langfuse's own metadata DB (separate from the app `postgres`)
-  - `langfuse-clickhouse` — event / analytics store
-  - `langfuse-minio` — S3-compatible blob storage for large payloads
-  - `langfuse-worker` — background event-processing worker
-  - `langfuse-web` — Langfuse UI on port `3000`
+- **Extend `docker-compose.yml`** with the Langfuse v3 services per the [Langfuse self-hosting guide](https://langfuse.com/self-hosting/docker-compose). Image tags follow the repo's major-version pin convention (matching `pgvector/pgvector:pg17` and `redis:7-alpine`):
+  - `langfuse-postgres` — Langfuse's own metadata DB on `postgres:16-alpine`, separate from the app `postgres`
+  - `langfuse-clickhouse` — event / analytics store on `clickhouse/clickhouse-server:24-alpine`
+  - `langfuse-minio` — S3-compatible blob storage on a dated MinIO release tag (e.g. `minio/minio:RELEASE.2025-04-22T22-12-26Z`)
+  - `langfuse-worker` — background event-processing worker on `langfuse/langfuse-worker:3`
+  - `langfuse-web` — Langfuse UI on `langfuse/langfuse:3`, host port `3001` → container `3000` (avoids the common clash with Next.js / Vite dev servers on `3000`; mirrors the Phase 1.2 `5433 → 5432` Postgres remap precedent)
   - Healthchecks on each stateful service; named volumes for `langfuse-postgres-data`, `langfuse-clickhouse-data`, `langfuse-minio-data`
   - Replace the Phase 1.2 TODO comment with the actual services
-- **`.env.example` additions** for the Langfuse infra-only vars (the app-side `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_ENABLED` already exist from Phase 1.1):
+- **`.env.example` additions** for the Langfuse infra vars (the app-side `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_ENABLED` already exist from Phase 1.1 with empty values — Phase 1.5 fills them in so they match the seeded project). `.env.example` ships dev-safe values for every Langfuse secret (not empty), continuing the Phase 1.4 `POSTGRES_PASSWORD=postgres` convention; the file makes clear these are local-only dev values:
   - `LANGFUSE_POSTGRES_USER`, `LANGFUSE_POSTGRES_PASSWORD`, `LANGFUSE_POSTGRES_DB`
   - `LANGFUSE_CLICKHOUSE_USER`, `LANGFUSE_CLICKHOUSE_PASSWORD`
   - `LANGFUSE_MINIO_ROOT_USER`, `LANGFUSE_MINIO_ROOT_PASSWORD`
-  - `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_SALT`
-- **README quickstart addition**: short section on bringing up Langfuse, creating a project in the UI, and copying the resulting public/secret keys into `.env`. Note that project creation is a one-time manual step (Langfuse has no idempotent bootstrap CLI).
-- **Phase 1.4 justfile touch-up if needed**: `just setup` already runs `docker compose up -d`, so it will bring up Langfuse automatically after this phase. Add a brief post-setup note pointing the user at `http://localhost:3000` for the manual project-creation step.
+  - `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_ENCRYPTION_KEY` (must be 64-char hex), `LANGFUSE_SALT`
+  - **Auto-bootstrap block** — `LANGFUSE_INIT_ORG_ID` / `_NAME`, `LANGFUSE_INIT_PROJECT_ID` / `_NAME` / `_PUBLIC_KEY` / `_SECRET_KEY`, `LANGFUSE_INIT_USER_EMAIL` / `_NAME` / `_PASSWORD`. These pre-create the org / project / user on first boot of an empty Langfuse Postgres; the resulting `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY` feed back into the app-side `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`. The bootstrap is idempotent only on emptiness — rotating these values requires `just clean` to drop `langfuse-postgres-data`.
+- **README quickstart addition**: a short note that the seeded admin credentials and auto-provisioned API keys live in `.env`, and that the UI is at `http://localhost:3001`.
+- **`just setup` tail echo**: add a one-line tail in `just setup` pointing the developer at `http://localhost:3001` with a hint that the seeded credentials are in `.env`.
 
 ### Acceptance criteria
 
 - [ ] `docker compose up -d` brings up the Langfuse services healthy alongside `postgres` and `redis`
 - [ ] `docker compose ps` shows `langfuse-postgres`, `langfuse-clickhouse`, `langfuse-minio`, `langfuse-worker`, `langfuse-web` as healthy
-- [ ] Langfuse UI is accessible at `http://localhost:3000`
-- [ ] A developer can create a Langfuse project via the UI and paste the public/secret keys into `.env`
+- [ ] Langfuse UI is reachable at `http://localhost:3001`
+- [ ] An org / project / user / API keys are auto-provisioned on first boot via `LANGFUSE_INIT_*`; `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` in `.env.example` match the seeded values
 - [ ] `docker compose down -v` cleanly removes all Langfuse containers and named volumes
 - [ ] No app-side code changes — the Langfuse client integration is owned by Epic 5
 
 ### Validation
 
-Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3000`, create a project, copy the keys into `.env`, then `docker compose down -v` to confirm clean teardown.
+Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3001`, log in with the seeded admin credentials, confirm the seeded project is present and that the keys in `.env` match the project keys in the UI, then `docker compose down -v` to confirm clean teardown.
 
 ---
 
