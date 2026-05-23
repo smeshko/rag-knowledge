@@ -8,6 +8,9 @@ setup:
     [ -f .env ] || cp .env.example .env
     docker compose up -d --wait
     uv run alembic upgrade head
+    @echo ""
+    @echo "Langfuse UI: http://localhost:3001"
+    @echo "Login:       dev@rag-recipes.local / devdevdev (seeded in .env)"
 
 # Run the API with autoreload (alias for `just dev-api`).
 dev: dev-api

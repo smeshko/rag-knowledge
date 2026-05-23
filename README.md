@@ -17,7 +17,15 @@ cp .env.example .env
 just setup
 ```
 
-`just setup` syncs dependencies, brings up Postgres + Redis (waits for healthchecks), and applies Alembic migrations.
+`just setup` syncs dependencies, brings up Postgres + Redis + the Langfuse self-hosted stack (waits for healthchecks), and applies Alembic migrations. First-time `just setup` pulls ~2 GB of images and can take several minutes; the running stack adds ~1 GB of RAM (ClickHouse + Langfuse) on top of the baseline — bump Docker Desktop's memory if needed.
+
+## Langfuse
+
+The self-hosted Langfuse UI runs at <http://localhost:3001> after `just setup`. Log in with `dev@rag-recipes.local` / `devdevdev` (seeded in `.env`).
+
+API keys are auto-provisioned via the `LANGFUSE_INIT_*` block in `.env`; the existing `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` values already match the seeded project — no copy-paste required.
+
+Re-seeding (e.g. after editing `LANGFUSE_INIT_PROJECT_*` values) requires `just clean` first: `LANGFUSE_INIT_*` only takes effect against an empty Langfuse Postgres.
 
 ## Run
 
