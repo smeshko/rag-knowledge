@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.*
+!.env.example
+data/storage/
+data/fixtures/private/
+evals/reports/
+.DS_Store

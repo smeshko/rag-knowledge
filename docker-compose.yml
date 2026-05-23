@@ -1,0 +1,35 @@
+# Local-only dev stack. Compose reads credentials from the project `.env`.
+# TODO: Langfuse stack (langfuse-postgres, langfuse-clickhouse, langfuse-web,
+# langfuse-worker, MinIO) slots in here when LLM tracing is wired up.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    # Host port 5433 (not 5432) to avoid clashing with other local Postgres
+    # instances. Container-internal port stays 5432 for in-network DSNs.
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
