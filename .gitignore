@@ -33,6 +33,6 @@ evals/reports/*
 !evals/reports/.gitkeep
 !evals/baselines/
 
-# Local planning state (create-plan skill output)
-.claude/plans/
-.pi/plans/
+# Agents
+.claude/
+.pi/
