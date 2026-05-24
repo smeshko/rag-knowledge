@@ -39,7 +39,6 @@ class ExtractionRun(Base):
     input_source_span_ids: Mapped[list[str]] = mapped_column(
         JSONB,
         nullable=False,
-        default=list,
     )
     input_hash: Mapped[str] = mapped_column(sa.Text, nullable=False)
     status: Mapped[ExtractionRunStatus] = mapped_column(

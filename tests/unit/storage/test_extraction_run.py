@@ -50,6 +50,17 @@ def test_jsonb_columns() -> None:
     assert isinstance(ExtractionRun.__table__.columns["output_json"].type, JSONB)
 
 
+def test_input_source_span_ids_has_no_default() -> None:
+    """Provenance must be supplied explicitly, not silently defaulted to [].
+
+    ExtractionRun is the canonical audit record of which source spans the
+    model saw. A default=list would let a construction bug persist a NOT NULL
+    empty array, turning missing provenance into unrecoverable data loss for
+    debugging, validation, and replay.
+    """
+    assert ExtractionRun.__table__.columns["input_source_span_ids"].default is None
+
+
 def test_nullable_columns() -> None:
     cols = ExtractionRun.__table__.columns
     assert cols["output_json"].nullable is True
