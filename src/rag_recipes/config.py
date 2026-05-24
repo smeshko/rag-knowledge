@@ -1,16 +1,15 @@
 """Application settings loaded from environment and `.env`.
 
-Required fields (`database_url`, `redis_url`, `redis_password`,
-`openai_api_key`) have no default — instantiating `Settings()` raises a
-`pydantic.ValidationError` that names the missing field if they aren't
-provided. Every other field has a documented default that mirrors
-`.env.example`.
+Required fields (`database_url`, `redis_url`, `openai_api_key`) have no
+default — instantiating `Settings()` raises a `pydantic.ValidationError`
+that names the missing field if they aren't provided. Every other field
+has a documented default that mirrors `.env.example`.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,7 +25,7 @@ class Settings(BaseSettings):
 
     database_url: str
     redis_url: str
-    redis_password: str
+    redis_password: str = ""
     openai_api_key: str
 
     llm_model: str = "gpt-4.1"
@@ -73,7 +72,13 @@ class Settings(BaseSettings):
         # Phase 1.6: catch the mismatch case (REDIS_PASSWORD updated but the
         # password in REDIS_URL drifted, or vice versa) — would otherwise pass
         # Settings load and explode with WRONGPASS at the first arq write.
-        if urlsplit(self.redis_url).password != self.redis_password:
+        # Skipped when REDIS_PASSWORD is unset so envs that authenticate via
+        # a fully-credentialed REDIS_URL alone stay supported. urlsplit keeps
+        # passwords percent-encoded, so decode before comparing.
+        if not self.redis_password:
+            return self
+        url_password = urlsplit(self.redis_url).password
+        if url_password is not None and unquote(url_password) != self.redis_password:
             raise ValueError(
                 "REDIS_URL password does not match REDIS_PASSWORD; update both in .env"
             )

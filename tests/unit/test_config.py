@@ -52,11 +52,28 @@ def test_redis_url_password_mismatch_rejected(monkeypatch: pytest.MonkeyPatch) -
         Settings(_env_file=None)
 
 
-def test_settings_fails_when_redis_password_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_redis_url_credentialed_without_redis_password_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Envs that authenticate via a fully-credentialed REDIS_URL alone (no
+    # separate REDIS_PASSWORD) must keep loading — the mismatch check is
+    # skipped when REDIS_PASSWORD is unset.
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
     monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
     monkeypatch.delenv("REDIS_PASSWORD", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    with pytest.raises(ValidationError) as excinfo:
-        Settings(_env_file=None)
-    assert "redis_password" in str(excinfo.value).lower()
+    settings = Settings(_env_file=None)
+    assert settings.redis_password == ""
+
+
+def test_redis_url_encoded_password_matches_decoded_redis_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # urlsplit keeps passwords percent-encoded; the validator must compare
+    # the decoded form against REDIS_PASSWORD to support special chars.
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "redis://:p%40ss@localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "p@ss")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    settings = Settings(_env_file=None)
+    assert settings.redis_password == "p@ss"
