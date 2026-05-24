@@ -16,6 +16,7 @@ from rag_recipes.storage.models.source_asset import SourceAsset
 
 if TYPE_CHECKING:
     from rag_recipes.storage.models.extraction_run import ExtractionRun
+    from rag_recipes.storage.models.knowledge_item import KnowledgeItem
     from rag_recipes.storage.models.source_span import SourceSpan
 
 
@@ -81,6 +82,10 @@ class Document(Base):
     )
     extraction_runs: Mapped[list[ExtractionRun]] = relationship(
         "ExtractionRun",
+        back_populates="document",
+    )
+    knowledge_items: Mapped[list[KnowledgeItem]] = relationship(
+        "KnowledgeItem",
         back_populates="document",
     )
 
