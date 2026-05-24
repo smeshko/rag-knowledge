@@ -122,8 +122,10 @@ services:
       REDIS_PORT: 6379
     healthcheck:
       # Worker exposes /api/health on port 3030 (LANGFUSE_WORKER_PORT default).
-      # 127.0.0.1 (not localhost) for the same IPv4/IPv6 reason as clickhouse.
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3030/api/health || exit 1"]
+      # Binds to the container IP only — neither localhost nor 127.0.0.1 works
+      # from inside. Resolve the bound interface at probe time (same trick as
+      # langfuse-web below).
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname -i):3030/api/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -131,14 +133,17 @@ services:
 
   langfuse-web:
     image: langfuse/langfuse:3
+    # NOTE: do NOT gate this on langfuse-worker: service_healthy. langfuse-web
+    # is the container that runs Prisma migrate deploy against langfuse-postgres
+    # on first boot; the worker polls those tables at startup and only becomes
+    # healthy after they exist. Gating web on worker deadlocks both. Upstream
+    # Langfuse compose starts web and worker in parallel for this reason.
     depends_on:
       langfuse-postgres:
         condition: service_healthy
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-minio:
-        condition: service_healthy
-      langfuse-worker:
         condition: service_healthy
     # Host port 3001 (not 3000) to avoid clashing with frontend dev servers,
     # and bound to loopback because Langfuse is seeded with committed dev creds.
