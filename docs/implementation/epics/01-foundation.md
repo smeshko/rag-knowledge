@@ -238,9 +238,47 @@ Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3001
 
 ---
 
+## Phase 1.6 — Dev-infra hardening + Langfuse ingestion smoke
+
+**Goal**: Close the two defense-in-depth gaps that the Phase 1.5 adversarial review surfaced and explicitly deferred: tighten the Phase 1.2 dev infra ports (Postgres + Redis) so they match the loopback + committed-creds posture introduced for Langfuse in 1.5, and add an end-to-end trace-ingestion smoke so `just setup` proves the observability path actually works — not just that the containers report healthy.
+
+### Background
+
+Phase 1.5's review (see `.claude/plans/epic-01-phase-1-5-langfuse/REVIEW.md`) tightened the new Langfuse + MinIO ports to `127.0.0.1` because they ship with committed dev credentials, and added a `langfuse-worker` healthcheck so `docker compose up --wait` no longer reports ready while ingestion is silently broken. Two related concerns were deferred to keep that branch focused:
+
+- `postgres` (`5433`) and `redis` (`6379`) still publish on all host interfaces with dev-default credentials, and Redis additionally has no `requirepass`. Once Langfuse rides on the same Redis for its queue/cache, anyone on the local network can flush or mutate ingestion state.
+- The `langfuse-worker` `/api/health` endpoint validates the worker process and its Postgres connection, but not the full ingestion path (Redis writes, ClickHouse writes, MinIO bucket reads). A misconfigured worker can still let traces drop silently between web → worker → ClickHouse.
+
+### What to build
+
+- **Tighten `docker-compose.yml` for the Phase 1.2 services**:
+  - Bind `postgres` host port to `127.0.0.1:5433:5432` (mirrors the Phase 1.5 Langfuse / MinIO posture).
+  - Bind `redis` host port to `127.0.0.1:6379:6379` and add a dev-safe `requirepass` (env-driven, default committed to `.env.example` in the same way as `POSTGRES_PASSWORD=postgres`).
+  - Update the app-side `REDIS_URL` in `.env.example` to include the password.
+  - Update Langfuse `langfuse-worker` / `langfuse-web` env to pass Redis auth (`REDIS_AUTH` or equivalent — see Langfuse self-hosting docs).
+- **Langfuse trace-ingestion smoke**:
+  - Add a small smoke script (e.g. `scripts/smoke_langfuse.py` or a `just smoke-langfuse` recipe) that uses the seeded `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` to submit a trace via the Python SDK, then polls the Langfuse API until the trace is visible (or fails after a short timeout with a clear error).
+  - Wire it into `just setup` (after `docker compose up -d --wait`) so a broken ingestion path fails the bootstrap rather than producing a quietly-empty UI.
+- **README quickstart update**: document the new `requirepass` value and call out that `just setup` now includes the ingestion smoke (and roughly how long it takes).
+
+### Acceptance criteria
+
+- [ ] `docker compose ps` shows `postgres` and `redis` bound to `127.0.0.1` only (`docker port` confirms no `0.0.0.0` binding).
+- [ ] `redis-cli -h 127.0.0.1 -p 6379 ping` requires `AUTH` and returns `PONG` only after authenticating with the dev password.
+- [ ] The app-side `Settings()` loads with the new `REDIS_URL` (including credentials) without raising.
+- [ ] Langfuse worker / web still reach Redis after auth is enabled (`docker compose up -d --wait` stays green).
+- [ ] `just setup` on a fresh clone submits a smoke trace and reports it as visible in Langfuse within the timeout; tearing down with `just clean` and re-running still works.
+- [ ] Killing the worker (`docker compose stop langfuse-worker`) and re-running the smoke causes a clear, actionable failure rather than a silent pass.
+
+### Validation
+
+Fresh `just clean && just setup` — confirm all infra binds to loopback, Redis requires auth, and the trace-ingestion smoke posts and verifies a trace end-to-end. Repeat with the worker stopped to confirm the smoke fails loudly.
+
+---
+
 ## Epic-level acceptance criteria
 
-- [ ] All five phases complete and merged
+- [ ] All six phases complete and merged
 - [ ] Fresh-clone bootstrap to a working `/health` endpoint is a single command sequence (`just setup && just dev`)
 - [ ] `just test`, `just lint`, `just migrate` all run green on the empty codebase
 - [ ] All services (Postgres+pgvector, Redis, Langfuse) accessible locally
