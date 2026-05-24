@@ -5,8 +5,9 @@ services:
     image: pgvector/pgvector:pg17
     # Host port 5433 (not 5432) to avoid clashing with other local Postgres
     # instances. Container-internal port stays 5432 for in-network DSNs.
+    # Loopback-only — dev credentials are committed (matches Phase 1.5 posture).
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -21,8 +22,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Loopback-only — dev credentials are committed (matches Phase 1.5 posture).
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
