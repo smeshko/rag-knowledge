@@ -17,7 +17,17 @@ cp .env.example .env
 just setup
 ```
 
-`just setup` syncs dependencies, brings up Postgres + Redis + the Langfuse self-hosted stack (waits for healthchecks), and applies Alembic migrations. First-time `just setup` pulls ~2 GB of images and can take several minutes; the running stack adds ~1 GB of RAM (ClickHouse + Langfuse) on top of the baseline — bump Docker Desktop's memory if needed.
+`just setup` syncs dependencies, brings up Postgres + Redis + the Langfuse self-hosted stack (waits for healthchecks), applies Alembic migrations, and then submits a Langfuse trace via `scripts/smoke_langfuse.py` to verify the full ingestion path (web → Redis → worker → ClickHouse). The smoke typically adds ~2–5 s on a warm stack and up to ~30 s on cold-cache first boot. First-time `just setup` pulls ~2 GB of images and can take several minutes; the running stack adds ~1 GB of RAM (ClickHouse + Langfuse) on top of the baseline — bump Docker Desktop's memory if needed.
+
+## Local infrastructure
+
+The dev compose stack publishes every service on `127.0.0.1` only — the committed dev credentials (`postgres:postgres`, `redis:redis`, `dev@rag-recipes.local`) are deliberately weak and loopback binding is what keeps them safe.
+
+- `postgres` on `127.0.0.1:5433` (user `postgres`, password `postgres`).
+- `redis` on `127.0.0.1:6379` with `requirepass`; the password is `REDIS_PASSWORD` (default `redis`) — it must also be present in the `REDIS_URL` DSN (Settings rejects a credential-less DSN).
+- Langfuse UI on `127.0.0.1:3001`; MinIO API / console on `127.0.0.1:9090` / `127.0.0.1:9091`.
+
+When upgrading an existing checkout, add `REDIS_PASSWORD=redis` to your `.env` and update `REDIS_URL` to `redis://:redis@localhost:6379/0`; `docker compose up` fails fast with `refresh your .env from .env.example` if the password is missing.
 
 ## Langfuse
 
@@ -26,6 +36,8 @@ The self-hosted Langfuse UI runs at <http://localhost:3001> after `just setup`. 
 API keys are auto-provisioned via the `LANGFUSE_INIT_*` block in `.env`; the existing `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` values already match the seeded project — no copy-paste required.
 
 Re-seeding (e.g. after editing `LANGFUSE_INIT_PROJECT_*` values) requires `just clean` first: `LANGFUSE_INIT_*` only takes effect against an empty Langfuse Postgres.
+
+`just smoke-langfuse` re-runs the bootstrap ingestion check on demand — it's the easiest way to debug a misconfigured stack without re-running the full `just setup`.
 
 ## Run
 
