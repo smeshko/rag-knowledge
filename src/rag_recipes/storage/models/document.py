@@ -15,6 +15,7 @@ from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.source_asset import SourceAsset
 
 if TYPE_CHECKING:
+    from rag_recipes.storage.models.extraction_run import ExtractionRun
     from rag_recipes.storage.models.source_span import SourceSpan
 
 
@@ -68,6 +69,10 @@ class Document(Base):
         "SourceSpan",
         back_populates="document",
         cascade="all, delete-orphan",
+    )
+    extraction_runs: Mapped[list[ExtractionRun]] = relationship(
+        "ExtractionRun",
+        back_populates="document",
     )
 
     @validates("source_type", "asset")
