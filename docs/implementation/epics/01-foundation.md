@@ -198,7 +198,7 @@ On a fresh clone with an empty `.env`: copy example, set `OPENAI_API_KEY`, run `
 
 ## Phase 1.5 — Langfuse self-hosted observability stack
 
-**Goal**: Extend the compose stack with the Langfuse v3 self-hosted services so LLM call tracing can be wired up in a later epic. By the end of this phase, the Langfuse UI is reachable locally and a developer can create a project to obtain the `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` that the app will consume.
+**Goal**: Extend the compose stack with the Langfuse v3 self-hosted services so LLM call tracing can be wired up in a later epic. By the end of this phase, the Langfuse UI is reachable locally and an org / project / user / API keys are auto-provisioned on first boot via `LANGFUSE_INIT_*` env vars, so the app-side `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are already valid the moment `.env` is in place.
 
 ### Background
 
@@ -206,40 +206,79 @@ Doc 13 §13 originally anticipated Langfuse as "two extra containers", but Langf
 
 ### What to build
 
-- **Extend `docker-compose.yml`** with the Langfuse v3 services per the [Langfuse self-hosting guide](https://langfuse.com/self-hosting/docker-compose):
-  - `langfuse-postgres` — Langfuse's own metadata DB (separate from the app `postgres`)
-  - `langfuse-clickhouse` — event / analytics store
-  - `langfuse-minio` — S3-compatible blob storage for large payloads
-  - `langfuse-worker` — background event-processing worker
-  - `langfuse-web` — Langfuse UI on port `3000`
+- **Extend `docker-compose.yml`** with the Langfuse v3 services per the [Langfuse self-hosting guide](https://langfuse.com/self-hosting/docker-compose). Image tags follow the repo's major-version pin convention (matching `pgvector/pgvector:pg17` and `redis:7-alpine`):
+  - `langfuse-postgres` — Langfuse's own metadata DB on `postgres:16-alpine`, separate from the app `postgres`
+  - `langfuse-clickhouse` — event / analytics store on `clickhouse/clickhouse-server:24-alpine`
+  - `langfuse-minio` — S3-compatible blob storage on a dated MinIO release tag (e.g. `minio/minio:RELEASE.2025-04-22T22-12-26Z`)
+  - `langfuse-worker` — background event-processing worker on `langfuse/langfuse-worker:3`
+  - `langfuse-web` — Langfuse UI on `langfuse/langfuse:3`, host port `3001` → container `3000` (avoids the common clash with Next.js / Vite dev servers on `3000`; mirrors the Phase 1.2 `5433 → 5432` Postgres remap precedent)
   - Healthchecks on each stateful service; named volumes for `langfuse-postgres-data`, `langfuse-clickhouse-data`, `langfuse-minio-data`
   - Replace the Phase 1.2 TODO comment with the actual services
-- **`.env.example` additions** for the Langfuse infra-only vars (the app-side `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_ENABLED` already exist from Phase 1.1):
+- **`.env.example` additions** for the Langfuse infra vars (the app-side `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_ENABLED` already exist from Phase 1.1 with empty values — Phase 1.5 fills them in so they match the seeded project). `.env.example` ships dev-safe values for every Langfuse secret (not empty), continuing the Phase 1.4 `POSTGRES_PASSWORD=postgres` convention; the file makes clear these are local-only dev values:
   - `LANGFUSE_POSTGRES_USER`, `LANGFUSE_POSTGRES_PASSWORD`, `LANGFUSE_POSTGRES_DB`
   - `LANGFUSE_CLICKHOUSE_USER`, `LANGFUSE_CLICKHOUSE_PASSWORD`
   - `LANGFUSE_MINIO_ROOT_USER`, `LANGFUSE_MINIO_ROOT_PASSWORD`
-  - `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_SALT`
-- **README quickstart addition**: short section on bringing up Langfuse, creating a project in the UI, and copying the resulting public/secret keys into `.env`. Note that project creation is a one-time manual step (Langfuse has no idempotent bootstrap CLI).
-- **Phase 1.4 justfile touch-up if needed**: `just setup` already runs `docker compose up -d`, so it will bring up Langfuse automatically after this phase. Add a brief post-setup note pointing the user at `http://localhost:3000` for the manual project-creation step.
+  - `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_ENCRYPTION_KEY` (must be 64-char hex), `LANGFUSE_SALT`
+  - **Auto-bootstrap block** — `LANGFUSE_INIT_ORG_ID` / `_NAME`, `LANGFUSE_INIT_PROJECT_ID` / `_NAME` / `_PUBLIC_KEY` / `_SECRET_KEY`, `LANGFUSE_INIT_USER_EMAIL` / `_NAME` / `_PASSWORD`. These pre-create the org / project / user on first boot of an empty Langfuse Postgres; the resulting `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY` feed back into the app-side `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`. The bootstrap is idempotent only on emptiness — rotating these values requires `just clean` to drop `langfuse-postgres-data`.
+- **README quickstart addition**: a short note that the seeded admin credentials and auto-provisioned API keys live in `.env`, and that the UI is at `http://localhost:3001`.
+- **`just setup` tail echo**: add a one-line tail in `just setup` pointing the developer at `http://localhost:3001` with a hint that the seeded credentials are in `.env`.
 
 ### Acceptance criteria
 
 - [ ] `docker compose up -d` brings up the Langfuse services healthy alongside `postgres` and `redis`
 - [ ] `docker compose ps` shows `langfuse-postgres`, `langfuse-clickhouse`, `langfuse-minio`, `langfuse-worker`, `langfuse-web` as healthy
-- [ ] Langfuse UI is accessible at `http://localhost:3000`
-- [ ] A developer can create a Langfuse project via the UI and paste the public/secret keys into `.env`
+- [ ] Langfuse UI is reachable at `http://localhost:3001`
+- [ ] An org / project / user / API keys are auto-provisioned on first boot via `LANGFUSE_INIT_*`; `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` in `.env.example` match the seeded values
 - [ ] `docker compose down -v` cleanly removes all Langfuse containers and named volumes
 - [ ] No app-side code changes — the Langfuse client integration is owned by Epic 5
 
 ### Validation
 
-Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3000`, create a project, copy the keys into `.env`, then `docker compose down -v` to confirm clean teardown.
+Fresh `docker compose up -d`, wait for healthchecks, open `http://localhost:3001`, log in with the seeded admin credentials, confirm the seeded project is present and that the keys in `.env` match the project keys in the UI, then `docker compose down -v` to confirm clean teardown.
+
+---
+
+## Phase 1.6 — Dev-infra hardening + Langfuse ingestion smoke
+
+**Goal**: Close the two defense-in-depth gaps that the Phase 1.5 adversarial review surfaced and explicitly deferred: tighten the Phase 1.2 dev infra ports (Postgres + Redis) so they match the loopback + committed-creds posture introduced for Langfuse in 1.5, and add an end-to-end trace-ingestion smoke so `just setup` proves the observability path actually works — not just that the containers report healthy.
+
+### Background
+
+Phase 1.5's review (see `.claude/plans/epic-01-phase-1-5-langfuse/REVIEW.md`) tightened the new Langfuse + MinIO ports to `127.0.0.1` because they ship with committed dev credentials, and added a `langfuse-worker` healthcheck so `docker compose up --wait` no longer reports ready while ingestion is silently broken. Two related concerns were deferred to keep that branch focused:
+
+- `postgres` (`5433`) and `redis` (`6379`) still publish on all host interfaces with dev-default credentials, and Redis additionally has no `requirepass`. Once Langfuse rides on the same Redis for its queue/cache, anyone on the local network can flush or mutate ingestion state.
+- The `langfuse-worker` `/api/health` endpoint validates the worker process and its Postgres connection, but not the full ingestion path (Redis writes, ClickHouse writes, MinIO bucket reads). A misconfigured worker can still let traces drop silently between web → worker → ClickHouse.
+
+### What to build
+
+- **Tighten `docker-compose.yml` for the Phase 1.2 services**:
+  - Bind `postgres` host port to `127.0.0.1:5433:5432` (mirrors the Phase 1.5 Langfuse / MinIO posture).
+  - Bind `redis` host port to `127.0.0.1:6379:6379` and add a dev-safe `requirepass` (env-driven, default committed to `.env.example` in the same way as `POSTGRES_PASSWORD=postgres`).
+  - Update the app-side `REDIS_URL` in `.env.example` to include the password.
+  - Update Langfuse `langfuse-worker` / `langfuse-web` env to pass Redis auth (`REDIS_AUTH` or equivalent — see Langfuse self-hosting docs).
+- **Langfuse trace-ingestion smoke**:
+  - Add a small smoke script (e.g. `scripts/smoke_langfuse.py` or a `just smoke-langfuse` recipe) that uses the seeded `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` to submit a trace via the Python SDK, then polls the Langfuse API until the trace is visible (or fails after a short timeout with a clear error).
+  - Wire it into `just setup` (after `docker compose up -d --wait`) so a broken ingestion path fails the bootstrap rather than producing a quietly-empty UI.
+- **README quickstart update**: document the new `requirepass` value and call out that `just setup` now includes the ingestion smoke (and roughly how long it takes).
+
+### Acceptance criteria
+
+- [ ] `docker compose ps` shows `postgres` and `redis` bound to `127.0.0.1` only (`docker port` confirms no `0.0.0.0` binding).
+- [ ] `redis-cli -h 127.0.0.1 -p 6379 ping` requires `AUTH` and returns `PONG` only after authenticating with the dev password.
+- [ ] The app-side `Settings()` loads with the new `REDIS_URL` (including credentials) without raising.
+- [ ] Langfuse worker / web still reach Redis after auth is enabled (`docker compose up -d --wait` stays green).
+- [ ] `just setup` on a fresh clone submits a smoke trace and reports it as visible in Langfuse within the timeout; tearing down with `just clean` and re-running still works.
+- [ ] Killing the worker (`docker compose stop langfuse-worker`) and re-running the smoke causes a clear, actionable failure rather than a silent pass.
+
+### Validation
+
+Fresh `just clean && just setup` — confirm all infra binds to loopback, Redis requires auth, and the trace-ingestion smoke posts and verifies a trace end-to-end. Repeat with the worker stopped to confirm the smoke fails loudly.
 
 ---
 
 ## Epic-level acceptance criteria
 
-- [ ] All five phases complete and merged
+- [ ] All six phases complete and merged
 - [ ] Fresh-clone bootstrap to a working `/health` endpoint is a single command sequence (`just setup && just dev`)
 - [ ] `just test`, `just lint`, `just migrate` all run green on the empty codebase
 - [ ] All services (Postgres+pgvector, Redis, Langfuse) accessible locally

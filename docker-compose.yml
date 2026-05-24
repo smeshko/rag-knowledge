@@ -1,6 +1,4 @@
 # Local-only dev stack. Compose reads credentials from the project `.env`.
-# TODO: Langfuse stack (langfuse-postgres, langfuse-clickhouse, langfuse-web,
-# langfuse-worker, MinIO) slots in here when LLM tracing is wired up.
 
 services:
   postgres:
@@ -31,5 +29,169 @@ services:
       timeout: 5s
       retries: 5
 
+  langfuse-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${LANGFUSE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${LANGFUSE_POSTGRES_DB}
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    environment:
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: default
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # 127.0.0.1 (not localhost) — busybox wget resolves localhost to ::1
+      # but ClickHouse binds IPv4-only by default.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  langfuse-minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # Pre-create the langfuse bucket directory before starting the server so
+    # langfuse-worker's S3 event uploads don't fail silently on a fresh volume.
+    # Matches the upstream Langfuse self-host compose pattern.
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server /data --console-address ":9001"'
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_ROOT_PASSWORD}
+    # Host ports remapped off the upstream 9000/9001 defaults to avoid clashes,
+    # and bound to loopback because MinIO is seeded with committed dev creds.
+    ports:
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9091:9001"
+    volumes:
+      - langfuse-minio-data:/data
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "mc alias set local http://localhost:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD > /dev/null 2>&1 && mc ready local"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER}:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB}
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # Single-node ClickHouse without Zookeeper — disables ON CLUSTER /
+      # ReplicatedMergeTree DDL in the Langfuse migrations.
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ROOT_USER}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      SALT: ${LANGFUSE_SALT}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    healthcheck:
+      # Worker exposes /api/health on port 3030 (LANGFUSE_WORKER_PORT default).
+      # Binds to the container IP only — neither localhost nor 127.0.0.1 works
+      # from inside. Resolve the bound interface at probe time (same trick as
+      # langfuse-web below).
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname -i):3030/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    # NOTE: do NOT gate this on langfuse-worker: service_healthy. langfuse-web
+    # is the container that runs Prisma migrate deploy against langfuse-postgres
+    # on first boot; the worker polls those tables at startup and only becomes
+    # healthy after they exist. Gating web on worker deadlocks both. Upstream
+    # Langfuse compose starts web and worker in parallel for this reason.
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    # Host port 3001 (not 3000) to avoid clashing with frontend dev servers,
+    # and bound to loopback because Langfuse is seeded with committed dev creds.
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER}:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB}
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # Single-node ClickHouse without Zookeeper — disables ON CLUSTER /
+      # ReplicatedMergeTree DDL in the Langfuse migrations.
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ROOT_USER}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      NEXTAUTH_URL: http://localhost:3001
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      SALT: ${LANGFUSE_SALT}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+    healthcheck:
+      # langfuse-web's Next.js server binds to the container IP only — neither
+      # localhost nor 127.0.0.1 works from inside. Use `hostname -i` to resolve
+      # the bound interface at probe time.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname -i):3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
 volumes:
   postgres-data:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  langfuse-minio-data:
