@@ -63,9 +63,7 @@ class Settings(BaseSettings):
         if parsed.scheme not in {"redis", "rediss"}:
             raise ValueError("REDIS_URL scheme must be redis:// or rediss://")
         if not parsed.password:
-            raise ValueError(
-                "REDIS_URL must include credentials, e.g. redis://:pwd@host:port/db"
-            )
+            raise ValueError("REDIS_URL must include credentials, e.g. redis://:pwd@host:port/db")
         return value
 
 
