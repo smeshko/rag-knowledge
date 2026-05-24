@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.source_asset import SourceAsset
 
-__all__ = ["SourceAsset"]
+__all__ = ["Document", "SourceAsset"]

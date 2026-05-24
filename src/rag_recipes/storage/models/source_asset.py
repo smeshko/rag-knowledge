@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import sqlalchemy as sa
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from rag_recipes.storage.base import Base
 from rag_recipes.storage.enums import SourceType, UploadStatus
 from rag_recipes.storage.ids import new_id
+
+if TYPE_CHECKING:
+    from rag_recipes.storage.models.document import Document
 
 
 class SourceAsset(Base):
@@ -46,4 +49,10 @@ class SourceAsset(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+    document: Mapped[Document | None] = relationship(
+        "Document",
+        uselist=False,
+        back_populates="asset",
     )
