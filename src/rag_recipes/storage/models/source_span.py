@@ -67,8 +67,9 @@ class SourceSpan(Base):
     @validates("source_type", "document")
     def _validate_source_type_matches_document(self, key: str, value: Any) -> Any:
         if key == "source_type":
+            value = None if value is None else SourceType(value)
             doc = getattr(self, "document", None)
-            if doc is not None and doc.source_type != value:
+            if doc is not None and value is not None and doc.source_type != value:
                 raise ValueError(
                     f"SourceSpan.source_type={value!r} does not match "
                     f"Document.source_type={doc.source_type!r}"

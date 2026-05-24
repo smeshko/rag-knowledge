@@ -92,8 +92,9 @@ class Document(Base):
     @validates("source_type", "asset")
     def _validate_source_type_matches_asset(self, key: str, value: Any) -> Any:
         if key == "source_type":
+            value = None if value is None else SourceType(value)
             asset = getattr(self, "asset", None)
-            if asset is not None and asset.source_type != value:
+            if asset is not None and value is not None and asset.source_type != value:
                 raise ValueError(
                     f"Document.source_type={value!r} does not match "
                     f"SourceAsset.source_type={asset.source_type!r}"
@@ -106,3 +107,7 @@ class Document(Base):
                     f"Document.source_type={current_type!r}"
                 )
         return value
+
+    @validates("status")
+    def _coerce_status(self, key: str, value: Any) -> Any:
+        return None if value is None else DocumentStatus(value)

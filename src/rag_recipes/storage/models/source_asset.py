@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import sqlalchemy as sa
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.sql import func
 
 from rag_recipes.storage.base import Base
@@ -66,3 +66,11 @@ class SourceAsset(Base):
         uselist=False,
         back_populates="asset",
     )
+
+    @validates("source_type")
+    def _coerce_source_type(self, key: str, value: Any) -> Any:
+        return None if value is None else SourceType(value)
+
+    @validates("upload_status")
+    def _coerce_upload_status(self, key: str, value: Any) -> Any:
+        return None if value is None else UploadStatus(value)

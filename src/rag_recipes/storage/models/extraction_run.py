@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.sql import func
 
 from rag_recipes.storage.base import Base
@@ -73,3 +73,7 @@ class ExtractionRun(Base):
         "KnowledgeItem",
         back_populates="extraction_run",
     )
+
+    @validates("status")
+    def _coerce_status(self, key: str, value: Any) -> Any:
+        return None if value is None else ExtractionRunStatus(value)
