@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from rag_recipes.config import get_settings
-from rag_recipes.storage.base import Base  # noqa: F401 — registers metadata
+from rag_recipes.storage.base import Base
+from rag_recipes.storage import models  # noqa: F401 — registers tables on Base.metadata
 
 config = context.config
 
