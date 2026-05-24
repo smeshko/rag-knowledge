@@ -59,8 +59,11 @@ def main() -> int:
         ) as span:
             span.update(input={"smoke": "phase-1.6"}, output={"ok": True})
         lf.flush()
-    except httpx.ConnectError:
-        print(f"Langfuse host unreachable at {host} — is the stack up? (docker compose ps)")
+    except httpx.RequestError as exc:
+        print(
+            f"Langfuse host unreachable at {host} ({type(exc).__name__}) "
+            "— is the stack up? (docker compose ps)"
+        )
         return 1
 
     api_url = f"{host}/api/public/traces/{trace_id}"
@@ -73,9 +76,13 @@ def main() -> int:
         for _ in range(POLL_TIMEOUT_S):
             try:
                 response = client.get(api_url)
-            except httpx.ConnectError:
-                print(f"Langfuse host unreachable at {host} — is the stack up? (docker compose ps)")
-                return 1
+            except httpx.RequestError as exc:
+                # Covers ConnectError, TimeoutException, ReadError, etc.
+                # Without this, a hung langfuse-web yields an unhandled
+                # traceback inside `just setup` instead of the diagnostic.
+                last_body = f"{type(exc).__name__}: {exc}"
+                time.sleep(POLL_INTERVAL_S)
+                continue
             last_status = response.status_code
             last_body = response.text[:200]
             if response.status_code == 200:
@@ -90,8 +97,9 @@ def main() -> int:
                     "don't match the seeded project"
                 )
                 return 1
-            if response.status_code != 404:
-                response.raise_for_status()
+            # 404 = trace not yet materialised, keep polling. Other statuses
+            # (5xx, unexpected 4xx) also poll — last_status/last_body surface
+            # the failing response in the post-loop diagnostic.
             time.sleep(POLL_INTERVAL_S)
 
     elapsed = time.monotonic() - started
