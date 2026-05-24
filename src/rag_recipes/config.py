@@ -9,7 +9,9 @@ has a documented default that mirrors `.env.example`.
 from __future__ import annotations
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -50,6 +52,21 @@ class Settings(BaseSettings):
     recipe_keyword_boost_title: float = 1.40
     recipe_keyword_boost_ingredients: float = 1.20
     recipe_vector_boost_summary: float = 1.20
+
+    @field_validator("redis_url")
+    @classmethod
+    def _redis_url_requires_credentials(cls, value: str) -> str:
+        # Phase 1.6: reject credential-less or non-redis DSNs so a
+        # half-migrated .env (REDIS_PASSWORD added but REDIS_URL not updated)
+        # fails at Settings load instead of silently hitting NOAUTH at runtime.
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"redis", "rediss"}:
+            raise ValueError("REDIS_URL scheme must be redis:// or rediss://")
+        if not parsed.password:
+            raise ValueError(
+                "REDIS_URL must include credentials, e.g. redis://:pwd@host:port/db"
+            )
+        return value
 
 
 @lru_cache
