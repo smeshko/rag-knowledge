@@ -60,6 +60,27 @@ def test_document_id_is_foreign_key() -> None:
     assert fks[0].target_fullname == "documents.id"
 
 
+def test_unique_constraint_on_document_version_locator() -> None:
+    """One locator per (document_id, source_version) — see doc 2 §3 + Epic 8.
+
+    Without this constraint, arq retries or concurrent ingestion runs can
+    persist duplicate page spans for the same document/version and corrupt
+    downstream extraction windows and citations.
+    """
+    from sqlalchemy import UniqueConstraint
+
+    uniques = [c for c in SourceSpan.__table__.constraints if isinstance(c, UniqueConstraint)]
+    matching = [
+        c
+        for c in uniques
+        if {col.name for col in c.columns} == {"document_id", "source_version", "locator_hash"}
+    ]
+    assert len(matching) == 1, (
+        "expected exactly one UniqueConstraint on (document_id, source_version, locator_hash)"
+    )
+    assert matching[0].name == "uq_source_spans_document_version_locator"
+
+
 def test_default_id_uses_span_prefix() -> None:
     default = SourceSpan.__table__.columns["id"].default
     assert default is not None

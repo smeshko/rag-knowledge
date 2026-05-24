@@ -18,6 +18,14 @@ from rag_recipes.storage.models.document import Document
 
 class SourceSpan(Base):
     __tablename__ = "source_spans"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "document_id",
+            "source_version",
+            "locator_hash",
+            name="uq_source_spans_document_version_locator",
+        ),
+    )
 
     ID_PREFIX: ClassVar[str] = "span"
 
