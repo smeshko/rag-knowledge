@@ -43,7 +43,12 @@ class ExtractionRun(Base):
     )
     input_hash: Mapped[str] = mapped_column(sa.Text, nullable=False)
     status: Mapped[ExtractionRunStatus] = mapped_column(
-        sa.Enum(ExtractionRunStatus, name="extraction_run_status_enum", native_enum=True),
+        sa.Enum(
+            ExtractionRunStatus,
+            name="extraction_run_status_enum",
+            native_enum=True,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
     )
     output_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

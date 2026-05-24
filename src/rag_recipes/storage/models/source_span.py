@@ -33,7 +33,12 @@ class SourceSpan(Base):
     )
     source_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
     source_type: Mapped[SourceType] = mapped_column(
-        sa.Enum(SourceType, name="source_type_enum", create_type=False),
+        sa.Enum(
+            SourceType,
+            name="source_type_enum",
+            create_type=False,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
     )
     locator: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)

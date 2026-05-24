@@ -40,13 +40,23 @@ class Document(Base):
     title: Mapped[str] = mapped_column(sa.Text, nullable=False)
     author: Mapped[str] = mapped_column(sa.Text, nullable=False)
     source_type: Mapped[SourceType] = mapped_column(
-        sa.Enum(SourceType, name="source_type_enum", create_type=False),
+        sa.Enum(
+            SourceType,
+            name="source_type_enum",
+            create_type=False,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
     )
     language: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     active_source_version: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
     status: Mapped[DocumentStatus] = mapped_column(
-        sa.Enum(DocumentStatus, name="document_status_enum", native_enum=True),
+        sa.Enum(
+            DocumentStatus,
+            name="document_status_enum",
+            native_enum=True,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(

@@ -28,7 +28,12 @@ class SourceAsset(Base):
         default=lambda: new_id(SourceAsset.ID_PREFIX),
     )
     source_type: Mapped[SourceType] = mapped_column(
-        sa.Enum(SourceType, name="source_type_enum", native_enum=True),
+        sa.Enum(
+            SourceType,
+            name="source_type_enum",
+            native_enum=True,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
     )
     original_filename: Mapped[str] = mapped_column(sa.Text, nullable=False)
@@ -36,7 +41,12 @@ class SourceAsset(Base):
     storage_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(sa.Text, nullable=False, unique=True)
     upload_status: Mapped[UploadStatus] = mapped_column(
-        sa.Enum(UploadStatus, name="upload_status_enum", native_enum=True),
+        sa.Enum(
+            UploadStatus,
+            name="upload_status_enum",
+            native_enum=True,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(
