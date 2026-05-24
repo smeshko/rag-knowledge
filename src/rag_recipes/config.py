@@ -1,9 +1,10 @@
 """Application settings loaded from environment and `.env`.
 
-Required fields (`database_url`, `redis_url`, `openai_api_key`) have no
-default — instantiating `Settings()` raises a `pydantic.ValidationError`
-that names the missing field if they aren't provided. Every other field
-has a documented default that mirrors `.env.example`.
+Required fields (`database_url`, `redis_url`, `redis_password`,
+`openai_api_key`) have no default — instantiating `Settings()` raises a
+`pydantic.ValidationError` that names the missing field if they aren't
+provided. Every other field has a documented default that mirrors
+`.env.example`.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
 
     database_url: str
     redis_url: str
+    redis_password: str
     openai_api_key: str
 
     llm_model: str = "gpt-4.1"
@@ -65,6 +67,17 @@ class Settings(BaseSettings):
         if not parsed.password:
             raise ValueError("REDIS_URL must include credentials, e.g. redis://:pwd@host:port/db")
         return value
+
+    @model_validator(mode="after")
+    def _redis_password_matches_url(self) -> Settings:
+        # Phase 1.6: catch the mismatch case (REDIS_PASSWORD updated but the
+        # password in REDIS_URL drifted, or vice versa) — would otherwise pass
+        # Settings load and explode with WRONGPASS at the first arq write.
+        if urlsplit(self.redis_url).password != self.redis_password:
+            raise ValueError(
+                "REDIS_URL password does not match REDIS_PASSWORD; update both in .env"
+            )
+        return self
 
 
 @lru_cache

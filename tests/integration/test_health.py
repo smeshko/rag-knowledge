@@ -8,6 +8,7 @@ from rag_recipes.api.app import app
 def client(monkeypatch: pytest.MonkeyPatch) -> httpx.AsyncClient:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
     monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
