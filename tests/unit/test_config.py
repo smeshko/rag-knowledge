@@ -69,11 +69,33 @@ def test_redis_url_credentialed_without_redis_password_accepted(
 def test_redis_url_encoded_password_matches_decoded_redis_password(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # urlsplit keeps passwords percent-encoded; the validator must compare
-    # the decoded form against REDIS_PASSWORD to support special chars.
+    # The redis-py URL parser decodes percent-encoded passwords; the validator
+    # must accept e.g. redis://:p%40ss@... against REDIS_PASSWORD=p@ss.
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
     monkeypatch.setenv("REDIS_URL", "redis://:p%40ss@localhost:6379/0")
     monkeypatch.setenv("REDIS_PASSWORD", "p@ss")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     settings = Settings(_env_file=None)
     assert settings.redis_password == "p@ss"
+
+
+def test_redis_url_unix_socket_with_credentials_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # redis-py accepts unix:// DSNs with the password in the query string;
+    # the validator delegates to that parser so the same forms work here.
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "unix:///tmp/redis.sock?password=redis&db=0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    settings = Settings(_env_file=None)
+    assert settings.redis_url.startswith("unix://")
+
+
+def test_redis_url_invalid_scheme_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "http://localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    with pytest.raises(ValidationError, match="not a valid Redis DSN"):
+        Settings(_env_file=None)
