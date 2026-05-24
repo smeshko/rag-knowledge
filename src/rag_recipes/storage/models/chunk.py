@@ -15,6 +15,7 @@ from rag_recipes.storage.enums import ChunkParentType, ChunkType
 from rag_recipes.storage.ids import new_id
 
 if TYPE_CHECKING:
+    from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
     from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
 
@@ -83,6 +84,10 @@ class Chunk(Base):
     knowledge_item: Mapped[KnowledgeItem] = relationship(
         "KnowledgeItem",
         back_populates="chunks",
+    )
+    embeddings: Mapped[list[ChunkEmbedding]] = relationship(
+        "ChunkEmbedding",
+        back_populates="chunk",
     )
 
     @validates("document_id", "knowledge_item")
