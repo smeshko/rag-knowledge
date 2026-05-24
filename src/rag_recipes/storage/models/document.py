@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
@@ -13,6 +13,9 @@ from rag_recipes.storage.base import Base
 from rag_recipes.storage.enums import DocumentStatus, SourceType
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.source_asset import SourceAsset
+
+if TYPE_CHECKING:
+    from rag_recipes.storage.models.source_span import SourceSpan
 
 
 class Document(Base):
@@ -60,6 +63,11 @@ class Document(Base):
     asset: Mapped[SourceAsset] = relationship(
         "SourceAsset",
         back_populates="document",
+    )
+    source_spans: Mapped[list[SourceSpan]] = relationship(
+        "SourceSpan",
+        back_populates="document",
+        cascade="all, delete-orphan",
     )
 
     @validates("source_type", "asset")
