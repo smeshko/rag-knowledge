@@ -15,6 +15,7 @@ from rag_recipes.storage.enums import KnowledgeItemStatus
 from rag_recipes.storage.ids import new_id
 
 if TYPE_CHECKING:
+    from rag_recipes.storage.models.chunk import Chunk
     from rag_recipes.storage.models.document import Document
     from rag_recipes.storage.models.extraction_run import ExtractionRun
 
@@ -81,6 +82,10 @@ class KnowledgeItem(Base):
     extraction_run: Mapped[ExtractionRun] = relationship(
         "ExtractionRun",
         back_populates="knowledge_items",
+    )
+    chunks: Mapped[list[Chunk]] = relationship(
+        "Chunk",
+        back_populates="knowledge_item",
     )
 
     @validates("status")
