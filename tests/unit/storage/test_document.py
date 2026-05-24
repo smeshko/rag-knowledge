@@ -79,6 +79,20 @@ def test_source_type_enum_reuses_existing_type() -> None:
     assert col_type.enum_class is SourceType
 
 
+def test_source_spans_relationship_does_not_delete_orphans() -> None:
+    """SourceSpan rows are immutable/append-only (doc 2 §3 + PLAN line 79).
+
+    A delete-orphan cascade would DELETE spans when they are removed from
+    Document.source_spans (e.g. a reprocess flow swapping in a new version),
+    even though ExtractionRun.input_source_span_ids still references them by
+    id in a JSONB array with no FK protection. Cascade/ON DELETE policy is
+    explicitly deferred to Phase 2.3 (PLAN line 36).
+    """
+    rel = sa.inspect(Document).relationships["source_spans"]
+    assert rel.cascade.delete_orphan is False
+    assert rel.cascade.delete is False
+
+
 def test_source_type_mismatch_after_asset_attach_raises() -> None:
     doc = Document(source_type=SourceType.PDF)
     mismatch = _make_asset()

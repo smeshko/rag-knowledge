@@ -78,7 +78,6 @@ class Document(Base):
     source_spans: Mapped[list[SourceSpan]] = relationship(
         "SourceSpan",
         back_populates="document",
-        cascade="all, delete-orphan",
     )
     extraction_runs: Mapped[list[ExtractionRun]] = relationship(
         "ExtractionRun",
