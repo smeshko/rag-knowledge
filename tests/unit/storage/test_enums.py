@@ -8,8 +8,11 @@ import sqlalchemy as sa
 
 from rag_recipes.storage.base import Base
 from rag_recipes.storage.enums import (
+    ChunkParentType,
+    ChunkType,
     DocumentStatus,
     ExtractionRunStatus,
+    KnowledgeItemStatus,
     SourceType,
     UploadStatus,
 )
@@ -61,6 +64,31 @@ def test_extraction_run_status_members() -> None:
         "failed",
         "rejected",
     }
+
+
+def test_knowledge_item_status_members() -> None:
+    assert issubclass(KnowledgeItemStatus, StrEnum)
+    assert {member.value for member in KnowledgeItemStatus} == {
+        "ready",
+        "needs_review",
+        "superseded",
+    }
+
+
+def test_chunk_type_members() -> None:
+    assert issubclass(ChunkType, StrEnum)
+    assert {member.value for member in ChunkType} == {
+        "recipe_full",
+        "recipe_title",
+        "recipe_summary",
+        "recipe_ingredients",
+        "recipe_steps",
+    }
+
+
+def test_chunk_parent_type_members() -> None:
+    assert issubclass(ChunkParentType, StrEnum)
+    assert {member.value for member in ChunkParentType} == {"knowledge_item"}
 
 
 def _column_enum(table: str, column: str) -> sa.Enum:
