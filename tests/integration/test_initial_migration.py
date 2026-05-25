@@ -48,7 +48,7 @@ EXPECTED_UNIQUES = {
     "uq_source_spans_document_version_locator",
     "uq_chunk_embeddings_chunk_provider_model",
     # Back the denormalization-enforcing composite FKs.
-    "uq_extraction_runs_id_document",
+    "uq_extraction_runs_id_document_version",
     "uq_knowledge_items_id_document",
 }
 

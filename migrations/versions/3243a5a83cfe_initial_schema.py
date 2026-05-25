@@ -83,7 +83,7 @@ def upgrade() -> None:
     sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
     sa.ForeignKeyConstraint(['document_id'], ['documents.id'], ),
     sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('id', 'document_id', name='uq_extraction_runs_id_document')
+    sa.UniqueConstraint('id', 'document_id', 'source_version', name='uq_extraction_runs_id_document_version')
     )
     op.create_table('knowledge_items',
     sa.Column('id', sa.Text(), nullable=False),
@@ -103,7 +103,7 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['document_id'], ['documents.id'], ),
     sa.ForeignKeyConstraint(['extraction_run_id'], ['extraction_runs.id'], ),
-    sa.ForeignKeyConstraint(['extraction_run_id', 'document_id'], ['extraction_runs.id', 'extraction_runs.document_id'], name='fk_knowledge_items_extraction_run_document'),
+    sa.ForeignKeyConstraint(['extraction_run_id', 'document_id', 'source_version'], ['extraction_runs.id', 'extraction_runs.document_id', 'extraction_runs.source_version'], name='fk_knowledge_items_extraction_run_document_version'),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('id', 'document_id', name='uq_knowledge_items_id_document')
     )

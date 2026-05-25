@@ -349,6 +349,46 @@ async def test_knowledge_item_document_id_mismatch_rejected(db_session: AsyncSes
     await db_session.rollback()
 
 
+async def test_knowledge_item_source_version_mismatch_rejected(db_session: AsyncSession) -> None:
+    """A KnowledgeItem whose source_version disagrees with its ExtractionRun's
+    source_version is rejected by the composite FK, even with a matching
+    document_id and extraction_run_id (doc 2: source_version is copied from the
+    accepted run)."""
+    doc = await _document_with_asset(db_session, "sv_mismatch")
+
+    run = ExtractionRun(
+        document_id=doc.id,
+        source_version=1,
+        provider="openai",
+        model="m",
+        prompt_version="v1",
+        schema_version="recipe.v1",
+        input_source_span_ids=[],
+        input_hash="in_hash",
+        status="success",
+        output_json={"items": []},
+    )
+    db_session.add(run)
+    await db_session.flush()
+
+    item = KnowledgeItem(
+        document_id=doc.id,
+        extraction_run_id=run.id,
+        source_version=2,  # disagrees with run.source_version (1)
+        item_type="recipe",
+        title="T",
+        normalized_title="t",
+        body_text="...",
+        source_span_ids=[],
+        structured_data={"schema": "recipe.v1"},
+        status="ready",
+    )
+    db_session.add(item)
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
 async def test_chunk_document_id_mismatch_rejected(db_session: AsyncSession) -> None:
     """A raw-ID write where a Chunk's document_id disagrees with its parent
     KnowledgeItem's document_id is rejected by the composite FK."""

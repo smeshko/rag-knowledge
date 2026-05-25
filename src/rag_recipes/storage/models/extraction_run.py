@@ -22,8 +22,11 @@ if TYPE_CHECKING:
 class ExtractionRun(Base):
     __tablename__ = "extraction_runs"
     __table_args__ = (
-        # Backs the composite FK from knowledge_items(extraction_run_id, document_id).
-        sa.UniqueConstraint("id", "document_id", name="uq_extraction_runs_id_document"),
+        # Backs the composite FK from
+        # knowledge_items(extraction_run_id, document_id, source_version).
+        sa.UniqueConstraint(
+            "id", "document_id", "source_version", name="uq_extraction_runs_id_document_version"
+        ),
     )
 
     ID_PREFIX: ClassVar[str] = "run"
