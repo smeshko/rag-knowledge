@@ -22,6 +22,17 @@ if TYPE_CHECKING:
 
 class KnowledgeItem(Base):
     __tablename__ = "knowledge_items"
+    __table_args__ = (
+        # Backs the composite FK from chunks(parent_id, document_id).
+        sa.UniqueConstraint("id", "document_id", name="uq_knowledge_items_id_document"),
+        # Composite FK enforces document_id agreement with the extraction run even on
+        # raw-ID writes that bypass the @validates relationship check.
+        sa.ForeignKeyConstraint(
+            ["extraction_run_id", "document_id"],
+            ["extraction_runs.id", "extraction_runs.document_id"],
+            name="fk_knowledge_items_extraction_run_document",
+        ),
+    )
 
     ID_PREFIX: ClassVar[str] = "item"
 
@@ -82,10 +93,12 @@ class KnowledgeItem(Base):
     extraction_run: Mapped[ExtractionRun] = relationship(
         "ExtractionRun",
         back_populates="knowledge_items",
+        foreign_keys="KnowledgeItem.extraction_run_id",
     )
     chunks: Mapped[list[Chunk]] = relationship(
         "Chunk",
         back_populates="knowledge_item",
+        foreign_keys="Chunk.parent_id",
     )
 
     @validates("document_id", "extraction_run")

@@ -36,12 +36,14 @@ def test_chunk_metadata_python_attribute_maps_to_metadata_column() -> None:
 
 
 def test_foreign_keys_target_documents_and_knowledge_items() -> None:
-    doc_fks = list(Chunk.__table__.columns["document_id"].foreign_keys)
-    parent_fks = list(Chunk.__table__.columns["parent_id"].foreign_keys)
-    assert len(doc_fks) == 1
-    assert doc_fks[0].target_fullname == "documents.id"
-    assert len(parent_fks) == 1
-    assert parent_fks[0].target_fullname == "knowledge_items.id"
+    doc_targets = {fk.target_fullname for fk in Chunk.__table__.columns["document_id"].foreign_keys}
+    parent_targets = {
+        fk.target_fullname for fk in Chunk.__table__.columns["parent_id"].foreign_keys
+    }
+    # document_id: single FK to documents.id + composite FK leg to knowledge_items.document_id.
+    assert doc_targets == {"documents.id", "knowledge_items.document_id"}
+    # parent_id: single FK and the composite FK leg both target knowledge_items.id.
+    assert parent_targets == {"knowledge_items.id"}
 
 
 def test_default_id_uses_chunk_prefix() -> None:

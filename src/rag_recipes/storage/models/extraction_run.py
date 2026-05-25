@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 
 class ExtractionRun(Base):
     __tablename__ = "extraction_runs"
+    __table_args__ = (
+        # Backs the composite FK from knowledge_items(extraction_run_id, document_id).
+        sa.UniqueConstraint("id", "document_id", name="uq_extraction_runs_id_document"),
+    )
 
     ID_PREFIX: ClassVar[str] = "run"
 
@@ -72,6 +76,7 @@ class ExtractionRun(Base):
     knowledge_items: Mapped[list[KnowledgeItem]] = relationship(
         "KnowledgeItem",
         back_populates="extraction_run",
+        foreign_keys="KnowledgeItem.extraction_run_id",
     )
 
     @validates("status")

@@ -82,7 +82,8 @@ def upgrade() -> None:
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
     sa.ForeignKeyConstraint(['document_id'], ['documents.id'], ),
-    sa.PrimaryKeyConstraint('id')
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('id', 'document_id', name='uq_extraction_runs_id_document')
     )
     op.create_table('knowledge_items',
     sa.Column('id', sa.Text(), nullable=False),
@@ -102,7 +103,9 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['document_id'], ['documents.id'], ),
     sa.ForeignKeyConstraint(['extraction_run_id'], ['extraction_runs.id'], ),
-    sa.PrimaryKeyConstraint('id')
+    sa.ForeignKeyConstraint(['extraction_run_id', 'document_id'], ['extraction_runs.id', 'extraction_runs.document_id'], name='fk_knowledge_items_extraction_run_document'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('id', 'document_id', name='uq_knowledge_items_id_document')
     )
     op.create_table('chunks',
     sa.Column('id', sa.Text(), nullable=False),
@@ -118,6 +121,7 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['document_id'], ['documents.id'], ),
     sa.ForeignKeyConstraint(['parent_id'], ['knowledge_items.id'], ),
+    sa.ForeignKeyConstraint(['parent_id', 'document_id'], ['knowledge_items.id', 'knowledge_items.document_id'], name='fk_chunks_parent_document'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_table('chunk_embeddings',
