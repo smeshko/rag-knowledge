@@ -1,7 +1,12 @@
 """In-memory FakeLLMProvider returning canned structured output (doc 13 § 9).
 
-Production code: canned ``output_json`` keyed on the doc 11 § 3 cache-key hash,
-a configurable technical-failure mode, and a copy-on-read call log. Honours the
+Production code: canned responses keyed on the doc 11 § 3 cache-key hash, a
+configurable technical-failure mode, and a copy-on-read call log. A canned
+response is either a bare ``output_json`` dict (clean parse — the Fake wraps it,
+echoing ``provider``/``model`` and deriving usage) or a full
+``StructuredOutputResponse``, which lets a test model the parse-failure contract
+state (``output_json=None`` + ``parse_error``, with ``raw_text`` preserved) that
+the extraction layer must distinguish from a technical failure. Honours the
 state-isolation invariant — caller-owned mutable state is deep-copied in, and
 retained mutable state is deep-copied out — so fake-backed tests stay
 order-independent and prompt/schema drift can never silently return stale output.
@@ -30,18 +35,21 @@ class FakeLLMProvider(LLMProvider):
 
     def __init__(
         self,
-        responses_by_hash: dict[str, dict[str, Any]] | None = None,
+        responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse]
+        | None = None,
         *,
         fail_technically: bool = False,
         default_usage: TokenUsage | None = None,
-        default_output: dict[str, Any] | None = None,
+        default_output: dict[str, Any] | StructuredOutputResponse | None = None,
     ) -> None:
-        self._responses_by_hash: dict[str, dict[str, Any]] = copy.deepcopy(
-            responses_by_hash or {}
+        self._responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse] = (
+            copy.deepcopy(responses_by_hash or {})
         )
         self._fail_technically = fail_technically
         self._default_usage = default_usage
-        self._default_output = copy.deepcopy(default_output)
+        self._default_output: dict[str, Any] | StructuredOutputResponse | None = (
+            copy.deepcopy(default_output)
+        )
         self._calls: list[StructuredOutputRequest] = []
 
     @staticmethod
@@ -69,15 +77,18 @@ class FakeLLMProvider(LLMProvider):
         if self._fail_technically:
             raise LLMTechnicalError("fake technical failure")
 
-        output_json = self._responses_by_hash.get(self.request_hash(request))
-        if output_json is None:
+        canned = self._responses_by_hash.get(self.request_hash(request))
+        if canned is None:
             if self._default_output is None:
                 raise LookupError(
                     f"no canned response for request_hash {self.request_hash(request)}"
                 )
-            output_json = self._default_output
+            canned = self._default_output
 
-        chosen = copy.deepcopy(output_json)
+        if isinstance(canned, StructuredOutputResponse):
+            return canned.model_copy(deep=True)
+
+        chosen = copy.deepcopy(canned)
         return StructuredOutputResponse(
             output_json=chosen,
             raw_text=json.dumps(chosen),
