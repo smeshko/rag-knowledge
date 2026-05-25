@@ -36,28 +36,37 @@ def _maintenance_dsn(test_dsn: str) -> str:
     return urlunparse(parts._replace(path="/postgres"))
 
 
-def _assert_resettable(dsn: str, db_name: str) -> None:
-    """Guard the destructive DROP DATABASE path.
+def _assert_safe_test_target(dsn: str, db_name: str) -> None:
+    """Guard every integration run against a misconfigured TEST_DATABASE_URL.
 
-    A misconfigured TEST_DATABASE_URL must never let the reset flag drop a real
-    database. Only a local, `*_test`-named database may be dropped.
+    The integration suite is destructive by design: it runs migrations, and the
+    round-trip test calls `alembic downgrade base`, which drops every table.
+    Pointing TEST_DATABASE_URL at a real database (e.g. copied from DATABASE_URL)
+    would wipe it. Refuse anything that isn't a local, `*_test`-named database, so
+    the destructive paths only ever run against a throwaway test database.
     """
+    # db_name is interpolated into CREATE/DROP DATABASE, which cannot take bind
+    # parameters for the identifier; reject anything that isn't a plain identifier.
+    if not _VALID_DB_NAME.match(db_name):
+        raise RuntimeError(f"Unsafe test database name {db_name!r} in TEST_DATABASE_URL.")
     host = (urlparse(dsn).hostname or "").lower()
     if host not in _LOCAL_HOSTS:
         raise RuntimeError(
-            f"Refusing TEST_DATABASE_RESET against non-local host {host!r}; "
-            "reset only drops databases on localhost."
+            f"Refusing to run the destructive integration suite against non-local "
+            f"host {host!r}; TEST_DATABASE_URL must point at a local database."
         )
     if not db_name.endswith("_test"):
         raise RuntimeError(
-            f"Refusing TEST_DATABASE_RESET for database {db_name!r}; "
-            "only databases whose name ends in '_test' may be dropped."
+            f"Refusing to run the destructive integration suite against database "
+            f"{db_name!r}; TEST_DATABASE_URL must name a database ending in '_test'."
         )
 
 
 @pytest.fixture(scope="session")
 def postgres_test_dsn() -> str:
     dsn = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_DSN)
+    # Fail loud before any destructive work if the target looks like a real database.
+    _assert_safe_test_target(dsn, urlparse(dsn).path.lstrip("/"))
     maintenance = _maintenance_dsn(dsn)
 
     async def _check() -> None:
@@ -77,17 +86,13 @@ def postgres_test_dsn() -> str:
 
 @pytest.fixture(scope="session")
 def create_test_database(postgres_test_dsn: str) -> str:
-    """Create rag_recipes_test on the dev cluster if absent; recreate when TEST_DATABASE_RESET=1."""
+    """Create rag_recipes_test on the dev cluster if absent; recreate when TEST_DATABASE_RESET=1.
+
+    Safety of the target DSN is enforced upstream by `postgres_test_dsn`.
+    """
     maintenance = _maintenance_dsn(postgres_test_dsn)
     db_name = urlparse(postgres_test_dsn).path.lstrip("/")
     reset = os.environ.get("TEST_DATABASE_RESET") == "1"
-
-    # db_name is interpolated into CREATE/DROP DATABASE, which cannot take bind
-    # parameters for the identifier; reject anything that isn't a plain identifier.
-    if not _VALID_DB_NAME.match(db_name):
-        raise RuntimeError(f"Unsafe test database name {db_name!r} in TEST_DATABASE_URL.")
-    if reset:
-        _assert_resettable(postgres_test_dsn, db_name)
 
     async def _ensure() -> None:
         engine = create_async_engine(maintenance, isolation_level="AUTOCOMMIT")
