@@ -116,6 +116,10 @@ Models import without errors; unit tests construct instances; pgvector type impo
     - `source_spans (document_id, source_version, locator_hash)` unique
     - `chunk_embeddings (chunk_id, embedding_provider, embedding_model)` unique
   - Adds softer constraints in application logic for now (do *not* add DB constraint for `(document_id, item_type, normalized_title, source_version)` etc. — leave that to application layer until extraction/dedup are mature)
+  - Adds **denormalization-enforcing composite FKs** to close the raw-FK-ID write gaps left by the Phase 2.2 `@validates` soft checks (which only fire on relationship assignment, not raw-ID construction):
+    - `UNIQUE(knowledge_items.id, document_id)` + composite FK `chunks(parent_id, document_id) → knowledge_items(id, document_id)` — rejects any chunk whose `document_id` disagrees with its parent item's `document_id`, regardless of construction path
+    - `UNIQUE(extraction_runs.id, document_id)` + composite FK `knowledge_items(extraction_run_id, document_id) → extraction_runs(id, document_id)` — rejects any knowledge item whose `document_id` disagrees with its extraction run's `document_id`
+    - These keep the single-column FKs (`chunks.parent_id`, `knowledge_items.extraction_run_id`) as well; the composite FKs are additive integrity, and must be dropped/replaced when non-`knowledge_item` chunk parent types land (Phase 12+)
   - Adds initial indexes:
     - `chunks(document_id)`, `chunks(parent_type, parent_id)`
     - `knowledge_items(document_id)`, `knowledge_items(status)`
@@ -129,6 +133,7 @@ Models import without errors; unit tests construct instances; pgvector type impo
 - [ ] `make migrate` on a fresh DB creates all tables with expected columns, FKs, constraints
 - [ ] `pgvector` extension installed (verifiable via `\dx` in `psql`)
 - [ ] All uniqueness constraints from doc 5 present
+- [ ] Denormalization composite FKs present and enforced: an insert with `chunks.document_id` disagreeing with its parent item's `document_id`, or `knowledge_items.document_id` disagreeing with its extraction run's `document_id`, is rejected by the DB even via raw-ID writes
 - [ ] `alembic downgrade base` cleanly removes everything
 - [ ] `alembic upgrade head` after downgrade re-creates everything identically
 - [ ] Integration test: insert sample data covering all FK relationships; FK violations rejected as expected
