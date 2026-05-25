@@ -27,7 +27,7 @@ Architecture grounding:
 |---|------|--------|--------------|--------|
 | 1 | [Foundation & Project Scaffolding](./epics/01-foundation.md) | 4 | — | Ready for dev |
 | 2 | [Data Model & Migrations](./epics/02-data-model.md) | 3 | Epic 1 | Done |
-| 3 | [Provider Interfaces & Fakes](./epics/03-provider-interfaces.md) | 2 | Epic 1 | Blocked |
+| 3 | [Provider Interfaces & Fakes](./epics/03-provider-interfaces.md) | 2 | Epic 1 | In progress |
 | 4 | [Storage & PDF Extraction](./epics/04-storage-and-pdf-extraction.md) | 2 | Epic 3 | Blocked |
 | 5 | [LLM & Embedding Providers](./epics/05-llm-and-embedding-providers.md) | 3 | Epic 3 | Blocked |
 | 6 | [Document Management API](./epics/06-document-api.md) | 3 | Epics 2, 4 | Blocked |
