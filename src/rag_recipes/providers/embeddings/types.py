@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, FiniteFloat, model_validator
 
 __all__ = ["Embedding"]
 
@@ -20,7 +20,7 @@ class Embedding(BaseModel):
     provider: str
     model: str
     dimensions: int
-    vector: list[float]
+    vector: list[FiniteFloat]
 
     @model_validator(mode="after")
     def _dimensions_match_vector(self) -> Embedding:

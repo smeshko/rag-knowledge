@@ -139,3 +139,14 @@ def test_embedding_rejects_dimension_mismatch() -> None:
             dimensions=0,
             vector=[],
         )
+
+
+def test_embedding_rejects_non_finite_components() -> None:
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            Embedding(
+                provider="openai",
+                model="text-embedding-3-small",
+                dimensions=1,
+                vector=[bad],
+            )
