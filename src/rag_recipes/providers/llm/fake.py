@@ -86,7 +86,12 @@ class FakeLLMProvider(LLMProvider):
             canned = self._default_output
 
         if isinstance(canned, StructuredOutputResponse):
-            return canned.model_copy(deep=True)
+            # Echo provider/model from the request, exactly as the dict path does,
+            # so a fixture reused across requests can't return mismatched metadata.
+            return canned.model_copy(
+                update={"provider": request.provider, "model": request.model},
+                deep=True,
+            )
 
         chosen = copy.deepcopy(canned)
         return StructuredOutputResponse(

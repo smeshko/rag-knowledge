@@ -93,6 +93,22 @@ class TestFakeLLM(LLMContract):
         assert response.provider == "openai"
         assert response.model == "gpt-4.1"
 
+    async def test_full_response_echoes_request_provider_and_model(self) -> None:
+        # A canned full response reused across requests must still report the
+        # calling request's provider/model, not whatever the fixture carried.
+        canned = StructuredOutputResponse(
+            output_json=None,
+            parse_error="bad json",
+            raw_text="{nope",
+            usage=TokenUsage(input_tokens=1, output_tokens=0),
+            provider="anthropic",
+            model="claude-3",
+        )
+        provider = FakeLLMProvider({FakeLLMProvider.request_hash(_REQUEST): canned})
+        response = await provider.generate_structured_output(_REQUEST)
+        assert response.provider == _REQUEST.provider == "openai"
+        assert response.model == _REQUEST.model == "gpt-4.1"
+
     async def test_schema_nonconforming_output_returned_verbatim(self) -> None:
         # The interface does not validate output_json against json_schema; the
         # Fake returns whatever was registered so the caller decides conformance.
