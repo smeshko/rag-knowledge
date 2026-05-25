@@ -34,11 +34,20 @@ class TokenUsage(BaseModel):
 class StructuredOutputResponse(BaseModel):
     """Result of a structured LLM generation.
 
-    ``raw_text`` is retained deliberately so the model's raw output survives a
-    structured-parse failure for debugging (doc 11 § 3).
+    A *technical* failure (transport, timeout, provider error) is raised as
+    ``LLMTechnicalError`` and never reaches this model. But un-parseable or
+    schema-non-conforming model output is **not** a technical failure — it is a
+    rejection the extraction layer decides on (doc 11 § 3). The response carries
+    that case explicitly: ``output_json`` is ``None`` when the model output could
+    not be parsed into a JSON object, and ``parse_error`` describes why. On a
+    clean parse, ``output_json`` holds the object and ``parse_error`` is ``None``.
+
+    ``raw_text`` is always retained so the model's raw output survives a parse
+    failure for debugging (doc 11 § 3).
     """
 
-    output_json: dict[str, Any]
+    output_json: dict[str, Any] | None
+    parse_error: str | None = None
     raw_text: str
     usage: TokenUsage
     provider: str

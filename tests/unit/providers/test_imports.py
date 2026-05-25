@@ -74,13 +74,23 @@ def test_llm_types_validate() -> None:
         input="...",
         json_schema={},
     )
-    StructuredOutputResponse(
+    parsed = StructuredOutputResponse(
         output_json={},
         raw_text="",
         usage=TokenUsage(input_tokens=1, output_tokens=2),
         provider="openai",
         model="gpt-4.1",
     )
+    assert parsed.parse_error is None
+    rejected = StructuredOutputResponse(
+        output_json=None,
+        parse_error="model output was not valid JSON",
+        raw_text="not json",
+        usage=TokenUsage(input_tokens=1, output_tokens=2),
+        provider="openai",
+        model="gpt-4.1",
+    )
+    assert rejected.output_json is None
 
 
 def test_embedding_validates() -> None:

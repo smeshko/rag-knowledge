@@ -14,8 +14,10 @@ class LLMProvider(ABC):
 
     Technical failures (transport, timeout, provider error) raise
     ``LLMTechnicalError`` (``providers.errors``). Schema-rejected or otherwise
-    non-conforming output is the caller's decision — the interface just returns
-    the response, including ``raw_text`` for debugging.
+    non-conforming output is the caller's decision, not a technical failure: the
+    interface returns the response with ``output_json=None`` and ``parse_error``
+    set when the output could not be parsed, always preserving ``raw_text`` for
+    debugging.
     """
 
     @abstractmethod
