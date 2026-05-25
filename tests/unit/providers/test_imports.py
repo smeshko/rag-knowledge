@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 
 import pytest
+from pydantic import ValidationError
 
 from rag_recipes.providers.embeddings.types import Embedding
 from rag_recipes.providers.file_storage.types import StoredObject
@@ -97,6 +98,23 @@ def test_embedding_validates() -> None:
     Embedding(
         provider="openai",
         model="text-embedding-3-small",
-        dimensions=1536,
-        vector=[0.1, -0.2],
+        dimensions=3,
+        vector=[0.1, -0.2, 0.3],
     )
+
+
+def test_embedding_rejects_dimension_mismatch() -> None:
+    with pytest.raises(ValidationError):
+        Embedding(
+            provider="openai",
+            model="text-embedding-3-small",
+            dimensions=1536,
+            vector=[0.1, -0.2],
+        )
+    with pytest.raises(ValidationError):
+        Embedding(
+            provider="openai",
+            model="text-embedding-3-small",
+            dimensions=0,
+            vector=[],
+        )
