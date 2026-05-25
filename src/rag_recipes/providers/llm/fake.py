@@ -46,7 +46,9 @@ class FakeLLMProvider(LLMProvider):
             copy.deepcopy(responses_by_hash or {})
         )
         self._fail_technically = fail_technically
-        self._default_usage = default_usage
+        self._default_usage = (
+            default_usage.model_copy(deep=True) if default_usage is not None else None
+        )
         self._default_output: dict[str, Any] | StructuredOutputResponse | None = (
             copy.deepcopy(default_output)
         )
@@ -94,10 +96,15 @@ class FakeLLMProvider(LLMProvider):
             )
 
         chosen = copy.deepcopy(canned)
+        usage = (
+            self._default_usage.model_copy(deep=True)
+            if self._default_usage is not None
+            else self._derive_usage(request)
+        )
         return StructuredOutputResponse(
             output_json=chosen,
             raw_text=json.dumps(chosen),
-            usage=self._default_usage or self._derive_usage(request),
+            usage=usage,
             provider=request.provider,
             model=request.model,
         )

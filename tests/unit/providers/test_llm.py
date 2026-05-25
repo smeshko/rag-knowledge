@@ -120,6 +120,24 @@ class TestFakeLLM(LLMContract):
         assert response.output_json == nonconforming
         assert response.parse_error is None
 
+    async def test_default_usage_returns_are_isolated(self) -> None:
+        # Mutating a returned usage must not poison the retained default_usage
+        # nor leak into later calls.
+        default_usage = TokenUsage(input_tokens=10, output_tokens=20)
+        provider = FakeLLMProvider(
+            {FakeLLMProvider.request_hash(_REQUEST): _OUTPUT},
+            default_usage=default_usage,
+        )
+        first = await provider.generate_structured_output(_REQUEST)
+        first.usage.input_tokens = 999
+
+        # Mutating the original constructor argument must not leak in either.
+        default_usage.output_tokens = 888
+
+        second = await provider.generate_structured_output(_REQUEST)
+        assert second.usage.input_tokens == 10
+        assert second.usage.output_tokens == 20
+
     async def test_output_json_returns_are_isolated(self) -> None:
         registered = FakeLLMProvider({FakeLLMProvider.request_hash(_REQUEST): _OUTPUT})
         response = await registered.generate_structured_output(_REQUEST)
