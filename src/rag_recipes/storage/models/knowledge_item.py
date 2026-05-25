@@ -88,6 +88,24 @@ class KnowledgeItem(Base):
         back_populates="knowledge_item",
     )
 
+    @validates("document_id", "extraction_run")
+    def _validate_document_id_matches_run(self, key: str, value: Any) -> Any:
+        if key == "document_id":
+            run = getattr(self, "extraction_run", None)
+            if run is not None and run.document_id != value:
+                raise ValueError(
+                    f"KnowledgeItem.document_id {value!r} does not match "
+                    f"ExtractionRun.document_id {run.document_id!r}"
+                )
+        else:  # key == "extraction_run"
+            current = getattr(self, "document_id", None)
+            if value is not None and current is not None and value.document_id != current:
+                raise ValueError(
+                    f"ExtractionRun.document_id {value.document_id!r} does not match "
+                    f"KnowledgeItem.document_id {current!r}"
+                )
+        return value
+
     @validates("status")
     def _coerce_status(self, key: str, value: Any) -> Any:
         return None if value is None else KnowledgeItemStatus(value)

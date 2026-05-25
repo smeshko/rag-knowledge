@@ -6,7 +6,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
-from rag_recipes.storage.models import KnowledgeItem
+from rag_recipes.storage.models import ExtractionRun, KnowledgeItem
 
 
 def test_tablename() -> None:
@@ -100,3 +100,25 @@ def test_structured_data_default_callable_returns_empty_dict() -> None:
 def test_source_span_ids_accepts_list_of_strings() -> None:
     item = KnowledgeItem(source_span_ids=["span_1", "span_2"])
     assert item.source_span_ids == ["span_1", "span_2"]
+
+
+def test_document_id_validator_raises_after_run_attached_with_mismatched_doc() -> None:
+    run = ExtractionRun(document_id="doc_A")
+    item = KnowledgeItem(document_id="doc_B")
+    with pytest.raises(ValueError, match="document_id"):
+        item.extraction_run = run
+
+
+def test_document_id_validator_raises_when_document_id_changed_after_attach() -> None:
+    run = ExtractionRun(document_id="doc_A")
+    item = KnowledgeItem(document_id="doc_A")
+    item.extraction_run = run
+    with pytest.raises(ValueError, match="document_id"):
+        item.document_id = "doc_B"
+
+
+def test_document_id_validator_matching_passes() -> None:
+    run = ExtractionRun(document_id="doc_A")
+    item = KnowledgeItem(document_id="doc_A")
+    item.extraction_run = run
+    assert item.extraction_run is run
