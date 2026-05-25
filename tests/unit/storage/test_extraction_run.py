@@ -84,16 +84,14 @@ def test_status_enum_uses_extraction_run_status_enum_type() -> None:
 
 
 def test_invalid_status_raises() -> None:
-    run = ExtractionRun(
-        source_version=1,
-        provider="openai",
-        model="gpt-4",
-        prompt_version="v1",
-        schema_version="v1",
-        input_source_span_ids=["span_x"],
-        input_hash="h",
-        status="invalid_value",  # type: ignore[arg-type]
-    )
-    col_type = ExtractionRun.__table__.columns["status"].type
-    with pytest.raises((LookupError, ValueError)):
-        col_type._object_value_for_elem(run.status)
+    with pytest.raises(ValueError):
+        ExtractionRun(
+            source_version=1,
+            provider="openai",
+            model="gpt-4",
+            prompt_version="v1",
+            schema_version="v1",
+            input_source_span_ids=["span_x"],
+            input_hash="h",
+            status="invalid_value",  # type: ignore[arg-type]
+        )

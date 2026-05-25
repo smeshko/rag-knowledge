@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.sql import func
 
 from rag_recipes.storage.base import Base
 from rag_recipes.storage.enums import ExtractionRunStatus
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
+
+if TYPE_CHECKING:
+    from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
 
 class ExtractionRun(Base):
@@ -66,3 +69,11 @@ class ExtractionRun(Base):
         "Document",
         back_populates="extraction_runs",
     )
+    knowledge_items: Mapped[list[KnowledgeItem]] = relationship(
+        "KnowledgeItem",
+        back_populates="extraction_run",
+    )
+
+    @validates("status")
+    def _coerce_status(self, key: str, value: Any) -> Any:
+        return None if value is None else ExtractionRunStatus(value)

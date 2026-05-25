@@ -129,6 +129,7 @@ Run an ingestion against a Fake LLM with canned responses for each status; asser
     - If soft validation fails: persist with `status="needs_review"`, attach warnings to a column (e.g., a new JSONB column on `knowledge_items` named `validation_warnings`, or stored in `structured_data["warnings"]` — pick one and document)
     - Otherwise: persist with `status="ready"`
     - Populate `extraction_run_id`, `source_version`, `normalized_title`, copy `structured_data` and `confidence` from the extracted output
+  - **JSONB mutation contract** (deferred here from Phase 2.2): the `knowledge_items` / `chunks` JSONB columns (`structured_data`, `confidence`, `source_span_ids`, `chunk_metadata`) are plain `JSONB` mappings, so SQLAlchemy does **not** flag in-place edits (e.g. `item.structured_data["x"] = 1`) as dirty — they silently won't persist on commit. This phase is the first write/normalization consumer, so it must pick and document one convention: either (a) reassign the whole object (`item.structured_data = {**item.structured_data, ...}`) on every edit, or (b) wrap the columns with `MutableDict`/`MutableList.as_mutable(JSONB)` in the model layer (note: `MutableDict` tracks only top-level keys, so nested `structured_data` edits still need whole-subtree reassignment). Add attribute-history/session tests proving representative edits are detected before commit.
 
 ### Acceptance criteria
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm.attributes import set_committed_value
 
 from rag_recipes.storage.enums import SourceType
 from rag_recipes.storage.models import Document, SourceSpan
@@ -91,14 +92,15 @@ def test_default_id_uses_span_prefix() -> None:
 def test_source_type_mismatch_after_doc_attach_raises() -> None:
     span = _make_span()
     doc = _make_doc()
-    doc.source_type = "_other"  # bypass enum coercion on parent
+    # Seed a sentinel via the committed state to bypass the enum coercer.
+    set_committed_value(doc, "source_type", "_other")
     with pytest.raises(ValueError, match="source_type"):
         span.document = doc
 
 
 def test_source_type_mismatch_after_source_type_change_raises() -> None:
     doc = _make_doc()
-    doc.source_type = "_other"
+    set_committed_value(doc, "source_type", "_other")
     span = SourceSpan(
         source_version=1,
         locator={"page": 1},

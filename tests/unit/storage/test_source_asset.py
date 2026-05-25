@@ -56,17 +56,20 @@ def test_upload_status_uses_native_enum() -> None:
 
 
 def test_invalid_upload_status_raises() -> None:
-    asset = SourceAsset(
-        source_type=SourceType.PDF,
-        original_filename="x.pdf",
-        storage_provider="s3",
-        storage_key="k",
-        content_hash="h",
-        upload_status="invalid_value",  # type: ignore[arg-type]
-    )
-    col_type = SourceAsset.__table__.columns["upload_status"].type
-    with pytest.raises((LookupError, ValueError)):
-        col_type._object_value_for_elem(asset.upload_status)
+    with pytest.raises(ValueError):
+        SourceAsset(
+            source_type=SourceType.PDF,
+            original_filename="x.pdf",
+            storage_provider="s3",
+            storage_key="k",
+            content_hash="h",
+            upload_status="invalid_value",  # type: ignore[arg-type]
+        )
+
+
+def test_invalid_source_type_raises() -> None:
+    with pytest.raises(ValueError):
+        SourceAsset(source_type="invalid_value")  # type: ignore[arg-type]
 
 
 def test_timestamps_have_server_defaults() -> None:

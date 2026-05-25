@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.orm.attributes import set_committed_value
 
 from rag_recipes.storage.enums import DocumentStatus, SourceType
 from rag_recipes.storage.models import Document, SourceAsset
@@ -96,14 +97,15 @@ def test_source_spans_relationship_does_not_delete_orphans() -> None:
 def test_source_type_mismatch_after_asset_attach_raises() -> None:
     doc = Document(source_type=SourceType.PDF)
     mismatch = _make_asset()
-    mismatch.source_type = "_other"  # bypass enum coercion for the validator test
+    # Seed a sentinel via the committed state to bypass the enum coercer.
+    set_committed_value(mismatch, "source_type", "_other")
     with pytest.raises(ValueError, match="source_type"):
         doc.asset = mismatch
 
 
 def test_source_type_mismatch_after_source_type_change_raises() -> None:
     asset = _make_asset()
-    asset.source_type = "_other"  # parent has a sentinel value
+    set_committed_value(asset, "source_type", "_other")
     doc = Document()
     doc.asset = asset
     with pytest.raises(ValueError, match="source_type"):

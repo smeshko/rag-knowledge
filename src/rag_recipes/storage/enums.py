@@ -35,3 +35,21 @@ class ExtractionRunStatus(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
     REJECTED = "rejected"
+
+
+class KnowledgeItemStatus(StrEnum):
+    READY = "ready"
+    NEEDS_REVIEW = "needs_review"
+    SUPERSEDED = "superseded"
+
+
+class ChunkType(StrEnum):
+    RECIPE_FULL = "recipe_full"
+    RECIPE_TITLE = "recipe_title"
+    RECIPE_SUMMARY = "recipe_summary"
+    RECIPE_INGREDIENTS = "recipe_ingredients"
+    RECIPE_STEPS = "recipe_steps"
+
+
+class ChunkParentType(StrEnum):
+    KNOWLEDGE_ITEM = "knowledge_item"
