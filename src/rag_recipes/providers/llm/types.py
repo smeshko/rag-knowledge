@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 __all__ = ["StructuredOutputRequest", "StructuredOutputResponse", "TokenUsage"]
 
@@ -52,3 +52,12 @@ class StructuredOutputResponse(BaseModel):
     usage: TokenUsage
     provider: str
     model: str
+
+    @model_validator(mode="after")
+    def _exactly_one_state(self) -> StructuredOutputResponse:
+        if self.output_json is None:
+            if not self.parse_error:
+                raise ValueError("rejected output requires a non-empty parse_error")
+        elif self.parse_error is not None:
+            raise ValueError("parsed output_json must not carry a parse_error")
+        return self

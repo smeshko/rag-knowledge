@@ -94,6 +94,27 @@ def test_llm_types_validate() -> None:
     assert rejected.output_json is None
 
 
+def test_llm_response_rejects_contradictory_states() -> None:
+    with pytest.raises(ValidationError):
+        StructuredOutputResponse(
+            output_json=None,
+            parse_error=None,
+            raw_text="",
+            usage=TokenUsage(input_tokens=1, output_tokens=2),
+            provider="openai",
+            model="gpt-4.1",
+        )
+    with pytest.raises(ValidationError):
+        StructuredOutputResponse(
+            output_json={},
+            parse_error="should not be set on a clean parse",
+            raw_text="{}",
+            usage=TokenUsage(input_tokens=1, output_tokens=2),
+            provider="openai",
+            model="gpt-4.1",
+        )
+
+
 def test_embedding_validates() -> None:
     Embedding(
         provider="openai",
