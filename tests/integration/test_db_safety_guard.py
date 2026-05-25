@@ -38,6 +38,21 @@ def test_refused_for_non_test_database_name() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql+asyncpg://postgres:postgres@/rag_recipes_test?host=db.prod.internal",
+        "postgresql+asyncpg://postgres:postgres@localhost/rag_recipes_test?port=6543",
+        "postgresql+asyncpg://postgres:postgres@/rag_recipes_test?host=staging-db&port=5432",
+    ],
+)
+def test_refused_for_query_string_host_or_port(dsn: str) -> None:
+    # asyncpg honours ?host=/?port=, which would connect off-box even though the
+    # URL host is empty/local — the guard must reject these.
+    with pytest.raises(RuntimeError, match="query parameters"):
+        _assert_safe_test_target(dsn, "rag_recipes_test")
+
+
 @pytest.mark.parametrize("bad_name", ["rag_recipes_test; DROP", "rag recipes", 'a"b', ""])
 def test_refused_for_non_identifier_database_name(bad_name: str) -> None:
     assert _VALID_DB_NAME.match(bad_name) is None

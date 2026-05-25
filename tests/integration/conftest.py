@@ -13,7 +13,7 @@ import os
 import re
 from collections.abc import AsyncIterator
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 import pytest
 import pytest_asyncio
@@ -49,6 +49,14 @@ def _assert_safe_test_target(dsn: str, db_name: str) -> None:
     # parameters for the identifier; reject anything that isn't a plain identifier.
     if not _VALID_DB_NAME.match(db_name):
         raise RuntimeError(f"Unsafe test database name {db_name!r} in TEST_DATABASE_URL.")
+    # asyncpg honours host/port given as query parameters, which would override the
+    # empty URL host and connect elsewhere — bypassing the local-host check below.
+    query = parse_qs(urlparse(dsn).query)
+    if "host" in query or "port" in query:
+        raise RuntimeError(
+            "TEST_DATABASE_URL must not set host/port via query parameters; "
+            "asyncpg would connect there, bypassing the local-host guard."
+        )
     host = (urlparse(dsn).hostname or "").lower()
     if host not in _LOCAL_HOSTS:
         raise RuntimeError(
