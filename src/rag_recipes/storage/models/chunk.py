@@ -21,6 +21,15 @@ if TYPE_CHECKING:
 
 class Chunk(Base):
     __tablename__ = "chunks"
+    __table_args__ = (
+        # Composite FK enforces document_id agreement with the parent knowledge item
+        # even on raw-ID writes that bypass the @validates relationship check.
+        sa.ForeignKeyConstraint(
+            ["parent_id", "document_id"],
+            ["knowledge_items.id", "knowledge_items.document_id"],
+            name="fk_chunks_parent_document",
+        ),
+    )
 
     ID_PREFIX: ClassVar[str] = "chunk"
 
@@ -84,6 +93,7 @@ class Chunk(Base):
     knowledge_item: Mapped[KnowledgeItem] = relationship(
         "KnowledgeItem",
         back_populates="chunks",
+        foreign_keys="Chunk.parent_id",
     )
     embeddings: Mapped[list[ChunkEmbedding]] = relationship(
         "ChunkEmbedding",

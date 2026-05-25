@@ -35,12 +35,17 @@ def test_table_columns_match_doc_2() -> None:
 
 
 def test_foreign_keys_target_documents_and_extraction_runs() -> None:
-    doc_fks = list(KnowledgeItem.__table__.columns["document_id"].foreign_keys)
-    run_fks = list(KnowledgeItem.__table__.columns["extraction_run_id"].foreign_keys)
-    assert len(doc_fks) == 1
-    assert doc_fks[0].target_fullname == "documents.id"
-    assert len(run_fks) == 1
-    assert run_fks[0].target_fullname == "extraction_runs.id"
+    doc_targets = {
+        fk.target_fullname for fk in KnowledgeItem.__table__.columns["document_id"].foreign_keys
+    }
+    run_targets = {
+        fk.target_fullname
+        for fk in KnowledgeItem.__table__.columns["extraction_run_id"].foreign_keys
+    }
+    # document_id: single FK to documents.id + composite FK leg to extraction_runs.document_id.
+    assert doc_targets == {"documents.id", "extraction_runs.document_id"}
+    # extraction_run_id: single FK and the composite FK leg both target extraction_runs.id.
+    assert run_targets == {"extraction_runs.id"}
 
 
 def test_default_id_uses_item_prefix() -> None:
