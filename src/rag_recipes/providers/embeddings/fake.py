@@ -1,9 +1,11 @@
 """Deterministic in-memory FakeEmbeddingProvider (doc 13 § 9).
 
-Production code: seeds ``random.Random`` from ``sha256(text)`` to emit
-reproducible, correctly-dimensioned vectors with no paid API call and no numpy
-dependency (see DECISIONS.md § 2) — determinism and dimensionality are all the
-contract requires of a Fake.
+Production code: seeds ``random.Random`` from ``sha256`` of the
+provider/model/dimensions/text to emit reproducible, correctly-dimensioned
+vectors with no paid API call and no numpy dependency (see DECISIONS.md § 2).
+Folding provider/model/dimensions into the seed keeps distinct embedding spaces
+distinct, so fake-backed retrieval tests can't pass while missing a
+provider/model filter.
 """
 
 from __future__ import annotations
@@ -32,7 +34,15 @@ class FakeEmbeddingProvider(EmbeddingProvider):
         self._dimensions = dimensions
 
     def _vector(self, text: str) -> list[float]:
-        seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
+        # Seed from provider/model/dimensions as well as text so distinct
+        # embedding spaces yield distinct vectors — mirroring the architecture
+        # invariant that embeddings from different provider/model spaces must
+        # never be compared, so fake-backed retrieval tests can't silently pass
+        # while missing an embedding_provider/embedding_model filter.
+        payload = "\x00".join(
+            [self._provider, self._model, str(self._dimensions), text]
+        )
+        seed = int.from_bytes(hashlib.sha256(payload.encode()).digest()[:8], "big")
         rng = random.Random(seed)
         return [rng.uniform(-1.0, 1.0) for _ in range(self._dimensions)]
 
