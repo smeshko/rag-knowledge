@@ -9,6 +9,14 @@ Keys are validated, not normalised: ``.``/``..``/empty segments are rejected so
 distinct keys never alias onto the same file. Writes are atomic (temp file in
 the destination directory + ``os.replace``) so a concurrent reader never sees a
 partial value; crash durability is out of scope (see plan DECISIONS.md § 3).
+
+Security boundary: ``root_path`` must be a private directory owned exclusively
+by the application, with OS permissions denying writes to untrusted processes.
+The provider rejects statically-planted symlinks under the root, but path
+operations are check-then-use, so an external process actively racing to swap a
+parent directory for a symlink between the check and the I/O is *not* defended
+against — that adversary already has write access to the private root and is
+out of scope for the local MVP backend.
 """
 
 from __future__ import annotations
@@ -62,12 +70,20 @@ class LocalFileStorage(FileStorageProvider):
         any link closes that aliasing/escape path. Missing components are not
         symlinks, so this is safe to call before ``put_object`` creates parents.
         Run inside the I/O worker to keep the check-to-use window minimal.
+
+        Non-missing ``lstat`` failures (e.g. ``PermissionError``) are wrapped in
+        ``FileStorageError`` so a degraded filesystem never leaks a raw
+        ``OSError`` through the provider contract.
         """
         current = path
         while current != self._root_path:
             if current == current.parent:
                 raise FileStorageError(f"storage key {key!r} escapes the storage root")
-            if current.is_symlink():
+            try:
+                is_link = current.is_symlink()
+            except OSError as exc:
+                raise FileStorageError(f"failed to validate storage key {key!r}") from exc
+            if is_link:
                 raise FileStorageError(f"storage key {key!r} resolves through a symlink")
             current = current.parent
 

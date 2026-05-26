@@ -82,6 +82,24 @@ async def test_symlinked_dir_component_cannot_escape_root(tmp_path: Path) -> Non
     assert not (outside / "file").exists()
 
 
+async def test_lstat_failure_surfaces_as_file_storage_error(
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(_self: Path) -> bool:
+        raise PermissionError("injected lstat failure")
+
+    monkeypatch.setattr(Path, "is_symlink", boom)
+
+    with pytest.raises(FileStorageError):
+        await storage.exists("k")
+    with pytest.raises(FileStorageError):
+        await storage.delete_object("k")
+    with pytest.raises(FileStorageError):
+        await storage.get_object("k")
+    with pytest.raises(FileStorageError):
+        await storage.put_object("k", b"x", "text/plain")
+
+
 async def test_prefix_is_not_an_object(storage: LocalFileStorage) -> None:
     await storage.put_object("a/b/c.pdf", b"payload", "application/pdf")
 
