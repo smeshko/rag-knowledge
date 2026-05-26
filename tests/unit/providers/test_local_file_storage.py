@@ -49,6 +49,39 @@ async def test_rejects_empty_and_dot_keys(storage: LocalFileStorage, key: str) -
         await storage.put_object(key, b"x", "text/plain")
 
 
+async def test_symlink_key_cannot_alias_another_object(storage: LocalFileStorage) -> None:
+    await storage.put_object("k", b"secret", "text/plain")
+    root = storage._root_path
+    (root / "link").symlink_to(root / "k")
+
+    with pytest.raises(FileStorageError):
+        await storage.get_object("link")
+    with pytest.raises(FileStorageError):
+        await storage.put_object("link", b"overwrite", "text/plain")
+    with pytest.raises(FileStorageError):
+        await storage.delete_object("link")
+    with pytest.raises(FileStorageError):
+        await storage.exists("link")
+
+    # The aliased object is untouched.
+    assert await storage.get_object("k") == b"secret"
+
+
+async def test_symlinked_dir_component_cannot_escape_root(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    storage = LocalFileStorage(root)
+    (root / "sub").symlink_to(outside)
+
+    with pytest.raises(FileStorageError):
+        await storage.put_object("sub/file", b"x", "text/plain")
+    with pytest.raises(FileStorageError):
+        await storage.get_object("sub/file")
+    assert not (outside / "file").exists()
+
+
 async def test_prefix_is_not_an_object(storage: LocalFileStorage) -> None:
     await storage.put_object("a/b/c.pdf", b"payload", "application/pdf")
 

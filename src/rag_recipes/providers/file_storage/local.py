@@ -34,10 +34,15 @@ class LocalFileStorage(FileStorageProvider):
         self._root_path = root_path
 
     def _resolve(self, key: str) -> Path:
-        """Validate ``key`` and return the absolute path it maps to under root.
+        """Validate ``key`` and return the lexical path it maps to under root.
 
         Rejects empty, absolute, empty-segment, and any ``.``/``..`` segment
-        keys, then confirms the joined path stays under ``root_path``.
+        keys, then assembles the path lexically from ``root_path``. The path is
+        *not* run through ``Path.resolve()``: resolving would follow symlinks
+        and let one key alias onto another object's bytes. Because no segment is
+        ``..``/``.``/empty, the lexical join is guaranteed to stay under
+        ``root_path``; symlink components are rejected at I/O time in
+        ``_verify_no_symlink``.
         """
         if not key or key.startswith("/"):
             raise FileStorageError(f"invalid storage key {key!r}")
@@ -45,16 +50,32 @@ class LocalFileStorage(FileStorageProvider):
         if any(seg in ("", ".", "..") for seg in segments):
             raise FileStorageError(f"invalid storage key {key!r}")
 
-        root = self._root_path.resolve()
-        path = (root / key).resolve()
-        if path != root and root not in path.parents:
-            raise FileStorageError(f"storage key {key!r} escapes the storage root")
-        return path
+        return self._root_path.joinpath(*segments)
+
+    def _verify_no_symlink(self, key: str, path: Path) -> None:
+        """Reject if any component between ``root_path`` and ``path`` is a symlink.
+
+        Resolving keys lexically keeps distinct keys from aliasing, but
+        ``open``/``stat``/``unlink`` still follow a symlink planted inside the
+        root by an external actor (restore, manual ops). Walking the components
+        with ``is_symlink`` (an ``lstat``, which does not follow) and rejecting
+        any link closes that aliasing/escape path. Missing components are not
+        symlinks, so this is safe to call before ``put_object`` creates parents.
+        Run inside the I/O worker to keep the check-to-use window minimal.
+        """
+        current = path
+        while current != self._root_path:
+            if current == current.parent:
+                raise FileStorageError(f"storage key {key!r} escapes the storage root")
+            if current.is_symlink():
+                raise FileStorageError(f"storage key {key!r} resolves through a symlink")
+            current = current.parent
 
     async def put_object(self, key: str, data: bytes, content_type: str) -> StoredObject:
         path = self._resolve(key)
 
         def _write() -> None:
+            self._verify_no_symlink(key, path)
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
             try:
@@ -84,6 +105,7 @@ class LocalFileStorage(FileStorageProvider):
         path = self._resolve(key)
 
         def _read() -> bytes:
+            self._verify_no_symlink(key, path)
             if not path.is_file():
                 raise FileStorageError(f"no object stored under key {key!r}")
             return path.read_bytes()
@@ -97,6 +119,7 @@ class LocalFileStorage(FileStorageProvider):
         path = self._resolve(key)
 
         def _exists() -> bool:
+            self._verify_no_symlink(key, path)
             try:
                 return stat.S_ISREG(os.stat(path).st_mode)
             except (FileNotFoundError, NotADirectoryError):
@@ -110,6 +133,7 @@ class LocalFileStorage(FileStorageProvider):
         path = self._resolve(key)
 
         def _delete() -> None:
+            self._verify_no_symlink(key, path)
             try:
                 if not stat.S_ISREG(os.stat(path).st_mode):
                     return
