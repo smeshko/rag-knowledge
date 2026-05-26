@@ -49,7 +49,9 @@ def build() -> bytes:
             }
         )
         doc.xref_set_key(-1, "ID", f"[<{_FIXED_ID.hex()}><{_FIXED_ID.hex()}>]")
-        return doc.tobytes(garbage=4, deflate=True)
+        # no_new_id keeps the pinned /ID above; without it MuPDF regenerates the
+        # trailer's second ID element randomly on every save, breaking determinism.
+        return doc.tobytes(garbage=4, deflate=True, no_new_id=True)
     finally:
         doc.close()
 
