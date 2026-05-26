@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -94,13 +95,28 @@ class LocalFileStorage(FileStorageProvider):
 
     async def exists(self, key: str) -> bool:
         path = self._resolve(key)
-        return await asyncio.to_thread(path.is_file)
+
+        def _exists() -> bool:
+            try:
+                return stat.S_ISREG(os.stat(path).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            except OSError as exc:
+                raise FileStorageError(f"failed to stat object under key {key!r}") from exc
+
+        return await asyncio.to_thread(_exists)
 
     async def delete_object(self, key: str) -> None:
         path = self._resolve(key)
 
         def _delete() -> None:
-            if path.is_file():
-                path.unlink()
+            try:
+                if not stat.S_ISREG(os.stat(path).st_mode):
+                    return
+                os.unlink(path)
+            except (FileNotFoundError, NotADirectoryError):
+                return
+            except OSError as exc:
+                raise FileStorageError(f"failed to delete object under key {key!r}") from exc
 
         await asyncio.to_thread(_delete)
