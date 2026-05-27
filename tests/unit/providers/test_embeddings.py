@@ -41,6 +41,7 @@ def _deterministic_vector(text: str, dimensions: int) -> list[float]:
 
 @dataclass
 class _FakeDatum:
+    index: int
     embedding: list[float]
 
 
@@ -61,8 +62,27 @@ class _FakeEmbeddings:
             raise self._error
         inputs: list[str] = list(kwargs["input"])
         return _FakeEmbeddingResponse(
-            data=[_FakeDatum(_deterministic_vector(text, self._dimensions)) for text in inputs]
+            data=[
+                _FakeDatum(i, _deterministic_vector(text, self._dimensions))
+                for i, text in enumerate(inputs)
+            ]
         )
+
+
+class _StubbedEmbeddings(_FakeEmbeddings):
+    """Returns caller-supplied response data verbatim, ignoring input order.
+
+    Lets tests force out-of-order, duplicate, or missing ``index`` values to
+    exercise the provider's index-based re-mapping and validation.
+    """
+
+    def __init__(self, dimensions: int, data: list[_FakeDatum]) -> None:
+        super().__init__(dimensions)
+        self._data = data
+
+    async def create(self, **kwargs: Any) -> _FakeEmbeddingResponse:
+        self.calls.append(kwargs)
+        return _FakeEmbeddingResponse(data=list(self._data))
 
 
 @dataclass
@@ -178,6 +198,44 @@ async def test_embed_batch_preserves_order_and_chunks() -> None:
         assert len(call["input"]) <= 2
         assert "" not in call["input"]
         assert "   " not in call["input"]
+
+
+async def test_embed_batch_maps_by_response_index_not_position() -> None:
+    # Response data arrives in reverse order but carries correct indexes; the
+    # provider must re-map by index, not trust list position.
+    texts = ["a", "b", "c"]
+    shuffled = [
+        _FakeDatum(2, _deterministic_vector("c", _DIMENSIONS)),
+        _FakeDatum(0, _deterministic_vector("a", _DIMENSIONS)),
+        _FakeDatum(1, _deterministic_vector("b", _DIMENSIONS)),
+    ]
+    fake = _FakeAsyncClient(embeddings=_StubbedEmbeddings(_DIMENSIONS, shuffled))
+    provider = _provider(fake=fake)
+    batch = await provider.embed_batch(texts)
+
+    for i, text in enumerate(texts):
+        assert batch[i].vector == _deterministic_vector(text, _DIMENSIONS)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(
+            [_FakeDatum(0, [0.0] * _DIMENSIONS), _FakeDatum(0, [0.0] * _DIMENSIONS)],
+            id="duplicate-index",
+        ),
+        pytest.param([_FakeDatum(0, [0.0] * _DIMENSIONS)], id="missing-index"),
+        pytest.param(
+            [_FakeDatum(0, [0.0] * _DIMENSIONS), _FakeDatum(5, [0.0] * _DIMENSIONS)],
+            id="out-of-range-index",
+        ),
+    ],
+)
+async def test_embed_chunk_rejects_malformed_indexes(data: list[_FakeDatum]) -> None:
+    fake = _FakeAsyncClient(embeddings=_StubbedEmbeddings(_DIMENSIONS, data))
+    provider = _provider(fake=fake)
+    with pytest.raises(EmbeddingTechnicalError):
+        await provider.embed_batch(["a", "b"])
 
 
 @pytest.mark.parametrize("error", _TECHNICAL_ERRORS)

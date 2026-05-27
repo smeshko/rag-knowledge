@@ -71,7 +71,22 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             )
         except openai.APIError as exc:
             raise EmbeddingTechnicalError(str(exc)) from exc
-        return [item.embedding for item in response.data]
+        # Map by the response's own ``index`` rather than list position: the API
+        # documents same-order results, but the ``index`` field is authoritative,
+        # so honouring it turns any ordering drift into a loud error instead of a
+        # silently mis-attached vector.
+        by_index: dict[int, list[float]] = {}
+        for item in response.data:
+            if item.index in by_index:
+                raise EmbeddingTechnicalError(
+                    f"OpenAI returned duplicate embedding index {item.index}"
+                )
+            by_index[item.index] = item.embedding
+        if by_index.keys() != set(range(len(chunk))):
+            raise EmbeddingTechnicalError(
+                f"OpenAI returned indexes {sorted(by_index)} for a chunk of {len(chunk)}"
+            )
+        return [by_index[i] for i in range(len(chunk))]
 
     async def embed_text(self, text: str) -> Embedding:
         if self._is_empty(text):
