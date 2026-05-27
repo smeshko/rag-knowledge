@@ -301,6 +301,14 @@ async def test_missing_usage_falls_back_to_zero() -> None:
     assert response.usage.output_tokens == 0
 
 
+async def test_response_provider_is_openai_regardless_of_request() -> None:
+    provider = _provider_with(_completion(content='{"ok": true}'))
+    mislabelled = _OPENAI_REQUEST.model_copy(update={"provider": "anthropic"})
+    response = await provider.generate_structured_output(mislabelled)
+
+    assert response.provider == "openai"
+
+
 @pytest.mark.parametrize("error", _TECHNICAL_ERRORS)
 async def test_technical_errors_wrapped(error: Exception) -> None:
     provider = OpenAILLMProvider(

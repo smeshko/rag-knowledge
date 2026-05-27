@@ -49,7 +49,14 @@ class OpenAILLMProvider(LLMProvider):
     provider issues exactly one external call per request — retry/backoff stays an
     explicit Epic-9 concern and a post-generation timeout can't trigger duplicate
     billable generations the audit record never sees (DECISIONS § 4).
+
+    The response provenance ``provider`` is the provider's own identity
+    (``provider``), not the caller-supplied ``request.provider``: this class can
+    only ever produce OpenAI generations, so the audit/cache label must reflect
+    that regardless of a stale or mistaken caller label.
     """
+
+    provider = "openai"
 
     def __init__(
         self, api_key: str, *, default_model: str, client: AsyncOpenAI | None = None
@@ -99,7 +106,7 @@ class OpenAILLMProvider(LLMProvider):
             parse_error=parse_error,
             raw_text=raw_text,
             usage=token_usage,
-            provider=request.provider,
+            provider=self.provider,
             model=request.model,
         )
 
