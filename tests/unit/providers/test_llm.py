@@ -441,6 +441,7 @@ async def test_trace_records_technical_failure_and_reraises() -> None:
     update = fake.observations[0].updates[-1]
     assert update["level"] == "ERROR"
     assert update["status_message"]
+    assert update["metadata"] == {"status": "failed"}
 
 
 async def test_trace_context_propagates_into_observation() -> None:

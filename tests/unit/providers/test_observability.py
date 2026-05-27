@@ -212,7 +212,11 @@ def test_exception_records_error_and_reraises() -> None:
         raise _Boom("kaboom")
 
     updates = fake.observations[0].updates
-    assert updates[-1] == {"level": "ERROR", "status_message": "kaboom"}
+    assert updates[-1] == {
+        "level": "ERROR",
+        "status_message": "kaboom",
+        "metadata": {"status": "failed"},
+    }
 
 
 # --- tracing-failure isolation (Langfuse is auxiliary, never in-band) --------

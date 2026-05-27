@@ -481,6 +481,7 @@ async def test_trace_records_technical_failure_and_reraises() -> None:
     update = fake.observations[0].updates[-1]
     assert update["level"] == "ERROR"
     assert update["status_message"]
+    assert update["metadata"] == {"status": "failed"}
 
 
 async def test_trace_empty_text_short_circuit_does_not_crash() -> None:

@@ -234,7 +234,11 @@ class ProviderObservability:
             # Technical failures must still surface as an ERROR observation before
             # propagating unchanged: the ``_SafeObservation`` swallows any tracing
             # error here so the provider's own exception is the one that re-raises.
-            observation.update(level="ERROR", status_message=str(exc))
+            # Record the ``failed`` status dimension too, so failure rates stay
+            # queryable alongside the success/rejected paths (AC: status metadata).
+            observation.update(
+                level="ERROR", status_message=str(exc), metadata={"status": "failed"}
+            )
             raise
         finally:
             _safe_close(stack)
