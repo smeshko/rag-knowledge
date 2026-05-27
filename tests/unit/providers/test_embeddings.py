@@ -22,6 +22,7 @@ from openai import (
     RateLimitError,
 )
 
+from rag_recipes.providers.embeddings import openai as openai_provider
 from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
 from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
 from rag_recipes.providers.errors import EmbeddingTechnicalError
@@ -236,6 +237,34 @@ async def test_embed_chunk_rejects_malformed_indexes(data: list[_FakeDatum]) -> 
     provider = _provider(fake=fake)
     with pytest.raises(EmbeddingTechnicalError):
         await provider.embed_batch(["a", "b"])
+
+
+async def test_embed_batch_rejects_oversized_input_before_any_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A single over-limit input is rejected in preflight, naming its slot, with
+    # no API call spent (so earlier chunks in a real batch aren't paid-for then lost).
+    monkeypatch.setattr(openai_provider, "_MAX_TOKENS_PER_INPUT", 4)
+    fake = _client()
+    provider = _provider(fake=fake)
+    with pytest.raises(EmbeddingTechnicalError, match="input 1 is .* per-input limit"):
+        await provider.embed_batch(["ok", "this input is far too long to embed"])
+    assert len(fake.embeddings.calls) == 0
+
+
+async def test_embed_batch_splits_on_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Count cap is high, but the aggregate token budget forces a second request.
+    monkeypatch.setattr(openai_provider, "_MAX_TOKENS_PER_REQUEST", 2)
+    fake = _client()
+    provider = _provider(batch_size=100, fake=fake)
+    texts = ["aaaa", "bbbb", "cccc"]  # ~1 token each; budget 2 → 2 then 1
+    batch = await provider.embed_batch(texts)
+
+    assert len(fake.embeddings.calls) == 2
+    for i, text in enumerate(texts):
+        assert batch[i].vector == _deterministic_vector(text, _DIMENSIONS)
 
 
 @pytest.mark.parametrize("error", _TECHNICAL_ERRORS)

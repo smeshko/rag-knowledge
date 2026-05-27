@@ -22,6 +22,17 @@ from rag_recipes.providers.errors import EmbeddingTechnicalError
 
 __all__ = ["OpenAIEmbeddingProvider"]
 
+# OpenAI embeddings request limits for text-embedding-3-*: a single input may not
+# exceed ~8192 tokens, and one request may not exceed 300k tokens in aggregate.
+# Exceeding either 400s the *whole* request, so batching by input count alone can
+# fail an otherwise-valid batch and waste any chunks already embedded in the same
+# call. We carry no tokenizer dependency (and unit tests must stay offline), so
+# tokens are estimated conservatively from character length; the estimate only
+# governs how inputs are packed into requests — it never touches returned vectors.
+_MAX_TOKENS_PER_INPUT = 8192
+_MAX_TOKENS_PER_REQUEST = 300_000
+_CHARS_PER_TOKEN = 4
+
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
     """``EmbeddingProvider`` backed by the OpenAI embeddings API.
@@ -55,6 +66,33 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     @staticmethod
     def _is_empty(text: str) -> bool:
         return text.strip() == ""
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        # Ceil division; conservative character-based proxy for token count.
+        return -(-len(text) // _CHARS_PER_TOKEN)
+
+    def _build_request_chunks(
+        self, texts: list[str], indices: list[int]
+    ) -> list[list[int]]:
+        # Pack non-empty input indices into requests bounded by BOTH the batch_size
+        # count cap and the aggregate per-request token budget, preserving order.
+        chunks: list[list[int]] = []
+        current: list[int] = []
+        current_tokens = 0
+        for i in indices:
+            est = self._estimate_tokens(texts[i])
+            over_count = len(current) >= self._batch_size
+            over_tokens = current_tokens + est > _MAX_TOKENS_PER_REQUEST
+            if current and (over_count or over_tokens):
+                chunks.append(current)
+                current = []
+                current_tokens = 0
+            current.append(i)
+            current_tokens += est
+        if current:
+            chunks.append(current)
+        return chunks
 
     def _embedding(self, vector: list[float]) -> Embedding:
         return Embedding(
@@ -96,9 +134,18 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 
     async def embed_batch(self, texts: list[str]) -> list[Embedding]:
         non_empty_indices = [i for i, text in enumerate(texts) if not self._is_empty(text)]
+        # Preflight: reject any single input over the per-input token limit before
+        # spending on API calls, naming the offending slot — one oversized input
+        # would otherwise 400 the whole request and discard earlier paid chunks.
+        for i in non_empty_indices:
+            est = self._estimate_tokens(texts[i])
+            if est > _MAX_TOKENS_PER_INPUT:
+                raise EmbeddingTechnicalError(
+                    f"input {i} is ~{est} tokens, exceeding the "
+                    f"{_MAX_TOKENS_PER_INPUT}-token per-input limit"
+                )
         vectors: dict[int, list[float]] = {}
-        for start in range(0, len(non_empty_indices), self._batch_size):
-            chunk_indices = non_empty_indices[start : start + self._batch_size]
+        for chunk_indices in self._build_request_chunks(texts, non_empty_indices):
             chunk_vectors = await self._embed_chunk([texts[i] for i in chunk_indices])
             for index, vector in zip(chunk_indices, chunk_vectors, strict=True):
                 vectors[index] = vector
