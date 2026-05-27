@@ -20,12 +20,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class LiveCredentials(BaseSettings):
+    # ``env_ignore_empty=True`` so a blank ``EMBEDDING_MODEL=`` / ``LLM_MODEL=``
+    # in ``.env`` falls back to the typed default instead of resolving to ``""``
+    # (which would 400 the live call with ``model=""``).
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore", case_sensitive=False
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+        env_ignore_empty=True,
     )
 
     openai_api_key: str | None = None
     llm_model: str = "gpt-4.1"
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
 
 
 @pytest.fixture

@@ -71,21 +71,21 @@ Implement the real OpenAI-backed `LLMProvider` (using the OpenAI SDK's native st
     - Splits into batches of `batch_size` (default 100; OpenAI limit is 2048 inputs but we want small batches for retry safety)
     - Calls the API per batch, preserving input order in the output
     - Returns `list[Embedding]` aligned with input order
-  - Handles empty strings explicitly (OpenAI rejects them) — either skip with a None marker or error per the contract test definition
+  - Handles empty / whitespace-only strings explicitly (OpenAI 400s on empty input, and a single empty string fails a whole batch request): short-circuits locally to a full-dimension zero vector with no API call, never sending empties to the wire — satisfying the frozen contract's "`embed_text("")` returns a full-dimension vector" requirement
   - Raises a typed `EmbeddingTechnicalError` on API failures
-- Run the Epic-3 contract tests against `OpenAIEmbeddingProvider` as an opt-in smoke test
+- Run the Epic-3 contract tests against `OpenAIEmbeddingProvider` (injected deterministic fake client, no network) plus an opt-in `live`-marked real-API test
 
 ### Acceptance criteria
 
-- [ ] `OpenAIEmbeddingProvider` implements the `EmbeddingProvider` interface
-- [ ] Returns vectors at exactly `1536` dimensions for the default model
-- [ ] Batch output order matches input order (verified by test)
-- [ ] Empty text handled consistently with the Fake's behavior
-- [ ] Opt-in smoke test hits the real API
+- [x] `OpenAIEmbeddingProvider` implements the `EmbeddingProvider` interface
+- [x] Returns vectors at exactly `1536` dimensions for the default model
+- [x] Batch output order matches input order (verified by test)
+- [x] Empty text handled consistently with the Fake's behavior
+- [x] Opt-in smoke test hits the real API
 
 ### Validation
 
-`make test-unit` against the Fake; `pytest tests/integration -m smoke` against the real API.
+`just test-unit` runs the contract suite against the Fake and the injected-client `OpenAIEmbeddingProvider`; `just test-live` runs the opt-in `live`-marked real-API test (deselected from the default `just test`).
 
 ---
 
@@ -122,9 +122,9 @@ With Langfuse running locally, enable tracing in `.env`, run the Epic-3 smoke te
 
 ## Epic-level acceptance criteria
 
-- [ ] `OpenAILLMProvider` and `OpenAIEmbeddingProvider` ship and pass all Epic-3 contract tests
-- [ ] Strict JSON-schema mode confirmed for the LLM provider
+- [x] `OpenAILLMProvider` and `OpenAIEmbeddingProvider` ship and pass all Epic-3 contract tests
+- [x] Strict JSON-schema mode confirmed for the LLM provider
 - [ ] Langfuse tracing toggled by config flag; no-ops cleanly when disabled
-- [ ] Real-API smoke tests exist and are opt-in (do not run in default `make test`)
-- [ ] mypy passes in strict mode against `providers/llm/` and `providers/embeddings/`
+- [x] Real-API smoke tests exist and are opt-in (do not run in default `make test`)
+- [x] mypy passes in strict mode against `providers/llm/` and `providers/embeddings/`
 - [ ] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked (also requires Epic 8)
