@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     pdf_window_size_pages: int = 3
     pdf_overlap_pages: int = 1
+    pdf_min_text_chars_for_page: int = 20
 
     search_default_limit: int = 10
     search_keyword_top_k: int = 50

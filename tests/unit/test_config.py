@@ -14,6 +14,16 @@ def test_settings_loads_with_required_env(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.openai_api_key == "sk-test"
 
 
+def test_pdf_min_text_chars_for_page_defaults_to_20(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("PDF_MIN_TEXT_CHARS_FOR_PAGE", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.pdf_min_text_chars_for_page == 20
+
+
 def test_settings_fails_when_database_url_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
