@@ -203,6 +203,65 @@ def test_exception_records_error_and_reraises() -> None:
     assert updates[-1] == {"level": "ERROR", "status_message": "kaboom"}
 
 
+# --- tracing-failure isolation (Langfuse is auxiliary, never in-band) --------
+
+
+class _TraceBackendError(Exception):
+    pass
+
+
+class _RaisingObservation:
+    def update(self, **kwargs: Any) -> None:
+        raise _TraceBackendError("update exploded")
+
+
+class _RaisingLangfuse:
+    """Stub whose backend fails — on observation start and/or ``update``."""
+
+    def __init__(self, *, fail_on_start: bool = False) -> None:
+        self._fail_on_start = fail_on_start
+
+    @contextlib.contextmanager
+    def start_as_current_observation(self, **kwargs: Any) -> Iterator[_RaisingObservation]:
+        if self._fail_on_start:
+            raise _TraceBackendError("start exploded")
+        yield _RaisingObservation()
+
+    @contextlib.contextmanager
+    def propagate_attributes(self, *, session_id: str | None = None) -> Iterator[None]:
+        yield
+
+
+def test_trace_start_failure_runs_the_block_untraced() -> None:
+    obs = ProviderObservability(_RaisingLangfuse(fail_on_start=True), enabled=True)
+    ran = False
+    with obs.trace_generation(name="n", model="m", input="i", metadata={}) as handle:
+        ran = True
+        handle.update(output={"parsed": 1})  # the no-op handle absorbs this
+    assert ran  # the provider body still executed despite the trace backend failing
+
+
+def test_observation_update_failure_is_swallowed() -> None:
+    obs = ProviderObservability(_RaisingLangfuse(), enabled=True)
+    with obs.trace_generation(name="n", model="m", input="i", metadata={}) as handle:
+        handle.update(output={"parsed": 1})  # must not raise _TraceBackendError
+
+
+def test_provider_exception_survives_a_failing_trace_update() -> None:
+    obs = ProviderObservability(_RaisingLangfuse(), enabled=True)
+
+    class _ProviderError(Exception):
+        pass
+
+    # The error-path observation.update raises inside the wrapper, but the
+    # provider's own exception is what must propagate — not the tracing error.
+    with (
+        pytest.raises(_ProviderError),
+        obs.trace_generation(name="n", model="m", input="i", metadata={}),
+    ):
+        raise _ProviderError("real failure")
+
+
 # --- factory -----------------------------------------------------------------
 
 

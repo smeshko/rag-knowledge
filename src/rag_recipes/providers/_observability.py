@@ -18,6 +18,7 @@ provider); unit tests inject a typed fake satisfying ``LangfuseLike`` instead.
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from typing import Any, Literal, Protocol
@@ -25,6 +26,8 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict
 
 from rag_recipes.config import Settings
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "EMBEDDING_PREVIEW_CHARS",
@@ -97,6 +100,32 @@ class _NoopObservation:
 _NOOP = _NoopObservation()
 
 
+class _SafeObservation:
+    """Wraps a real observation so a failing ``update`` can never reach the caller.
+
+    Langfuse is an auxiliary lens (doc 13 § 13): a degraded trace backend must
+    never turn a successful provider call into a failure, nor mask the provider's
+    own exception on the error path. Swallow-and-log instead.
+    """
+
+    def __init__(self, observation: LangfuseObservation) -> None:
+        self._observation = observation
+
+    def update(self, **kwargs: Any) -> None:
+        try:
+            self._observation.update(**kwargs)
+        except Exception:
+            logger.warning("Langfuse observation.update failed; trace dropped", exc_info=True)
+
+
+def _safe_close(stack: contextlib.ExitStack) -> None:
+    """Close the trace context stack without letting its teardown reach the caller."""
+    try:
+        stack.close()
+    except Exception:
+        logger.warning("Langfuse trace finalisation failed", exc_info=True)
+
+
 class ProviderObservability:
     """Wraps an injectable Langfuse-like client behind an ``enabled`` flag.
 
@@ -161,7 +190,8 @@ class ProviderObservability:
             return
         merged = self._merge_trace_context(metadata, trace_context)
         session_id = trace_context.session_id if trace_context is not None else None
-        with contextlib.ExitStack() as stack:
+        stack = contextlib.ExitStack()
+        try:
             if session_id is not None:
                 # Session grouping is a v4 *trace attribute*, not observation
                 # metadata: propagate it so every call in one ingestion run shares a
@@ -170,18 +200,29 @@ class ProviderObservability:
                 stack.enter_context(
                     self._client.propagate_attributes(session_id=session_id)
                 )
-            observation = stack.enter_context(
+            raw_observation = stack.enter_context(
                 self._client.start_as_current_observation(
                     name=name, as_type=as_type, input=input, metadata=merged, model=model
                 )
             )
-            try:
-                yield observation
-            except Exception as exc:
-                # Technical failures must still surface as an ERROR observation
-                # before propagating unchanged (the caller never swallows them).
-                observation.update(level="ERROR", status_message=str(exc))
-                raise
+        except Exception:
+            # A tracing-backend failure must never break the provider call — run it
+            # untraced (doc 13 § 13). Tear down whatever opened first.
+            _safe_close(stack)
+            logger.warning("Langfuse trace start failed; proceeding untraced", exc_info=True)
+            yield _NOOP
+            return
+        observation = _SafeObservation(raw_observation)
+        try:
+            yield observation
+        except Exception as exc:
+            # Technical failures must still surface as an ERROR observation before
+            # propagating unchanged: the ``_SafeObservation`` swallows any tracing
+            # error here so the provider's own exception is the one that re-raises.
+            observation.update(level="ERROR", status_message=str(exc))
+            raise
+        finally:
+            _safe_close(stack)
 
     @staticmethod
     def _merge_trace_context(
