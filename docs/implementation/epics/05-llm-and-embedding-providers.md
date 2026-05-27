@@ -1,6 +1,6 @@
 # Epic 5 — LLM & Embedding Providers (with Observability)
 
-**Status**: Blocked (depends on Epic 3)
+**Status**: In progress (Epic 3 met; Phase 5.1 merged)
 
 ## Overview
 
@@ -27,33 +27,34 @@ Implement the real OpenAI-backed `LLMProvider` (using the OpenAI SDK's native st
 
 ## Phase 5.1 — OpenAI LLMProvider with strict JSON-schema mode
 
-**Goal**: A real `LLMProvider` implementation that wraps the OpenAI SDK and returns Pydantic-validated structured output.
+**Goal**: A real `LLMProvider` implementation that wraps the OpenAI SDK in strict JSON-schema mode and returns a `StructuredOutputResponse`. This phase ships the call mechanism only — prompt content and the `recipe.v1` schema are Epic 9.
 
 ### What to build
 
 - **`src/rag_recipes/providers/llm/openai.py`** — `OpenAILLMProvider`:
-  - Constructor takes API key + default model from `Settings`
+  - Constructor `OpenAILLMProvider(api_key, *, default_model, client=None)`: takes `api_key` + `default_model` explicitly (the caller resolves them from `Settings`; the provider never reads `Settings`), and accepts an injectable `client` so unit tests supply a stub without monkeypatching. When `client is None` the default `AsyncOpenAI` is constructed with `max_retries=0`, so the provider issues exactly one external call per request and retry/backoff stays an explicit Epic-9 concern (a post-generation timeout can't trigger duplicate billable generations the audit record never sees)
   - `generate_structured_output(request)`:
-    - Calls `client.beta.chat.completions.parse(...)` (or the Responses API equivalent) with `response_format={"type": "json_schema", "strict": True, ...}` populated from `request.json_schema`
-    - Passes prompt (constructed from `request.input` plus a system message defined by the caller) and model from request
-    - Returns a `StructuredOutputResponse` with parsed `output_json`, `raw_text` (the model's raw string output for debugging), `usage` (`input_tokens`, `output_tokens`), and echoes provider/model
+    - Calls `client.chat.completions.create(...)` with `response_format={"type": "json_schema", "json_schema": {"name": <derived from schema_version>, "strict": True, "schema": request.json_schema}}` — consuming the **dict** `request.json_schema` directly (not a runtime-built model class)
+    - Sends `request.input` as the **sole user message** — no caller-defined system prompt in 5.1 (prompt content is Epic 9)
+    - Uses `model=request.model` (the request is authoritative, matching the `ExtractionRun` provider/model record)
+    - Returns a `StructuredOutputResponse` with parsed `output_json`, `raw_text` (the model's raw string output for debugging), `usage` (`input_tokens`, `output_tokens`), and echoes provider/model. No post-parse schema validation — strict mode enforces conformance on the wire; `recipe.v1` validation is Epic 9
   - **Failure handling** per [doc 11 § Failure categories](../../architecture/11-configuration-and-providers.md#failure-categories):
-    - Technical failures (timeout, rate limit, transport error) raise a typed `LLMTechnicalError`
-    - Schema-non-conformance is *not* retried inside the provider — surface the raw output and let the caller decide (this preserves the `rejected` vs `failed` distinction the validation layer needs)
+    - Technical failures (`APITimeoutError`, `RateLimitError`, `APIConnectionError`, `APIStatusError`, and the `APIError` base) raise a typed `LLMTechnicalError`
+    - Un-parseable / non-object / refused / truncated (`finish_reason` `length` or `content_filter`) output is *not* retried inside the provider — it returns `output_json=None` with a non-empty `parse_error` and `raw_text` preserved, letting the caller decide (this preserves the `rejected` vs `failed` distinction the validation layer needs)
 - **No instructor, no PydanticAI** — per [doc 13 topic 4b](../../architecture/13-implementation-decisions.md#4b-structured-output-approach-for-the-llm-call), we explicitly use the native SDK behind our own interface
-- Run the Epic-3 contract tests against `OpenAILLMProvider` as an opt-in smoke test (gated by `OPENAI_API_KEY` presence)
+- Bind `OpenAILLMProvider` to the Epic-3 `LLMContract` (against an injected fake client), plus an opt-in real-API test under `tests/live/` behind a `live` marker, run via `just test-live`
 
 ### Acceptance criteria
 
-- [ ] `OpenAILLMProvider` implements the `LLMProvider` interface
-- [ ] Uses strict JSON-schema mode (verified by checking the request payload in a recorded interaction)
-- [ ] Technical failures raise a typed exception; schema-non-conformance surfaces without raising
-- [ ] mypy passes
-- [ ] Opt-in smoke test (`pytest -m smoke`) hits the real API with a tiny prompt and asserts a structured response
+- [x] `OpenAILLMProvider` implements the `LLMProvider` interface
+- [x] Uses strict JSON-schema mode (verified by a unit test asserting the outgoing `response_format` carries `strict: True` and `schema == request.json_schema`)
+- [x] Technical failures raise a typed exception; un-parseable / non-object / refused / truncated output surfaces without raising (5.1 adds no post-parse JSON-Schema re-validation of a clean object — on-wire conformance is strict mode's job; `recipe.v1` validation is Epic 9)
+- [x] mypy passes
+- [x] Opt-in real-API test (`just test-live`, i.e. `pytest tests/live -m live`) hits the real API with a tiny prompt and asserts a structured response
 
 ### Validation
 
-`make test-unit` against the Fake; `pytest tests/integration -m smoke` against the real API with `OPENAI_API_KEY` set.
+`just test-unit` exercises the `LLMContract` bound to `OpenAILLMProvider` via an injected fake client; `just test-live` (`pytest tests/live -m live`) hits the real API with `OPENAI_API_KEY` set. The default suite deselects `live` tests via `addopts = "-m 'not live'"`, so real-API calls never run in `just test` even though `OPENAI_API_KEY` is a required `Settings` field.
 
 ---
 

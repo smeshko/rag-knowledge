@@ -72,4 +72,7 @@ strict = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = []
+addopts = "-m 'not live'"
+markers = [
+    "live: real external-API tests; deselected by default, run via `just test-live`",
+]

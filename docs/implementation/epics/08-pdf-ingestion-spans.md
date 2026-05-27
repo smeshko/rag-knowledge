@@ -36,6 +36,7 @@ Wire the first real ingestion job: when a Document is created via `POST /documen
   - Loads the `Document` and its parent `SourceAsset`
   - Reads PDF bytes via `FileStorageProvider.get_object(source_asset.storage_key)`
   - Calls `PdfTextExtractor.extract_pages(pdf_bytes)`
+  - **PyMuPDF concurrency guardrail** (deferred here from Phase 4.2's review): `PyMuPdfExtractor.extract_pages` dispatches to the default thread executor via `asyncio.to_thread` with no serialization, and PyMuPDF runs MuPDF in single-threaded mode (`reinit_singlethreaded()` at import). Concurrent extractions from multiple worker threads risk native crashes or silent extraction corruption. Before this provider runs under real job concurrency, serialize PyMuPDF access — a module-level lock or a dedicated single-worker executor in `PyMuPdfExtractor`, or a bounded process pool — and add a concurrent-extraction regression test (multiple `extract_pages` calls in flight against the synthetic fixture). See the Phase 4.2 archived `REVIEW.md` (round-1 #1 / round-2 #1).
   - For each page, computes `locator = {"type": "pdf_page_range", "page_start": N, "page_end": N}`, `locator_hash` (stable hash of normalized JSON), `text_hash` (hash of text)
   - Inserts `SourceSpan` rows with the supplied `source_version`
   - Handles the uniqueness constraint `(document_id, source_version, locator_hash)` — duplicates indicate a bug or a retry that shouldn't recreate; raise a clear error
@@ -57,6 +58,7 @@ Wire the first real ingestion job: when a Document is created via `POST /documen
 - [ ] Uniqueness constraint enforced (no duplicate spans for the same page/version)
 - [ ] Failure during extraction transitions Document to `failed` with a clear error
 - [ ] Langfuse session ID set to `document_id`
+- [ ] PyMuPDF access is serialized (lock / single-worker executor / process pool) before running under job concurrency, with a concurrent-extraction regression test (deferred from Phase 4.2)
 - [ ] Integration test using a committed synthetic PDF fixture
 
 ### Validation

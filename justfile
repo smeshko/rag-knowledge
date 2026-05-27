@@ -40,6 +40,10 @@ test-unit:
 test-integration:
     uv run pytest tests/integration
 
+# Run opt-in live tests that call real external APIs (needs OPENAI_API_KEY).
+test-live:
+    uv run pytest tests/live -m live
+
 # Run ruff and mypy. Both must pass for the recipe to exit 0.
 lint:
     uv run ruff check src/ tests/
