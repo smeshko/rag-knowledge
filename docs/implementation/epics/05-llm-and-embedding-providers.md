@@ -1,6 +1,6 @@
 # Epic 5 — LLM & Embedding Providers (with Observability)
 
-**Status**: In progress (Epic 3 met; Phase 5.1 merged)
+**Status**: Done (Phases 5.1, 5.2, 5.3 merged)
 
 ## Overview
 
@@ -106,13 +106,15 @@ Implement the real OpenAI-backed `LLMProvider` (using the OpenAI SDK's native st
   - For Embedding: `provider`, `model`, `dimensions`, `text_preview` (first N chars), `latency_ms`, `usage` if available, batch size
 - Confirm `ExtractionRun` (doc 2) remains the canonical record — Langfuse is *added* observability, not a replacement (per [doc 13 topic 13](../../architecture/13-implementation-decisions.md#13-observability--llm-tracing))
 
+> **SDK note**: The implementation targets the installed Langfuse **v4** OTEL SDK API — `Langfuse.start_as_current_observation(...)` used as a context manager — *not* the v2 `@observe` / `langfuse.generation()` decorator API that [doc 13 topic 13](../../architecture/13-implementation-decisions.md#13-observability--llm-tracing) describes. Treat doc 13's "~5 lines / decorator" wording as era-specific prose, not a contract. Trace context (`session_id`, `input_source_span_ids`, `input_hash`) is propagated via an explicit keyword-only `trace_context` argument on the provider methods rather than contextvars. App/DI wiring (constructing `build_provider_observability(settings)` and the `flush()`/`shutdown()` lifecycle) is deferred to the first consumer (Epic 9/10).
+
 ### Acceptance criteria
 
-- [ ] `langfuse_enabled=false` makes all provider calls fully equivalent to non-traced behavior (verified by test that disables tracing and runs contract tests unchanged)
-- [ ] `langfuse_enabled=true` produces a trace per call visible in the local Langfuse UI
-- [ ] Session ID propagates from caller through to the trace
-- [ ] Latency, tokens, prompt_version, schema_version all visible in trace metadata
-- [ ] No PII / API key leakage in traces
+- [x] `langfuse_enabled=false` makes all provider calls fully equivalent to non-traced behavior (verified by test that disables tracing and runs contract tests unchanged)
+- [x] `langfuse_enabled=true` produces a trace per call — the enabled payload contract is verified against an injected fake Langfuse client; visibility in the local Langfuse UI is confirmed by the documented manual validation step below
+- [x] Session ID propagates from caller (via `trace_context`) through to the trace
+- [x] Latency, tokens, prompt_version, schema_version all visible in trace metadata
+- [x] No PII / API key leakage in traces (asserted by test; embedding text recorded only as a truncated `text_preview`)
 
 ### Validation
 
@@ -124,7 +126,7 @@ With Langfuse running locally, enable tracing in `.env`, run the Epic-3 smoke te
 
 - [x] `OpenAILLMProvider` and `OpenAIEmbeddingProvider` ship and pass all Epic-3 contract tests
 - [x] Strict JSON-schema mode confirmed for the LLM provider
-- [ ] Langfuse tracing toggled by config flag; no-ops cleanly when disabled
+- [x] Langfuse tracing toggled by config flag; no-ops cleanly when disabled
 - [x] Real-API smoke tests exist and are opt-in (do not run in default `make test`)
 - [x] mypy passes in strict mode against `providers/llm/` and `providers/embeddings/`
-- [ ] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked (also requires Epic 8)
+- [x] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked (also requires Epic 8)
