@@ -44,6 +44,20 @@ def test_settings_fails_when_openai_api_key_missing(monkeypatch: pytest.MonkeyPa
     assert "openai_api_key" in str(excinfo.value).lower()
 
 
+@pytest.mark.parametrize("batch_size", ["0", "3000"])
+def test_embedding_batch_size_out_of_range_rejected(
+    monkeypatch: pytest.MonkeyPatch, batch_size: str
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", batch_size)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "embedding_batch_size" in str(excinfo.value).lower()
+
+
 def test_redis_url_without_credentials_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")

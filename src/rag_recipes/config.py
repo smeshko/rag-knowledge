@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio.connection import parse_url as redis_parse_url
 
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4.1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    embedding_batch_size: int = Field(default=100, ge=1, le=2048)
 
     langfuse_host: str = ""
     langfuse_public_key: str = ""
