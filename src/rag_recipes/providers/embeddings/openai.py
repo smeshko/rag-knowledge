@@ -26,12 +26,16 @@ __all__ = ["OpenAIEmbeddingProvider"]
 # exceed ~8192 tokens, and one request may not exceed 300k tokens in aggregate.
 # Exceeding either 400s the *whole* request, so batching by input count alone can
 # fail an otherwise-valid batch and waste any chunks already embedded in the same
-# call. We carry no tokenizer dependency (and unit tests must stay offline), so
-# tokens are estimated conservatively from character length; the estimate only
-# governs how inputs are packed into requests — it never touches returned vectors.
+# call. We carry no tokenizer dependency (tiktoken would add a runtime dep and
+# fetch encodings over the network on first use, breaking offline unit tests), so
+# token count is *upper-bounded* by UTF-8 byte length: text-embedding-3-* use the
+# byte-level cl100k_base BPE, whose token count can never exceed the byte count.
+# A character-based average (len/4) would undercount token-dense text (CJK, emoji,
+# symbol-heavy) and could still pack an over-limit request; the byte bound is safe
+# across all scripts at the cost of over-splitting plain ASCII. It only governs how
+# inputs are packed into requests — it never touches returned vectors.
 _MAX_TOKENS_PER_INPUT = 8192
 _MAX_TOKENS_PER_REQUEST = 300_000
-_CHARS_PER_TOKEN = 4
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
@@ -68,9 +72,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         return text.strip() == ""
 
     @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        # Ceil division; conservative character-based proxy for token count.
-        return -(-len(text) // _CHARS_PER_TOKEN)
+    def _token_upper_bound(text: str) -> int:
+        # cl100k_base is byte-level BPE, so token count never exceeds UTF-8 bytes.
+        return len(text.encode("utf-8"))
 
     def _build_request_chunks(
         self, texts: list[str], indices: list[int]
@@ -81,7 +85,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         current: list[int] = []
         current_tokens = 0
         for i in indices:
-            est = self._estimate_tokens(texts[i])
+            est = self._token_upper_bound(texts[i])
             over_count = len(current) >= self._batch_size
             over_tokens = current_tokens + est > _MAX_TOKENS_PER_REQUEST
             if current and (over_count or over_tokens):
@@ -138,7 +142,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         # spending on API calls, naming the offending slot — one oversized input
         # would otherwise 400 the whole request and discard earlier paid chunks.
         for i in non_empty_indices:
-            est = self._estimate_tokens(texts[i])
+            est = self._token_upper_bound(texts[i])
             if est > _MAX_TOKENS_PER_INPUT:
                 raise EmbeddingTechnicalError(
                     f"input {i} is ~{est} tokens, exceeding the "

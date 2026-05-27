@@ -259,12 +259,26 @@ async def test_embed_batch_splits_on_token_budget(
     monkeypatch.setattr(openai_provider, "_MAX_TOKENS_PER_REQUEST", 2)
     fake = _client()
     provider = _provider(batch_size=100, fake=fake)
-    texts = ["aaaa", "bbbb", "cccc"]  # ~1 token each; budget 2 → 2 then 1
+    texts = ["a", "b", "c"]  # 1 byte → 1 token each; budget 2 → 2 then 1
     batch = await provider.embed_batch(texts)
 
     assert len(fake.embeddings.calls) == 2
     for i, text in enumerate(texts):
         assert batch[i].vector == _deterministic_vector(text, _DIMENSIONS)
+
+
+async def test_token_bound_counts_multibyte_text_by_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Token-dense input: 4 CJK chars = 12 UTF-8 bytes. A char/4 average would
+    # estimate ~1 token and pass a 6-token limit; the byte upper bound rejects it,
+    # so token-dense text can't slip an over-limit request past preflight.
+    monkeypatch.setattr(openai_provider, "_MAX_TOKENS_PER_INPUT", 6)
+    fake = _client()
+    provider = _provider(fake=fake)
+    with pytest.raises(EmbeddingTechnicalError, match="per-input limit"):
+        await provider.embed_batch(["你好世界"])
+    assert len(fake.embeddings.calls) == 0
 
 
 @pytest.mark.parametrize("error", _TECHNICAL_ERRORS)
