@@ -19,6 +19,7 @@ import hashlib
 import json
 from typing import Any
 
+from rag_recipes.providers._observability import TraceContext
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.types import (
@@ -35,8 +36,7 @@ class FakeLLMProvider(LLMProvider):
 
     def __init__(
         self,
-        responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse]
-        | None = None,
+        responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse] | None = None,
         *,
         fail_technically: bool = False,
         default_usage: TokenUsage | None = None,
@@ -49,8 +49,8 @@ class FakeLLMProvider(LLMProvider):
         self._default_usage = (
             default_usage.model_copy(deep=True) if default_usage is not None else None
         )
-        self._default_output: dict[str, Any] | StructuredOutputResponse | None = (
-            copy.deepcopy(default_output)
+        self._default_output: dict[str, Any] | StructuredOutputResponse | None = copy.deepcopy(
+            default_output
         )
         self._calls: list[StructuredOutputRequest] = []
 
@@ -72,8 +72,13 @@ class FakeLLMProvider(LLMProvider):
         return tuple(call.model_copy(deep=True) for call in self._calls)
 
     async def generate_structured_output(
-        self, request: StructuredOutputRequest
+        self,
+        request: StructuredOutputRequest,
+        *,
+        trace_context: TraceContext | None = None,
     ) -> StructuredOutputResponse:
+        # The Fake emits no traces; the param exists only to keep the override
+        # signature-compatible with the LLMProvider contract.
         self._calls.append(request.model_copy(deep=True))
 
         if self._fail_technically:

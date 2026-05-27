@@ -7,7 +7,10 @@ provider's branching with no network and no API key.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +24,7 @@ from openai import (
     RateLimitError,
 )
 
+from rag_recipes.providers._observability import ProviderObservability, TraceContext
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
@@ -135,9 +139,7 @@ class _FakeAsyncClient:
         self.chat = _FakeChat(self.completions)
 
 
-def _client(
-    *, response: _FakeCompletion | None = None, error: Exception | None = None
-) -> Any:
+def _client(*, response: _FakeCompletion | None = None, error: Exception | None = None) -> Any:
     return _FakeAsyncClient(response=response, error=error)
 
 
@@ -272,9 +274,7 @@ async def test_parse_failures_do_not_raise(content: str, finish_reason: str) -> 
 
 
 async def test_refusal_preserves_text() -> None:
-    client = _client(
-        response=_completion(content=None, refusal="I cannot help with that.")
-    )
+    client = _client(response=_completion(content=None, refusal="I cannot help with that."))
     provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1", client=client)
     response = await provider.generate_structured_output(_OPENAI_REQUEST)
 
@@ -317,3 +317,151 @@ async def test_technical_errors_wrapped(error: Exception) -> None:
     with pytest.raises(LLMTechnicalError) as exc_info:
         await provider.generate_structured_output(_OPENAI_REQUEST)
     assert exc_info.value.__cause__ is error
+
+
+# --- Langfuse tracing --------------------------------------------------------
+
+
+class _RecordingObservation:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+
+    def update(self, **kwargs: Any) -> None:
+        self.updates.append(kwargs)
+
+
+class _FakeLangfuse:
+    """``Protocol``-shaped stub satisfying ``LangfuseLike``."""
+
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, Any]] = []
+        self.observations: list[_RecordingObservation] = []
+
+    @contextlib.contextmanager
+    def start_as_current_observation(
+        self,
+        *,
+        name: str,
+        as_type: str,
+        input: Any = None,
+        metadata: Any = None,
+        model: str | None = None,
+    ) -> Iterator[_RecordingObservation]:
+        self.start_calls.append(
+            {
+                "name": name,
+                "as_type": as_type,
+                "input": input,
+                "metadata": metadata,
+                "model": model,
+            }
+        )
+        observation = _RecordingObservation()
+        self.observations.append(observation)
+        yield observation
+
+
+def _traced_provider(
+    fake: _FakeLangfuse, *, response: _FakeCompletion | None = None, error: Exception | None = None
+) -> OpenAILLMProvider:
+    return OpenAILLMProvider(
+        api_key="sk-secret-key",
+        default_model="gpt-4.1",
+        client=_client(response=response, error=error),
+        observability=ProviderObservability(fake, enabled=True),
+    )
+
+
+def _payloads(fake: _FakeLangfuse) -> str:
+    parts = [json.dumps(call, default=str) for call in fake.start_calls]
+    for obs in fake.observations:
+        parts.extend(json.dumps(u, default=str) for u in obs.updates)
+    return "\n".join(parts)
+
+
+async def test_trace_records_clean_generation() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(
+        fake, response=_completion(content='{"ok": true}', usage=_FakeUsage(13, 5))
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    call = fake.start_calls[0]
+    assert call["as_type"] == "generation"
+    assert call["model"] == _OPENAI_REQUEST.model
+    assert call["metadata"]["provider"] == "openai"
+    assert call["metadata"]["prompt_version"] == _OPENAI_REQUEST.prompt_version
+    assert call["metadata"]["schema_version"] == _OPENAI_REQUEST.schema_version
+
+    update = fake.observations[0].updates[0]
+    assert update["output"] == {"parsed": {"ok": True}, "raw": '{"ok": true}'}
+    assert update["usage_details"] == {"input": 13, "output": 5}
+    assert update["metadata"]["status"] == "success"
+    assert update["level"] == "DEFAULT"
+    assert update["status_message"] is None
+
+
+async def test_trace_records_rejected_generation() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake, response=_completion(content="not json"))
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # The returned response is unchanged by tracing.
+    assert response.output_json is None
+    assert response.parse_error
+
+    update = fake.observations[0].updates[0]
+    assert update["metadata"]["status"] == "rejected"
+    assert update["level"] == "WARNING"
+    assert update["status_message"] == response.parse_error
+
+
+async def test_trace_records_technical_failure_and_reraises() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake, error=APITimeoutError(request=_REQUEST_OBJ))
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    update = fake.observations[0].updates[-1]
+    assert update["level"] == "ERROR"
+    assert update["status_message"]
+
+
+async def test_trace_context_propagates_into_observation() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake, response=_completion(content='{"ok": true}'))
+    await provider.generate_structured_output(
+        _OPENAI_REQUEST,
+        trace_context=TraceContext(
+            session_id="sess-1",
+            input_source_span_ids=["span-a"],
+            input_hash="hash-1",
+        ),
+    )
+
+    metadata = fake.start_calls[0]["metadata"]
+    assert metadata["session_id"] == "sess-1"
+    assert metadata["input_source_span_ids"] == ["span-a"]
+    assert metadata["input_hash"] == "hash-1"
+
+
+async def test_trace_payload_carries_no_secret() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake, response=_completion(content='{"ok": true}'))
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert "sk-secret-key" not in _payloads(fake)
+
+
+async def test_disabled_observability_never_touches_client() -> None:
+    fake = _FakeLangfuse()
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        client=_client(response=_completion(content='{"ok": true}')),
+        observability=ProviderObservability(fake, enabled=False),
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert fake.start_calls == []
+    assert fake.observations == []
