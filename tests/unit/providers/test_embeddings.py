@@ -7,8 +7,11 @@ vectors), so they exercise the real provider's branching with no network and no 
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import random
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +25,11 @@ from openai import (
     RateLimitError,
 )
 
+from rag_recipes.providers._observability import (
+    EMBEDDING_PREVIEW_CHARS,
+    ProviderObservability,
+    TraceContext,
+)
 from rag_recipes.providers.embeddings import openai as openai_provider
 from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
 from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
@@ -299,3 +307,170 @@ def test_constructor_rejects_out_of_range_batch_size(batch_size: int) -> None:
             batch_size=batch_size,
             client=_client(),
         )
+
+
+# --- Langfuse tracing --------------------------------------------------------
+
+
+class _RecordingObservation:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+
+    def update(self, **kwargs: Any) -> None:
+        self.updates.append(kwargs)
+
+
+class _FakeLangfuse:
+    """``Protocol``-shaped stub satisfying ``LangfuseLike``."""
+
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, Any]] = []
+        self.observations: list[_RecordingObservation] = []
+
+    @contextlib.contextmanager
+    def start_as_current_observation(
+        self,
+        *,
+        name: str,
+        as_type: str,
+        input: Any = None,
+        metadata: Any = None,
+        model: str | None = None,
+    ) -> Iterator[_RecordingObservation]:
+        self.start_calls.append(
+            {
+                "name": name,
+                "as_type": as_type,
+                "input": input,
+                "metadata": metadata,
+                "model": model,
+            }
+        )
+        observation = _RecordingObservation()
+        self.observations.append(observation)
+        yield observation
+
+
+def _traced_provider(
+    fake: _FakeLangfuse,
+    *,
+    batch_size: int = 100,
+    error: Exception | None = None,
+) -> OpenAIEmbeddingProvider:
+    return OpenAIEmbeddingProvider(
+        api_key="sk-secret-key",
+        model="text-embedding-3-small",
+        dimensions=_DIMENSIONS,
+        batch_size=batch_size,
+        client=_client(error=error),
+        observability=ProviderObservability(fake, enabled=True),
+    )
+
+
+def _payloads(fake: _FakeLangfuse) -> str:
+    return "\n".join(json.dumps(call, default=str) for call in fake.start_calls)
+
+
+async def test_trace_records_embed_text_observation() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    await provider.embed_text("a recipe to embed")
+
+    call = fake.start_calls[0]
+    assert call["as_type"] == "embedding"
+    assert call["model"] == "text-embedding-3-small"
+    assert call["input"] == "a recipe to embed"
+    assert call["metadata"] == {
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+        "dimensions": _DIMENSIONS,
+        "batch_size": 1,
+        "text_preview": "a recipe to embed",
+    }
+
+
+async def test_trace_truncates_text_preview() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    long_text = "x" * (EMBEDDING_PREVIEW_CHARS + 50)
+    await provider.embed_text(long_text)
+
+    call = fake.start_calls[0]
+    assert call["input"] == long_text[:EMBEDDING_PREVIEW_CHARS]
+    assert call["metadata"]["text_preview"] == long_text[:EMBEDDING_PREVIEW_CHARS]
+    assert len(call["metadata"]["text_preview"]) == EMBEDDING_PREVIEW_CHARS
+
+
+async def test_trace_records_batch_observation() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake, batch_size=2)
+    await provider.embed_batch(["first", "second", "third"])
+
+    call = fake.start_calls[0]
+    assert call["as_type"] == "embedding"
+    assert call["metadata"]["batch_size"] == 3
+    assert call["metadata"]["text_preview"] == "first"
+    # One observation for the whole batch, regardless of internal chunking.
+    assert len(fake.start_calls) == 1
+
+
+async def test_trace_records_technical_failure_and_reraises() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake, error=APITimeoutError(request=_REQUEST_OBJ))
+    with pytest.raises(EmbeddingTechnicalError):
+        await provider.embed_text("boom")
+
+    update = fake.observations[0].updates[-1]
+    assert update["level"] == "ERROR"
+    assert update["status_message"]
+
+
+async def test_trace_empty_text_short_circuit_does_not_crash() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    embedding = await provider.embed_text("")
+
+    assert embedding.vector == [0.0] * _DIMENSIONS
+    # The observation is still opened (and closed cleanly) for the short-circuit.
+    assert fake.start_calls[0]["as_type"] == "embedding"
+
+
+async def test_trace_context_propagates_into_observation() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    await provider.embed_text(
+        "text",
+        trace_context=TraceContext(session_id="sess-1", input_hash="hash-1"),
+    )
+
+    metadata = fake.start_calls[0]["metadata"]
+    assert metadata["session_id"] == "sess-1"
+    assert metadata["input_hash"] == "hash-1"
+
+
+async def test_trace_payload_carries_no_secret_or_full_text() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    long_text = "secret-ingredient " * 50
+    await provider.embed_text(long_text)
+
+    payloads = _payloads(fake)
+    assert "sk-secret-key" not in payloads
+    # Only the bounded preview is recorded, never the full corpus text.
+    assert long_text not in payloads
+
+
+async def test_disabled_observability_never_touches_client() -> None:
+    fake = _FakeLangfuse()
+    provider = OpenAIEmbeddingProvider(
+        api_key="sk-test",
+        model="text-embedding-3-small",
+        dimensions=_DIMENSIONS,
+        client=_client(),
+        observability=ProviderObservability(fake, enabled=False),
+    )
+    await provider.embed_text("hello")
+    await provider.embed_batch(["a", "b"])
+
+    assert fake.start_calls == []
+    assert fake.observations == []

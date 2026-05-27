@@ -13,9 +13,16 @@ Technical failures raise ``EmbeddingTechnicalError``.
 
 from __future__ import annotations
 
+from typing import Any
+
 import openai
 from openai import AsyncOpenAI
 
+from rag_recipes.providers._observability import (
+    EMBEDDING_PREVIEW_CHARS,
+    ProviderObservability,
+    TraceContext,
+)
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.embeddings.types import Embedding
 from rag_recipes.providers.errors import EmbeddingTechnicalError
@@ -57,6 +64,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         dimensions: int,
         batch_size: int = 100,
         client: AsyncOpenAI | None = None,
+        observability: ProviderObservability | None = None,
     ) -> None:
         # The provider is constructible without Settings, so it enforces the full
         # valid range itself rather than relying on the Settings field's cap.
@@ -66,19 +74,29 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._model = model
         self._dimensions = dimensions
         self._batch_size = batch_size
+        self._obs = observability or ProviderObservability(None, enabled=False)
 
     @staticmethod
     def _is_empty(text: str) -> bool:
         return text.strip() == ""
+
+    def _trace_metadata(self, *, batch_size: int, preview: str) -> dict[str, Any]:
+        # The full corpus text is never recorded — only a bounded preview — so a
+        # trace can't leak large or sensitive input (PLAN § secret/PII guard).
+        return {
+            "provider": "openai",
+            "model": self._model,
+            "dimensions": self._dimensions,
+            "batch_size": batch_size,
+            "text_preview": preview[:EMBEDDING_PREVIEW_CHARS],
+        }
 
     @staticmethod
     def _token_upper_bound(text: str) -> int:
         # cl100k_base is byte-level BPE, so token count never exceeds UTF-8 bytes.
         return len(text.encode("utf-8"))
 
-    def _build_request_chunks(
-        self, texts: list[str], indices: list[int]
-    ) -> list[list[int]]:
+    def _build_request_chunks(self, texts: list[str], indices: list[int]) -> list[list[int]]:
         # Pack non-empty input indices into requests bounded by BOTH the batch_size
         # count cap and the aggregate per-request token budget, preserving order.
         chunks: list[list[int]] = []
@@ -130,30 +148,51 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             )
         return [by_index[i] for i in range(len(chunk))]
 
-    async def embed_text(self, text: str) -> Embedding:
-        if self._is_empty(text):
-            return self._embedding([0.0] * self._dimensions)
-        vectors = await self._embed_chunk([text])
-        return self._embedding(vectors[0])
+    async def embed_text(
+        self, text: str, *, trace_context: TraceContext | None = None
+    ) -> Embedding:
+        with self._obs.trace_embedding(
+            name="openai.embed_text",
+            model=self._model,
+            input=text[:EMBEDDING_PREVIEW_CHARS],
+            metadata=self._trace_metadata(batch_size=1, preview=text),
+            trace_context=trace_context,
+        ):
+            if self._is_empty(text):
+                return self._embedding([0.0] * self._dimensions)
+            vectors = await self._embed_chunk([text])
+            return self._embedding(vectors[0])
 
-    async def embed_batch(self, texts: list[str]) -> list[Embedding]:
-        non_empty_indices = [i for i, text in enumerate(texts) if not self._is_empty(text)]
-        # Preflight: reject any single input over the per-input token limit before
-        # spending on API calls, naming the offending slot — one oversized input
-        # would otherwise 400 the whole request and discard earlier paid chunks.
-        for i in non_empty_indices:
-            est = self._token_upper_bound(texts[i])
-            if est > _MAX_TOKENS_PER_INPUT:
-                raise EmbeddingTechnicalError(
-                    f"input {i} is ~{est} tokens, exceeding the "
-                    f"{_MAX_TOKENS_PER_INPUT}-token per-input limit"
-                )
-        vectors: dict[int, list[float]] = {}
-        for chunk_indices in self._build_request_chunks(texts, non_empty_indices):
-            chunk_vectors = await self._embed_chunk([texts[i] for i in chunk_indices])
-            for index, vector in zip(chunk_indices, chunk_vectors, strict=True):
-                vectors[index] = vector
-        return [
-            self._embedding(vectors.get(i, [0.0] * self._dimensions))
-            for i in range(len(texts))
-        ]
+    async def embed_batch(
+        self, texts: list[str], *, trace_context: TraceContext | None = None
+    ) -> list[Embedding]:
+        # One observation per batch (not per input) keeps the trace count
+        # proportional to the operation rather than to the corpus size.
+        preview = texts[0] if texts else ""
+        with self._obs.trace_embedding(
+            name="openai.embed_batch",
+            model=self._model,
+            input=preview[:EMBEDDING_PREVIEW_CHARS],
+            metadata=self._trace_metadata(batch_size=len(texts), preview=preview),
+            trace_context=trace_context,
+        ):
+            non_empty_indices = [i for i, text in enumerate(texts) if not self._is_empty(text)]
+            # Preflight: reject any single input over the per-input token limit
+            # before spending on API calls, naming the offending slot — one
+            # oversized input would otherwise 400 the whole request and discard
+            # earlier paid chunks.
+            for i in non_empty_indices:
+                est = self._token_upper_bound(texts[i])
+                if est > _MAX_TOKENS_PER_INPUT:
+                    raise EmbeddingTechnicalError(
+                        f"input {i} is ~{est} tokens, exceeding the "
+                        f"{_MAX_TOKENS_PER_INPUT}-token per-input limit"
+                    )
+            vectors: dict[int, list[float]] = {}
+            for chunk_indices in self._build_request_chunks(texts, non_empty_indices):
+                chunk_vectors = await self._embed_chunk([texts[i] for i in chunk_indices])
+                for index, vector in zip(chunk_indices, chunk_vectors, strict=True):
+                    vectors[index] = vector
+            return [
+                self._embedding(vectors.get(i, [0.0] * self._dimensions)) for i in range(len(texts))
+            ]
