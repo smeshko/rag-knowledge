@@ -55,8 +55,15 @@ class _FakeDatum:
 
 
 @dataclass
+class _FakeUsage:
+    prompt_tokens: int
+    total_tokens: int
+
+
+@dataclass
 class _FakeEmbeddingResponse:
     data: list[_FakeDatum]
+    usage: _FakeUsage | None = None
 
 
 class _FakeEmbeddings:
@@ -70,11 +77,15 @@ class _FakeEmbeddings:
         if self._error is not None:
             raise self._error
         inputs: list[str] = list(kwargs["input"])
+        # Deterministic per-call usage: one token per input, so a batch's
+        # aggregate equals its non-empty input count.
+        tokens = len(inputs)
         return _FakeEmbeddingResponse(
             data=[
                 _FakeDatum(i, _deterministic_vector(text, self._dimensions))
                 for i, text in enumerate(inputs)
-            ]
+            ],
+            usage=_FakeUsage(prompt_tokens=tokens, total_tokens=tokens),
         )
 
 
@@ -425,6 +436,40 @@ async def test_trace_records_batch_observation() -> None:
     assert call["metadata"]["text_preview"] == "first"
     # One observation for the whole batch, regardless of internal chunking.
     assert len(fake.start_calls) == 1
+
+
+async def test_trace_records_embed_text_usage_and_status() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    await provider.embed_text("a recipe to embed")
+
+    update = fake.observations[0].updates[-1]
+    assert update["usage_details"] == {"input": 1, "output": 0, "total": 1}
+    assert update["metadata"] == {"status": "success"}
+
+
+async def test_trace_aggregates_batch_usage_across_chunks() -> None:
+    fake = _FakeLangfuse()
+    # batch_size=2 forces three non-empty inputs across two internal chunks; the
+    # single batch observation must report their summed usage, not one chunk's.
+    provider = _traced_provider(fake, batch_size=2)
+    await provider.embed_batch(["first", "second", "third"])
+
+    update = fake.observations[0].updates[-1]
+    assert update["usage_details"] == {"input": 3, "output": 0, "total": 3}
+    assert update["metadata"] == {"status": "success"}
+
+
+async def test_trace_empty_text_records_zero_usage_success() -> None:
+    fake = _FakeLangfuse()
+    provider = _traced_provider(fake)
+    await provider.embed_text("")
+
+    # The short-circuit makes no API call, so usage is zero — but the observation
+    # is still closed with an explicit success status.
+    update = fake.observations[0].updates[-1]
+    assert update["usage_details"] == {"input": 0, "output": 0, "total": 0}
+    assert update["metadata"] == {"status": "success"}
 
 
 async def test_trace_records_technical_failure_and_reraises() -> None:

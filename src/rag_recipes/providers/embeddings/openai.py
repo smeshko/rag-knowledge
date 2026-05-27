@@ -124,7 +124,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             vector=vector,
         )
 
-    async def _embed_chunk(self, chunk: list[str]) -> list[list[float]]:
+    async def _embed_chunk(self, chunk: list[str]) -> tuple[list[list[float]], int, int]:
         try:
             response = await self._client.embeddings.create(
                 model=self._model, input=chunk, dimensions=self._dimensions
@@ -146,7 +146,16 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             raise EmbeddingTechnicalError(
                 f"OpenAI returned indexes {sorted(by_index)} for a chunk of {len(chunk)}"
             )
-        return [by_index[i] for i in range(len(chunk))]
+        usage = response.usage
+        prompt_tokens = usage.prompt_tokens if usage is not None else 0
+        total_tokens = usage.total_tokens if usage is not None else 0
+        return [by_index[i] for i in range(len(chunk))], prompt_tokens, total_tokens
+
+    @staticmethod
+    def _usage_details(prompt_tokens: int, total_tokens: int) -> dict[str, int]:
+        # Langfuse derives token/cost surfacing from ``usage_details`` + model;
+        # embeddings report only input tokens, so ``output`` is always zero.
+        return {"input": prompt_tokens, "output": 0, "total": total_tokens}
 
     async def embed_text(
         self, text: str, *, trace_context: TraceContext | None = None
@@ -157,10 +166,17 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             input=text[:EMBEDDING_PREVIEW_CHARS],
             metadata=self._trace_metadata(batch_size=1, preview=text),
             trace_context=trace_context,
-        ):
+        ) as observation:
             if self._is_empty(text):
+                observation.update(
+                    usage_details=self._usage_details(0, 0), metadata={"status": "success"}
+                )
                 return self._embedding([0.0] * self._dimensions)
-            vectors = await self._embed_chunk([text])
+            vectors, prompt_tokens, total_tokens = await self._embed_chunk([text])
+            observation.update(
+                usage_details=self._usage_details(prompt_tokens, total_tokens),
+                metadata={"status": "success"},
+            )
             return self._embedding(vectors[0])
 
     async def embed_batch(
@@ -175,7 +191,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             input=preview[:EMBEDDING_PREVIEW_CHARS],
             metadata=self._trace_metadata(batch_size=len(texts), preview=preview),
             trace_context=trace_context,
-        ):
+        ) as observation:
             non_empty_indices = [i for i, text in enumerate(texts) if not self._is_empty(text)]
             # Preflight: reject any single input over the per-input token limit
             # before spending on API calls, naming the offending slot — one
@@ -189,10 +205,22 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                         f"{_MAX_TOKENS_PER_INPUT}-token per-input limit"
                     )
             vectors: dict[int, list[float]] = {}
+            # Aggregate token usage across internal chunks so the single batch
+            # observation reports the true cost of the whole operation.
+            prompt_tokens_total = 0
+            total_tokens_total = 0
             for chunk_indices in self._build_request_chunks(texts, non_empty_indices):
-                chunk_vectors = await self._embed_chunk([texts[i] for i in chunk_indices])
+                chunk_vectors, prompt_tokens, total_tokens = await self._embed_chunk(
+                    [texts[i] for i in chunk_indices]
+                )
+                prompt_tokens_total += prompt_tokens
+                total_tokens_total += total_tokens
                 for index, vector in zip(chunk_indices, chunk_vectors, strict=True):
                     vectors[index] = vector
+            observation.update(
+                usage_details=self._usage_details(prompt_tokens_total, total_tokens_total),
+                metadata={"status": "success"},
+            )
             return [
                 self._embedding(vectors.get(i, [0.0] * self._dimensions)) for i in range(len(texts))
             ]
