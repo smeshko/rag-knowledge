@@ -34,6 +34,7 @@ __all__ = [
     "LangfuseLike",
     "LangfuseObservation",
     "ProviderObservability",
+    "SessionScope",
     "TraceContext",
     "build_provider_observability",
 ]
@@ -85,9 +86,18 @@ class LangfuseLike(Protocol):
         model: str | None = None,
     ) -> AbstractContextManager[LangfuseObservation]: ...
 
-    def propagate_attributes(
-        self, *, session_id: str | None = None
-    ) -> AbstractContextManager[Any]: ...
+
+class SessionScope(Protocol):
+    """The v4 ``langfuse.propagate_attributes`` *module-level* function.
+
+    Session grouping is **not** an instance method on the ``Langfuse`` client — it
+    is a free function that sets trace-level attributes on the active OTEL context.
+    We hold it as an injectable callable so the real one is wired by the factory
+    and a recorder can be injected in tests (the client and the session scope are
+    distinct collaborators).
+    """
+
+    def __call__(self, *, session_id: str) -> AbstractContextManager[Any]: ...
 
 
 class _NoopObservation:
@@ -134,9 +144,16 @@ class ProviderObservability:
     traced and un-traced code paths are behaviourally identical.
     """
 
-    def __init__(self, client: LangfuseLike | None, *, enabled: bool) -> None:
+    def __init__(
+        self,
+        client: LangfuseLike | None,
+        *,
+        enabled: bool,
+        session_scope: SessionScope | None = None,
+    ) -> None:
         self._client = client
         self._enabled = enabled and client is not None
+        self._session_scope = session_scope
 
     def trace_generation(
         self,
@@ -192,14 +209,12 @@ class ProviderObservability:
         session_id = trace_context.session_id if trace_context is not None else None
         stack = contextlib.ExitStack()
         try:
-            if session_id is not None:
-                # Session grouping is a v4 *trace attribute*, not observation
-                # metadata: propagate it so every call in one ingestion run shares a
-                # Langfuse session (doc 13 § 13). A session_id buried in metadata
-                # groups nothing in the UI.
-                stack.enter_context(
-                    self._client.propagate_attributes(session_id=session_id)
-                )
+            if session_id is not None and self._session_scope is not None:
+                # Session grouping is a v4 *trace attribute* set by the module-level
+                # ``propagate_attributes`` function, not observation metadata: enter
+                # it before opening the observation so the span inherits the session
+                # and every call in one ingestion run groups together (doc 13 § 13).
+                stack.enter_context(self._session_scope(session_id=session_id))
             raw_observation = stack.enter_context(
                 self._client.start_as_current_observation(
                     name=name, as_type=as_type, input=input, metadata=merged, model=model
@@ -248,7 +263,7 @@ def build_provider_observability(settings: Settings) -> ProviderObservability:
     """
     if not settings.langfuse_enabled:
         return ProviderObservability(None, enabled=False)
-    from langfuse import Langfuse
+    from langfuse import Langfuse, propagate_attributes
 
     client = Langfuse(
         public_key=settings.langfuse_public_key,
@@ -259,4 +274,10 @@ def build_provider_observability(settings: Settings) -> ProviderObservability:
     # The SDK's overloaded ``start_as_current_observation`` returns a union of
     # ``_AgnosticContextManager[...]`` that mypy can't see as our narrower
     # ``LangfuseLike`` Protocol, though it satisfies it structurally at runtime.
-    return ProviderObservability(client, enabled=True)  # type: ignore[arg-type]
+    # ``propagate_attributes`` is a module-level function (not a client method), so
+    # the session scope is wired separately from the client.
+    return ProviderObservability(
+        client,  # type: ignore[arg-type]
+        enabled=True,
+        session_scope=propagate_attributes,
+    )

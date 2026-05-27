@@ -45,7 +45,6 @@ class _FakeLangfuse:
     def __init__(self) -> None:
         self.start_calls: list[dict[str, Any]] = []
         self.observations: list[_RecordingObservation] = []
-        self.propagated_session_ids: list[str | None] = []
 
     @contextlib.contextmanager
     def start_as_current_observation(
@@ -70,9 +69,21 @@ class _FakeLangfuse:
         self.observations.append(observation)
         yield observation
 
+
+class _SessionScopeRecorder:
+    """Records the session IDs propagated as trace attributes.
+
+    Mirrors the *module-level* ``langfuse.propagate_attributes`` callable — the
+    real SDK has no such client method, so it is injected separately from the
+    client (see review #2.1).
+    """
+
+    def __init__(self) -> None:
+        self.session_ids: list[str] = []
+
     @contextlib.contextmanager
-    def propagate_attributes(self, *, session_id: str | None = None) -> Iterator[None]:
-        self.propagated_session_ids.append(session_id)
+    def __call__(self, *, session_id: str) -> Iterator[None]:
+        self.session_ids.append(session_id)
         yield
 
 
@@ -125,7 +136,8 @@ def test_disabled_path_yields_noop_and_never_touches_client(
 
 def test_trace_generation_opens_generation_observation() -> None:
     fake = _FakeLangfuse()
-    obs = ProviderObservability(fake, enabled=True)
+    session = _SessionScopeRecorder()
+    obs = ProviderObservability(fake, enabled=True, session_scope=session)
     ctx = TraceContext(
         session_id="sess-1",
         input_source_span_ids=["span-a", "span-b"],
@@ -151,9 +163,9 @@ def test_trace_generation_opens_generation_observation() -> None:
     assert call["metadata"]["input_source_span_ids"] == ["span-a", "span-b"]
     assert call["metadata"]["input_hash"] == "hash-1"
     # ...but session_id drives Langfuse session grouping, so it is propagated as a
-    # trace attribute, never recorded in observation metadata.
+    # trace attribute via the session scope, never recorded in observation metadata.
     assert "session_id" not in call["metadata"]
-    assert fake.propagated_session_ids == ["sess-1"]
+    assert session.session_ids == ["sess-1"]
     assert fake.observations[0].updates == [{"output": {"parsed": {"ok": True}}}]
 
 
@@ -227,10 +239,6 @@ class _RaisingLangfuse:
             raise _TraceBackendError("start exploded")
         yield _RaisingObservation()
 
-    @contextlib.contextmanager
-    def propagate_attributes(self, *, session_id: str | None = None) -> Iterator[None]:
-        yield
-
 
 def test_trace_start_failure_runs_the_block_untraced() -> None:
     obs = ProviderObservability(_RaisingLangfuse(fail_on_start=True), enabled=True)
@@ -291,7 +299,7 @@ def test_factory_enabled_constructs_client_from_settings(
         return _FakeClient()
 
     monkeypatch.setattr(langfuse, "Langfuse", _fake_ctor, raising=True)
-    build_provider_observability(
+    obs = build_provider_observability(
         _settings(
             langfuse_enabled=True,
             langfuse_public_key="pk-1",
@@ -306,6 +314,17 @@ def test_factory_enabled_constructs_client_from_settings(
         "host": "http://localhost:3001",
         "tracing_enabled": True,
     }
+    # The session scope must be wired to the real *module-level* function — not a
+    # client method, which the SDK does not expose (review #2.1).
+    assert obs._session_scope is langfuse.propagate_attributes
+
+
+def test_session_scope_is_a_module_function_not_a_client_method() -> None:
+    # Pins the round-2 #1 SDK-shape contract: the v4 ``Langfuse`` client has no
+    # ``propagate_attributes`` method, so wiring it as a client call would silently
+    # fall back to the no-op path on the real SDK.
+    assert callable(langfuse.propagate_attributes)
+    assert not hasattr(langfuse.Langfuse, "propagate_attributes")
 
 
 # --- secret guard ------------------------------------------------------------

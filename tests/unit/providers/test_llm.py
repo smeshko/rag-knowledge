@@ -336,7 +336,6 @@ class _FakeLangfuse:
     def __init__(self) -> None:
         self.start_calls: list[dict[str, Any]] = []
         self.observations: list[_RecordingObservation] = []
-        self.propagated_session_ids: list[str | None] = []
 
     @contextlib.contextmanager
     def start_as_current_observation(
@@ -361,20 +360,31 @@ class _FakeLangfuse:
         self.observations.append(observation)
         yield observation
 
+
+class _SessionScopeRecorder:
+    """Records propagated session IDs (the module-level ``propagate_attributes``)."""
+
+    def __init__(self) -> None:
+        self.session_ids: list[str] = []
+
     @contextlib.contextmanager
-    def propagate_attributes(self, *, session_id: str | None = None) -> Iterator[None]:
-        self.propagated_session_ids.append(session_id)
+    def __call__(self, *, session_id: str) -> Iterator[None]:
+        self.session_ids.append(session_id)
         yield
 
 
 def _traced_provider(
-    fake: _FakeLangfuse, *, response: _FakeCompletion | None = None, error: Exception | None = None
+    fake: _FakeLangfuse,
+    *,
+    response: _FakeCompletion | None = None,
+    error: Exception | None = None,
+    session_scope: _SessionScopeRecorder | None = None,
 ) -> OpenAILLMProvider:
     return OpenAILLMProvider(
         api_key="sk-secret-key",
         default_model="gpt-4.1",
         client=_client(response=response, error=error),
-        observability=ProviderObservability(fake, enabled=True),
+        observability=ProviderObservability(fake, enabled=True, session_scope=session_scope),
     )
 
 
@@ -435,7 +445,10 @@ async def test_trace_records_technical_failure_and_reraises() -> None:
 
 async def test_trace_context_propagates_into_observation() -> None:
     fake = _FakeLangfuse()
-    provider = _traced_provider(fake, response=_completion(content='{"ok": true}'))
+    session = _SessionScopeRecorder()
+    provider = _traced_provider(
+        fake, response=_completion(content='{"ok": true}'), session_scope=session
+    )
     await provider.generate_structured_output(
         _OPENAI_REQUEST,
         trace_context=TraceContext(
@@ -451,7 +464,7 @@ async def test_trace_context_propagates_into_observation() -> None:
     # session_id is propagated as a trace attribute for Langfuse session grouping,
     # not folded into observation metadata.
     assert "session_id" not in metadata
-    assert fake.propagated_session_ids == ["sess-1"]
+    assert session.session_ids == ["sess-1"]
 
 
 async def test_trace_payload_carries_no_secret() -> None:
