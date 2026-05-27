@@ -45,6 +45,7 @@ class _FakeLangfuse:
     def __init__(self) -> None:
         self.start_calls: list[dict[str, Any]] = []
         self.observations: list[_RecordingObservation] = []
+        self.propagated_session_ids: list[str | None] = []
 
     @contextlib.contextmanager
     def start_as_current_observation(
@@ -68,6 +69,11 @@ class _FakeLangfuse:
         observation = _RecordingObservation()
         self.observations.append(observation)
         yield observation
+
+    @contextlib.contextmanager
+    def propagate_attributes(self, *, session_id: str | None = None) -> Iterator[None]:
+        self.propagated_session_ids.append(session_id)
+        yield
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -141,10 +147,13 @@ def test_trace_generation_opens_generation_observation() -> None:
     assert call["input"] == "extract this"
     assert call["metadata"]["provider"] == "openai"
     assert call["metadata"]["status"] == "success"
-    # trace_context merged into metadata.
-    assert call["metadata"]["session_id"] == "sess-1"
+    # input_source_span_ids / input_hash ride in observation metadata...
     assert call["metadata"]["input_source_span_ids"] == ["span-a", "span-b"]
     assert call["metadata"]["input_hash"] == "hash-1"
+    # ...but session_id drives Langfuse session grouping, so it is propagated as a
+    # trace attribute, never recorded in observation metadata.
+    assert "session_id" not in call["metadata"]
+    assert fake.propagated_session_ids == ["sess-1"]
     assert fake.observations[0].updates == [{"output": {"parsed": {"ok": True}}}]
 
 

@@ -82,6 +82,10 @@ class LangfuseLike(Protocol):
         model: str | None = None,
     ) -> AbstractContextManager[LangfuseObservation]: ...
 
+    def propagate_attributes(
+        self, *, session_id: str | None = None
+    ) -> AbstractContextManager[Any]: ...
+
 
 class _NoopObservation:
     """Sentinel yielded on the disabled path — ``update`` does nothing."""
@@ -156,9 +160,21 @@ class ProviderObservability:
             yield _NOOP
             return
         merged = self._merge_trace_context(metadata, trace_context)
-        with self._client.start_as_current_observation(
-            name=name, as_type=as_type, input=input, metadata=merged, model=model
-        ) as observation:
+        session_id = trace_context.session_id if trace_context is not None else None
+        with contextlib.ExitStack() as stack:
+            if session_id is not None:
+                # Session grouping is a v4 *trace attribute*, not observation
+                # metadata: propagate it so every call in one ingestion run shares a
+                # Langfuse session (doc 13 § 13). A session_id buried in metadata
+                # groups nothing in the UI.
+                stack.enter_context(
+                    self._client.propagate_attributes(session_id=session_id)
+                )
+            observation = stack.enter_context(
+                self._client.start_as_current_observation(
+                    name=name, as_type=as_type, input=input, metadata=merged, model=model
+                )
+            )
             try:
                 yield observation
             except Exception as exc:
@@ -174,8 +190,6 @@ class ProviderObservability:
         if trace_context is None:
             return metadata
         merged = dict(metadata)
-        if trace_context.session_id is not None:
-            merged["session_id"] = trace_context.session_id
         if trace_context.input_source_span_ids is not None:
             merged["input_source_span_ids"] = trace_context.input_source_span_ids
         if trace_context.input_hash is not None:

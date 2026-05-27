@@ -336,6 +336,7 @@ class _FakeLangfuse:
     def __init__(self) -> None:
         self.start_calls: list[dict[str, Any]] = []
         self.observations: list[_RecordingObservation] = []
+        self.propagated_session_ids: list[str | None] = []
 
     @contextlib.contextmanager
     def start_as_current_observation(
@@ -359,6 +360,11 @@ class _FakeLangfuse:
         observation = _RecordingObservation()
         self.observations.append(observation)
         yield observation
+
+    @contextlib.contextmanager
+    def propagate_attributes(self, *, session_id: str | None = None) -> Iterator[None]:
+        self.propagated_session_ids.append(session_id)
+        yield
 
 
 def _traced_provider(
@@ -440,9 +446,12 @@ async def test_trace_context_propagates_into_observation() -> None:
     )
 
     metadata = fake.start_calls[0]["metadata"]
-    assert metadata["session_id"] == "sess-1"
     assert metadata["input_source_span_ids"] == ["span-a"]
     assert metadata["input_hash"] == "hash-1"
+    # session_id is propagated as a trace attribute for Langfuse session grouping,
+    # not folded into observation metadata.
+    assert "session_id" not in metadata
+    assert fake.propagated_session_ids == ["sess-1"]
 
 
 async def test_trace_payload_carries_no_secret() -> None:
