@@ -1,10 +1,29 @@
-"""Bind FakeLLMProvider to the shared LLM contract suite."""
+"""Bind FakeLLMProvider and OpenAILLMProvider to the shared LLM contract suite.
+
+The OpenAI tests inject a typed fake async client (a ``Protocol``-shaped stub
+whose ``chat.completions.create`` is an async method), so they exercise the real
+provider's branching with no network and no API key.
+"""
 
 from __future__ import annotations
 
-import pytest
+import re
+from dataclasses import dataclass, field
+from typing import Any
 
+import httpx
+import pytest
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    RateLimitError,
+)
+
+from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.fake import FakeLLMProvider
+from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
 from tests.contracts.llm import LLMContract
 
@@ -17,6 +36,130 @@ _REQUEST = StructuredOutputRequest(
     json_schema={"type": "object"},
 )
 _OUTPUT = {"title": "Soup", "ingredients": [{"name": "salt"}]}
+
+_STRICT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"ok": {"type": "boolean"}},
+    "required": ["ok"],
+    "additionalProperties": False,
+}
+
+_OPENAI_REQUEST = StructuredOutputRequest(
+    provider="openai",
+    model="gpt-4.1",
+    prompt_version="recipe-v1",
+    schema_version="recipe.v1",
+    input="Return ok=true",
+    json_schema=_STRICT_SCHEMA,
+)
+
+_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+# --- typed fake async OpenAI client -----------------------------------------
+
+
+@dataclass
+class _FakeMessage:
+    content: str | None = None
+    refusal: str | None = None
+
+
+@dataclass
+class _FakeChoice:
+    message: _FakeMessage
+    finish_reason: str = "stop"
+
+
+@dataclass
+class _FakeUsage:
+    prompt_tokens: int = 11
+    completion_tokens: int = 7
+
+
+@dataclass
+class _FakeCompletion:
+    choices: list[_FakeChoice]
+    usage: _FakeUsage | None = field(default_factory=_FakeUsage)
+
+
+_DEFAULT_USAGE = _FakeUsage()
+
+
+def _completion(
+    *,
+    content: str | None = None,
+    refusal: str | None = None,
+    finish_reason: str = "stop",
+    usage: _FakeUsage | None = _DEFAULT_USAGE,
+) -> _FakeCompletion:
+    return _FakeCompletion(
+        choices=[
+            _FakeChoice(
+                message=_FakeMessage(content=content, refusal=refusal),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=usage,
+    )
+
+
+class _FakeCompletions:
+    def __init__(
+        self, response: _FakeCompletion | None = None, error: Exception | None = None
+    ) -> None:
+        self._response = response
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeCompletion:
+        self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+
+class _FakeChat:
+    def __init__(self, completions: _FakeCompletions) -> None:
+        self.completions = completions
+
+
+class _FakeAsyncClient:
+    """Duck-typed stand-in for ``AsyncOpenAI`` exposing ``chat.completions.create``."""
+
+    def __init__(
+        self, response: _FakeCompletion | None = None, error: Exception | None = None
+    ) -> None:
+        self.completions = _FakeCompletions(response, error)
+        self.chat = _FakeChat(self.completions)
+
+
+def _client(
+    *, response: _FakeCompletion | None = None, error: Exception | None = None
+) -> Any:
+    return _FakeAsyncClient(response=response, error=error)
+
+
+def _provider_with(response: _FakeCompletion) -> OpenAILLMProvider:
+    return OpenAILLMProvider(
+        api_key="sk-test", default_model="gpt-4.1", client=_client(response=response)
+    )
+
+
+_REQUEST_OBJ = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+_RESPONSE_OBJ = httpx.Response(429, request=_REQUEST_OBJ)
+
+_TECHNICAL_ERRORS = [
+    APITimeoutError(request=_REQUEST_OBJ),
+    APIConnectionError(message="boom", request=_REQUEST_OBJ),
+    RateLimitError("rate limited", response=_RESPONSE_OBJ, body=None),
+    APIStatusError("bad status", response=_RESPONSE_OBJ, body=None),
+    APIError("base error", request=_REQUEST_OBJ, body=None),
+]
+
+
+# --- contract bindings -------------------------------------------------------
 
 
 class TestFakeLLM(LLMContract):
@@ -31,3 +174,138 @@ class TestFakeLLM(LLMContract):
     @pytest.fixture
     def failure_provider(self) -> FakeLLMProvider:
         return FakeLLMProvider(fail_technically=True)
+
+
+class TestOpenAILLM(LLMContract):
+    @pytest.fixture
+    def provider(self) -> OpenAILLMProvider:
+        return _provider_with(_completion(content='{"ok": true}'))
+
+    @pytest.fixture
+    def sample_request(self) -> StructuredOutputRequest:
+        return _OPENAI_REQUEST
+
+    @pytest.fixture
+    def failure_provider(self) -> OpenAILLMProvider:
+        return OpenAILLMProvider(
+            api_key="sk-test",
+            default_model="gpt-4.1",
+            client=_client(error=APITimeoutError(request=_REQUEST_OBJ)),
+        )
+
+
+# --- bespoke OpenAILLMProvider tests ----------------------------------------
+
+
+def test_default_client_disables_sdk_retries() -> None:
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1")
+    assert provider._client.max_retries == 0
+
+
+async def test_strict_json_schema_payload() -> None:
+    client = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1", client=client)
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    kwargs = client.completions.calls[0]
+    assert kwargs["model"] == _OPENAI_REQUEST.model
+    response_format = kwargs["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"] == _OPENAI_REQUEST.json_schema
+
+
+async def test_single_user_message_no_system() -> None:
+    client = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1", client=client)
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    messages = client.completions.calls[0]["messages"]
+    assert messages == [{"role": "user", "content": _OPENAI_REQUEST.input}]
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    ["recipe.v1", "", "....", "x" * 100],
+)
+async def test_schema_name_is_always_valid(schema_version: str) -> None:
+    client = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1", client=client)
+    request = _OPENAI_REQUEST.model_copy(update={"schema_version": schema_version})
+    await provider.generate_structured_output(request)
+
+    name = client.completions.calls[0]["response_format"]["json_schema"]["name"]
+    assert _NAME_RE.match(name), f"invalid schema name: {name!r}"
+
+
+async def test_clean_parse_sets_output_json() -> None:
+    provider = _provider_with(_completion(content='{"ok": true}', usage=_FakeUsage(13, 5)))
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json == {"ok": True}
+    assert response.parse_error is None
+    assert response.raw_text == '{"ok": true}'
+    assert response.usage.input_tokens == 13
+    assert response.usage.output_tokens == 5
+    assert response.provider == "openai"
+    assert response.model == "gpt-4.1"
+
+
+@pytest.mark.parametrize(
+    ("content", "finish_reason"),
+    [
+        ("not json at all", "stop"),
+        ("[1, 2, 3]", "stop"),
+        ('{"ok": true}', "length"),
+        ('{"ok": true}', "content_filter"),
+    ],
+)
+async def test_parse_failures_do_not_raise(content: str, finish_reason: str) -> None:
+    client = _client(response=_completion(content=content, finish_reason=finish_reason))
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1", client=client)
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error
+    assert response.raw_text == content
+    assert len(client.completions.calls) == 1
+
+
+async def test_refusal_preserves_text() -> None:
+    client = _client(
+        response=_completion(content=None, refusal="I cannot help with that.")
+    )
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1", client=client)
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error
+    assert response.raw_text == "I cannot help with that."
+    assert len(client.completions.calls) == 1
+
+
+async def test_missing_content_and_refusal_yields_empty_raw_text() -> None:
+    provider = _provider_with(_completion(content=None, refusal=None))
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error
+    assert response.raw_text == ""
+
+
+async def test_missing_usage_falls_back_to_zero() -> None:
+    provider = _provider_with(_completion(content='{"ok": true}', usage=None))
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.usage.input_tokens == 0
+    assert response.usage.output_tokens == 0
+
+
+@pytest.mark.parametrize("error", _TECHNICAL_ERRORS)
+async def test_technical_errors_wrapped(error: Exception) -> None:
+    provider = OpenAILLMProvider(
+        api_key="sk-test", default_model="gpt-4.1", client=_client(error=error)
+    )
+    with pytest.raises(LLMTechnicalError) as exc_info:
+        await provider.generate_structured_output(_OPENAI_REQUEST)
+    assert exc_info.value.__cause__ is error
