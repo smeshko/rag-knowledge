@@ -21,6 +21,7 @@ from rag_recipes.api.dependencies import require_api_token
 from rag_recipes.api.errors import ApiError, ErrorCode, error_body
 from rag_recipes.api.routes import documents, health
 from rag_recipes.config import get_settings
+from rag_recipes.ingestion.queue import create_arq_pool
 from rag_recipes.storage.session import build_engine, build_session_factory
 
 
@@ -34,9 +35,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.redis = redis_client
+    arq_redis = None
     try:
+        # `create_arq_pool` may raise if Redis is unreachable; the outer
+        # `finally` closes `redis_client` and disposes the engine regardless.
+        arq_redis = await create_arq_pool(settings)
+        app.state.arq_redis = arq_redis
         yield
     finally:
+        if arq_redis is not None:
+            await arq_redis.aclose()
         await redis_client.aclose()
         await engine.dispose()
 
