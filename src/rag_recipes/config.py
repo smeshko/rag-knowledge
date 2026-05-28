@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     worker_keep_result_seconds: int = Field(default=60, ge=0)
     worker_health_check_interval_seconds: int = Field(default=30, ge=1)
 
+    stuck_job_timeout_minutes: int = Field(default=30, ge=1)
+    stuck_job_check_interval_minutes: int = Field(default=5, ge=1, le=60)
+
     @field_validator("redis_url")
     @classmethod
     def _redis_url_requires_credentials(cls, value: str) -> str:
@@ -91,6 +94,23 @@ class Settings(BaseSettings):
         if url_password != self.redis_password:
             raise ValueError(
                 "REDIS_URL password does not match REDIS_PASSWORD; update both in .env"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _stuck_check_interval_divides_60(self) -> Settings:
+        # arq's cron(..., minute={...}) encodes "every N minutes" only when N
+        # divides 60 — otherwise the schedule skews at the top of each hour
+        # (e.g. N=7 maps to {0,7,14,21,28,35,42,49,56} with a 4-minute gap
+        # 56→00). Reject non-divisors at Settings load so the operator picks
+        # from the documented valid set rather than discovering skew via a
+        # missed sweep tick.
+        value = self.stuck_job_check_interval_minutes
+        if 60 % value != 0:
+            raise ValueError(
+                "stuck_job_check_interval_minutes must be a divisor of 60 "
+                "(valid: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60); "
+                f"got {value}"
             )
         return self
 
