@@ -16,6 +16,7 @@ from rag_recipes.storage.models.source_asset import SourceAsset
 
 if TYPE_CHECKING:
     from rag_recipes.storage.models.extraction_run import ExtractionRun
+    from rag_recipes.storage.models.ingestion_failure import IngestionFailure
     from rag_recipes.storage.models.knowledge_item import KnowledgeItem
     from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -89,6 +90,11 @@ class Document(Base):
     knowledge_items: Mapped[list[KnowledgeItem]] = relationship(
         "KnowledgeItem",
         back_populates="document",
+    )
+    failures: Mapped[list[IngestionFailure]] = relationship(
+        "IngestionFailure",
+        back_populates="document",
+        cascade="all, delete-orphan",
     )
 
     @validates("source_type", "asset")

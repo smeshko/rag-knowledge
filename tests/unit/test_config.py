@@ -172,3 +172,41 @@ def test_worker_keep_result_seconds_rejects_negative(monkeypatch: pytest.MonkeyP
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
     assert "worker_keep_result_seconds" in str(excinfo.value).lower()
+
+
+def test_stuck_job_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    for var in ("STUCK_JOB_TIMEOUT_MINUTES", "STUCK_JOB_CHECK_INTERVAL_MINUTES"):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.stuck_job_timeout_minutes == 30
+    assert settings.stuck_job_check_interval_minutes == 5
+
+
+@pytest.mark.parametrize("interval", ["7", "11", "13"])
+def test_stuck_job_check_interval_rejects_non_divisors(
+    monkeypatch: pytest.MonkeyPatch, interval: str
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("STUCK_JOB_CHECK_INTERVAL_MINUTES", interval)
+    with pytest.raises(ValidationError, match="divisor of 60"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("interval", ["0", "61"])
+def test_stuck_job_check_interval_out_of_bounds_rejected(
+    monkeypatch: pytest.MonkeyPatch, interval: str
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("STUCK_JOB_CHECK_INTERVAL_MINUTES", interval)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "stuck_job_check_interval_minutes" in str(excinfo.value).lower()
+
+
+def test_stuck_job_timeout_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("STUCK_JOB_TIMEOUT_MINUTES", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "stuck_job_timeout_minutes" in str(excinfo.value).lower()
