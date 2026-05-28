@@ -17,16 +17,25 @@ setup:
 smoke-langfuse:
     uv run python scripts/smoke_langfuse.py
 
-# Run the API with autoreload (alias for `just dev-api`).
-dev: dev-api
+# Run API + worker in parallel under one process group; Ctrl-C tears down both.
+# For per-process log streams during debugging, prefer two terminals:
+# `just dev-api` in one and `just dev-worker` in the other.
+dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'kill 0' EXIT
+    just dev-api &
+    just dev-worker &
+    wait
 
 # Run the FastAPI app under uvicorn with autoreload.
 dev-api:
     uv run uvicorn rag_recipes.api.app:app --reload
 
-# Placeholder until Epic 7 wires up the real arq worker.
+# Run the arq worker against compose Redis. Reads .env via uv run.
+# `--watch src/` autoreloads on source changes (mirrors uvicorn --reload).
 dev-worker:
-    @echo "arq worker not implemented until Epic 7 — recipe reserved."
+    uv run arq rag_recipes.ingestion.jobs.WorkerSettings --watch src/
 
 # Run the full test suite.
 test:
