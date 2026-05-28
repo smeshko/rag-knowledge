@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+import pytest
 import sqlalchemy as sa
 
 from rag_recipes.storage.base import Base
@@ -13,6 +14,7 @@ from rag_recipes.storage.enums import (
     DocumentStatus,
     ExtractionRunStatus,
     KnowledgeItemStatus,
+    ReprocessMode,
     SourceType,
     UploadStatus,
 )
@@ -89,6 +91,18 @@ def test_chunk_type_members() -> None:
 def test_chunk_parent_type_members() -> None:
     assert issubclass(ChunkParentType, StrEnum)
     assert {member.value for member in ChunkParentType} == {"knowledge_item"}
+
+
+def test_reprocess_mode_members() -> None:
+    assert issubclass(ReprocessMode, StrEnum)
+    assert {member.value for member in ReprocessMode} == {
+        "auto",
+        "reuse_source_spans",
+        "new_source_version",
+    }
+    assert ReprocessMode("auto") is ReprocessMode.AUTO
+    with pytest.raises(ValueError):
+        ReprocessMode("bogus")
 
 
 def _column_enum(table: str, column: str) -> sa.Enum:

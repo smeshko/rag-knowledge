@@ -53,3 +53,9 @@ class ChunkType(StrEnum):
 
 class ChunkParentType(StrEnum):
     KNOWLEDGE_ITEM = "knowledge_item"
+
+
+class ReprocessMode(StrEnum):
+    AUTO = "auto"
+    REUSE_SOURCE_SPANS = "reuse_source_spans"
+    NEW_SOURCE_VERSION = "new_source_version"

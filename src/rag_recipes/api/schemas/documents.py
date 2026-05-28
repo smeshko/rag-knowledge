@@ -80,3 +80,15 @@ class IngestionStatusResponse(BaseModel):
     current_source_version: int | None
     progress: IngestionProgress
     terminal: bool
+
+
+class ReprocessRequest(BaseModel):
+    mode: str
+    reason: str | None = None
+
+
+class ReprocessResponse(BaseModel):
+    document_id: str
+    status: str
+    previous_active_source_version: int | None
+    current_source_version: int | None
