@@ -37,6 +37,8 @@ def test_table_columns_match_doc_2() -> None:
         "language",
         "active_source_version",
         "status",
+        "last_reprocess_mode",
+        "last_reprocess_reason",
         "created_at",
         "updated_at",
     ]
@@ -56,6 +58,14 @@ def test_nullable_columns() -> None:
     assert cols["subcategory"].nullable is True
     assert cols["language"].nullable is True
     assert cols["active_source_version"].nullable is True
+    assert cols["last_reprocess_mode"].nullable is True
+    assert cols["last_reprocess_reason"].nullable is True
+
+
+def test_reprocess_columns_default_to_none() -> None:
+    doc = Document()
+    assert doc.last_reprocess_mode is None
+    assert doc.last_reprocess_reason is None
 
 
 def test_default_id_uses_doc_prefix() -> None:

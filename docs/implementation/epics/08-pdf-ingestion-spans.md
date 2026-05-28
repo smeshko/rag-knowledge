@@ -73,6 +73,8 @@ Upload a small synthetic PDF; poll `GET /documents/{id}/status` until status mov
 
 > **Forward-note from Epic 6 Phase 6.2.** `GET /documents/{id}/status` currently mirrors `current_source_version = active_source_version` as a placeholder (both `null` at `queued`; the span/run tables are empty pre-Epic-8 so there is no in-progress version to point at). Once 8.2 writes versioned `source_span`s and real progress, replace the mirror with the actual in-progress version per [doc 6 §5](../../architecture/06-backend-api-shape.md#5-get-ingestion-status) — e.g. `active_source_version: null`, `current_source_version: 1` mid-ingestion. Update or replace the 6.2 mirror test (`tests/integration/test_documents_status.py::test_current_source_version_mirrors_active_when_set`) accordingly so the 6.2 placeholder isn't frozen as a permanent contract.
 
+> **Forward-note from Epic 6 Phase 6.3.** `POST /documents/{id}/reprocess` returns `current_source_version` mirroring `previous_active_source_version` (the value of `active_source_version` at the time of the request) for the same reason — no new source version exists pre-Epic-8. Once 8.2 dispatches the actual job and writes a new versioned span set, return the real new version per [doc 6 §6](../../architecture/06-backend-api-shape.md#6-trigger-reprocessing) (e.g. `previous_active_source_version: 1`, `current_source_version: 2`). The reprocess happy-path tests in `tests/integration/test_documents_reprocess.py` currently assert the mirror; update them when the real version arrives.
+
 ### What to build
 
 - Populate `progress.pages_total` and `progress.pages_processed` on `GET /documents/{id}/status` while ingestion runs:

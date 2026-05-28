@@ -144,14 +144,22 @@ async def _seed_chunk(
 
 
 @pytest.fixture
-def client(db_session: AsyncSession) -> Iterator[httpx.AsyncClient]:
+def client(
+    db_session: AsyncSession,
+    override_settings_with_token: None,
+    auth_headers: dict[str, str],
+) -> Iterator[httpx.AsyncClient]:
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield db_session
 
     app.dependency_overrides[get_session] = _override_session
     transport = httpx.ASGITransport(app=app)
     try:
-        yield httpx.AsyncClient(transport=transport, base_url="http://testserver")
+        yield httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=auth_headers,
+        )
     finally:
         app.dependency_overrides.pop(get_session, None)
 

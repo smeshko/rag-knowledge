@@ -22,9 +22,15 @@ from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
+from tests.integration.conftest import AUTH_HEADERS
 
 PDF_BYTES = b"%PDF-1.4\n%minimal test pdf payload\n%%EOF\n"
 NON_PDF_BYTES = b"not a pdf at all"
+
+
+@pytest.fixture(autouse=True)
+def _auto_token_override(override_settings_with_token: None) -> None:
+    """Apply the fail-closed auth override to every documents-upload test."""
 
 
 class SpyLocalFileStorage(LocalFileStorage):
@@ -75,6 +81,8 @@ def app_storage(tmp_path: Path) -> SpyLocalFileStorage:
 def client(
     savepoint_session: AsyncSession,
     app_storage: SpyLocalFileStorage,
+    override_settings_with_token: None,
+    auth_headers: dict[str, str],
 ) -> Iterator[httpx.AsyncClient]:
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield savepoint_session
@@ -86,7 +94,11 @@ def client(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        yield httpx.AsyncClient(transport=transport, base_url="http://testserver")
+        yield httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=auth_headers,
+        )
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(get_file_storage, None)
@@ -371,7 +383,11 @@ async def test_duplicate_race_recovery_deletes_orphan_and_returns_winner(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("loser.pdf", PDF_BYTES, "application/pdf")},
@@ -419,7 +435,11 @@ async def test_post_storage_precommit_failure_deletes_orphan_and_returns_500(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("loser.pdf", PDF_BYTES, "application/pdf")},
@@ -460,7 +480,11 @@ async def test_commit_ambiguous_keeps_file_and_returns_500(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("loser.pdf", PDF_BYTES, "application/pdf")},
@@ -503,7 +527,11 @@ async def test_pre_storage_duplicate_lookup_failure_returns_500(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
@@ -548,7 +576,11 @@ async def test_pre_storage_put_object_failure_returns_500(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
@@ -617,7 +649,11 @@ async def test_duplicate_race_recovery_survives_delete_failure(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("loser.pdf", PDF_BYTES, "application/pdf")},
@@ -662,7 +698,11 @@ async def test_post_storage_precommit_cleanup_failure_still_returns_500(
     app.dependency_overrides[get_file_storage] = _override_storage
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=AUTH_HEADERS,
+        ) as c:
             response = await c.post(
                 "/api/v1/documents",
                 files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},

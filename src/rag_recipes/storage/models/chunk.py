@@ -29,6 +29,8 @@ class Chunk(Base):
             ["knowledge_items.id", "knowledge_items.document_id"],
             name="fk_chunks_parent_document",
         ),
+        sa.Index("ix_chunks_document_id", "document_id"),
+        sa.Index("ix_chunks_parent_type_parent_id", "parent_type", "parent_id"),
     )
 
     ID_PREFIX: ClassVar[str] = "chunk"

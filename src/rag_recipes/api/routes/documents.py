@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,13 +37,16 @@ from rag_recipes.api.schemas.documents import (
     DocumentResponse,
     IngestionProgress,
     IngestionStatusResponse,
+    ReprocessRequest,
+    ReprocessResponse,
     UploadIngestion,
     UploadResponse,
 )
 from rag_recipes.providers.errors import FileStorageError
 from rag_recipes.providers.file_storage.base import FileStorageProvider
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import DocumentStatus, ReprocessMode, SourceType, UploadStatus
 from rag_recipes.storage.ids import new_id
+from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
 
@@ -159,28 +162,16 @@ async def upload_document(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     storage: FileStorageProvider = Depends(get_file_storage),  # noqa: B008
 ) -> Any:
-    try:
-        return await _handle_upload(
-            file=file,
-            category=category,
-            subcategory=subcategory,
-            title=title,
-            author=author,
-            language=language,
-            session=session,
-            storage=storage,
-        )
-    except ApiError as err:
-        return JSONResponse(status_code=err.status_code, content=err.to_body())
-    except Exception:
-        # Final safety net: no failure escapes the doc-6 envelope shape.
-        # No deletion here — earlier handlers already managed any orphan.
-        fallback = ApiError(
-            status_code=500,
-            code=ErrorCode.INTERNAL_ERROR,
-            message="Unexpected server error.",
-        )
-        return JSONResponse(status_code=fallback.status_code, content=fallback.to_body())
+    return await _handle_upload(
+        file=file,
+        category=category,
+        subcategory=subcategory,
+        title=title,
+        author=author,
+        language=language,
+        session=session,
+        storage=storage,
+    )
 
 
 async def _handle_upload(
@@ -349,37 +340,34 @@ async def list_documents(
     offset: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
-    try:
-        status_enum = _parse_enum(DocumentStatus, status, field="status")
-        source_type_enum = _parse_enum(SourceType, source_type, field="source_type")
-        limit_int = _parse_int(
-            limit,
-            field="limit",
-            default=_LIST_LIMIT_DEFAULT,
-            minimum=1,
-            maximum=_LIST_LIMIT_MAX,
-        )
-        offset_int = _parse_int(
-            offset,
-            field="offset",
-            default=_LIST_OFFSET_DEFAULT,
-            minimum=0,
-        )
-        # `category` is free text per the plan — no enum validation.
-        category_value = category if category else None
-        repo = DocumentRepository(session)
-        documents = await repo.list_documents(
-            category=category_value,
-            status=status_enum,
-            source_type=source_type_enum,
-            limit=limit_int,
-            offset=offset_int,
-        )
-        return DocumentListResponse(
-            documents=[DocumentListItem.model_validate(doc) for doc in documents],
-        )
-    except ApiError as err:
-        return JSONResponse(status_code=err.status_code, content=err.to_body())
+    status_enum = _parse_enum(DocumentStatus, status, field="status")
+    source_type_enum = _parse_enum(SourceType, source_type, field="source_type")
+    limit_int = _parse_int(
+        limit,
+        field="limit",
+        default=_LIST_LIMIT_DEFAULT,
+        minimum=1,
+        maximum=_LIST_LIMIT_MAX,
+    )
+    offset_int = _parse_int(
+        offset,
+        field="offset",
+        default=_LIST_OFFSET_DEFAULT,
+        minimum=0,
+    )
+    # `category` is free text per the plan — no enum validation.
+    category_value = category if category else None
+    repo = DocumentRepository(session)
+    documents = await repo.list_documents(
+        category=category_value,
+        status=status_enum,
+        source_type=source_type_enum,
+        limit=limit_int,
+        offset=offset_int,
+    )
+    return DocumentListResponse(
+        documents=[DocumentListItem.model_validate(doc) for doc in documents],
+    )
 
 
 async def _require_document(repo: DocumentRepository, document_id: str) -> Any:
@@ -399,23 +387,20 @@ async def get_document(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
-    try:
-        repo = DocumentRepository(session)
-        document = await _require_document(repo, document_id)
-        item_counts = await repo.count_knowledge_items(document_id)
-        counts = DocumentCounts(
-            source_spans=await repo.count_source_spans(document_id),
-            knowledge_items=item_counts.total,
-            ready_items=item_counts.ready,
-            needs_review_items=item_counts.needs_review,
-            chunks=await repo.count_chunks(document_id),
-        )
-        return DocumentDetailResponse(
-            document=DocumentResponse.model_validate(document),
-            counts=counts,
-        )
-    except ApiError as err:
-        return JSONResponse(status_code=err.status_code, content=err.to_body())
+    repo = DocumentRepository(session)
+    document = await _require_document(repo, document_id)
+    item_counts = await repo.count_knowledge_items(document_id)
+    counts = DocumentCounts(
+        source_spans=await repo.count_source_spans(document_id),
+        knowledge_items=item_counts.total,
+        ready_items=item_counts.ready,
+        needs_review_items=item_counts.needs_review,
+        chunks=await repo.count_chunks(document_id),
+    )
+    return DocumentDetailResponse(
+        document=DocumentResponse.model_validate(document),
+        counts=counts,
+    )
 
 
 @router.get("/documents/{document_id}/status")
@@ -423,25 +408,85 @@ async def get_document_status(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
+    repo = DocumentRepository(session)
+    document = await _require_document(repo, document_id)
+    # `current_source_version` is a TEMPORARY Epic-8 placeholder that
+    # mirrors `active_source_version`. doc 6 §5 documents the two as
+    # diverging mid-ingestion (active: null, current: 1); Epic 8 Phase 8.2
+    # replaces this mirror once versioned spans + real progress exist.
+    return IngestionStatusResponse(
+        document_id=document.id,
+        status=document.status.value,
+        active_source_version=document.active_source_version,
+        current_source_version=document.active_source_version,
+        progress=IngestionProgress(
+            stage=document.status.value,
+            message=None,
+            pages_total=None,
+            pages_processed=None,
+        ),
+        terminal=document.status in _TERMINAL_DOCUMENT_STATUSES,
+    )
+
+
+@router.post("/documents/{document_id}/reprocess")
+async def reprocess_document(
+    document_id: str,
+    body: ReprocessRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> Any:
     try:
-        repo = DocumentRepository(session)
-        document = await _require_document(repo, document_id)
-        # `current_source_version` is a TEMPORARY Epic-8 placeholder that
-        # mirrors `active_source_version`. doc 6 §5 documents the two as
-        # diverging mid-ingestion (active: null, current: 1); Epic 8 Phase 8.2
-        # replaces this mirror once versioned spans + real progress exist.
-        return IngestionStatusResponse(
-            document_id=document.id,
-            status=document.status.value,
-            active_source_version=document.active_source_version,
-            current_source_version=document.active_source_version,
-            progress=IngestionProgress(
-                stage=document.status.value,
-                message=None,
-                pages_total=None,
-                pages_processed=None,
-            ),
-            terminal=document.status in _TERMINAL_DOCUMENT_STATUSES,
+        mode = ReprocessMode(body.mode)
+    except ValueError as exc:
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message="Invalid value for 'mode'.",
+            details={"field": "mode", "value": body.mode},
+        ) from exc
+
+    repo = DocumentRepository(session)
+    document = await repo.get_document(document_id)
+    if document is None:
+        raise ApiError(
+            status_code=404,
+            code=ErrorCode.DOCUMENT_NOT_FOUND,
+            message=f"Document {document_id!r} not found.",
+            details={"document_id": document_id},
         )
-    except ApiError as err:
-        return JSONResponse(status_code=err.status_code, content=err.to_body())
+    previous = document.active_source_version
+
+    # Atomic guarded transition: the WHERE-clause status filter closes the
+    # check-then-write race. Two concurrent POSTs cannot both pass because
+    # Postgres serializes the row UPDATEs; the loser sees status='queued'
+    # (no longer in the terminal set) and matches 0 rows.
+    result = await session.execute(
+        update(Document)
+        .where(
+            Document.id == document_id,
+            Document.status.in_(_TERMINAL_DOCUMENT_STATUSES),
+        )
+        .values(
+            status=DocumentStatus.QUEUED,
+            last_reprocess_mode=mode.value,
+            last_reprocess_reason=body.reason,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:  # type: ignore[attr-defined]
+        raise ApiError(
+            status_code=409,
+            code=ErrorCode.INGESTION_ALREADY_RUNNING,
+            message="Document is not in a terminal state.",
+            details={"document_id": document_id},
+        )
+    await session.commit()
+
+    # `current_source_version` mirrors `active_source_version` until Epic 8
+    # writes versioned source spans (handoff documented in PLAN/TASK-006).
+    return ReprocessResponse(
+        document_id=document_id,
+        status=DocumentStatus.QUEUED.value,
+        previous_active_source_version=previous,
+        current_source_version=previous,
+    )

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -160,3 +160,39 @@ async def db_session(test_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
             await session.close()
             if trans.is_active:
                 await trans.rollback()
+
+
+# Phase 6.3: documents-route tests must send a bearer token because auth fails
+# closed when ``personal_api_token`` is unset.
+TEST_API_TOKEN = "test-personal-api-token"
+AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
+
+
+@pytest.fixture
+def auth_headers() -> dict[str, str]:
+    return dict(AUTH_HEADERS)
+
+
+@pytest.fixture
+def override_settings_with_token() -> Iterator[None]:
+    """Override ``get_settings`` so the auth dependency sees a token configured.
+
+    Documents-route tests opt into this fixture to keep the auth code path
+    real (the route still runs ``require_api_token``) while supplying the
+    token the test client also sends as a bearer header.
+    """
+    from rag_recipes.api.app import app
+    from rag_recipes.api.dependencies import get_settings
+    from rag_recipes.config import Settings
+
+    real = get_settings()
+    overridden = real.model_copy(update={"personal_api_token": TEST_API_TOKEN})
+
+    def _override() -> Settings:
+        return overridden
+
+    app.dependency_overrides[get_settings] = _override
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_settings, None)

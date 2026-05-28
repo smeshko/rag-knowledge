@@ -45,11 +45,12 @@ Re-seeding (e.g. after editing `LANGFUSE_INIT_PROJECT_*` values) requires `just 
 just dev
 ```
 
-Then hit the health endpoint:
+The API is gated by a personal bearer token and **fails closed**: when `PERSONAL_API_TOKEN` is empty, every request — including `/api/v1/health` — returns `401 unauthorized`. Set the variable in `.env` and send it as a header to use the API locally:
 
 ```sh
-curl http://localhost:8000/api/v1/health
+curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8000/api/v1/health
 # {"status":"ok"}
+curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8000/api/v1/documents
 ```
 
 ## Test

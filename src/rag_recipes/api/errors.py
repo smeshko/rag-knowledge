@@ -18,6 +18,8 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_FILE_TYPE = "unsupported_file_type"
     DUPLICATE_SOURCE_ASSET = "duplicate_source_asset"
     DOCUMENT_NOT_FOUND = "document_not_found"
+    UNAUTHORIZED = "unauthorized"
+    INGESTION_ALREADY_RUNNING = "ingestion_already_running"
     INTERNAL_ERROR = "internal_error"
 
 

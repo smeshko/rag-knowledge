@@ -25,6 +25,11 @@ class SourceSpan(Base):
             "locator_hash",
             name="uq_source_spans_document_version_locator",
         ),
+        sa.Index(
+            "ix_source_spans_document_id_source_version",
+            "document_id",
+            "source_version",
+        ),
     )
 
     ID_PREFIX: ClassVar[str] = "span"

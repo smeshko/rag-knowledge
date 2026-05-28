@@ -12,9 +12,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from redis.asyncio import from_url as redis_from_url
 
+from rag_recipes.api.dependencies import require_api_token
+from rag_recipes.api.errors import ApiError, ErrorCode, error_body
 from rag_recipes.api.routes import documents, health
 from rag_recipes.config import get_settings
 from rag_recipes.storage.session import build_engine, build_session_factory
@@ -37,6 +41,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await engine.dispose()
 
 
-app = FastAPI(title="rag-recipes", lifespan=lifespan)
+async def _handle_api_error(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, ApiError)
+    return JSONResponse(status_code=exc.status_code, content=exc.to_body())
+
+
+async def _handle_request_validation_error(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    assert isinstance(exc, RequestValidationError)
+    return JSONResponse(
+        status_code=422,
+        content=error_body(
+            code=ErrorCode.INVALID_REQUEST,
+            message="Request validation failed.",
+            details={"errors": exc.errors()},
+        ),
+    )
+
+
+async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content=error_body(
+            code=ErrorCode.INTERNAL_ERROR,
+            message="Unexpected server error.",
+        ),
+    )
+
+
+app = FastAPI(
+    title="rag-recipes",
+    lifespan=lifespan,
+    dependencies=[Depends(require_api_token)],
+)
+app.add_exception_handler(ApiError, _handle_api_error)
+app.add_exception_handler(RequestValidationError, _handle_request_validation_error)
+app.add_exception_handler(Exception, _handle_unexpected_error)
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
