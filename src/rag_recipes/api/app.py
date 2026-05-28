@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from redis.asyncio import from_url as redis_from_url
 
-from rag_recipes.api.routes import health
+from rag_recipes.api.routes import documents, health
 from rag_recipes.config import get_settings
 from rag_recipes.storage.session import build_engine, build_session_factory
 
@@ -39,3 +39,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="rag-recipes", lifespan=lifespan)
 app.include_router(health.router, prefix="/api/v1")
+app.include_router(documents.router, prefix="/api/v1")

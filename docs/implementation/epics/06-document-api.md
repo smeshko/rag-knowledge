@@ -1,6 +1,6 @@
 # Epic 6 — Document Management API
 
-**Status**: Blocked (depends on Epics 2, 4)
+**Status**: In progress (Phase 6.1 done; 6.2/6.3 pending)
 
 ## Overview
 
@@ -49,11 +49,11 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 
 ### Acceptance criteria
 
-- [ ] Upload succeeds end-to-end: file appears in `data/storage/`, rows in `source_assets` and `documents`, response matches doc 6 shape
-- [ ] Duplicate upload returns the existing document (no new rows, file not re-stored)
-- [ ] Non-PDF upload returns 415 with `code: "unsupported_file_type"`
-- [ ] Multipart fields validated; missing required fields return 400
-- [ ] Integration test against real Postgres + `LocalFileStorage`
+- [x] Upload succeeds end-to-end: file appears in `data/storage/`, rows in `source_assets` and `documents`, response matches doc 6 shape
+- [x] Duplicate upload returns the existing document (no new rows, file not re-stored)
+- [x] Non-PDF upload returns 415 with `code: "unsupported_file_type"`
+- [x] Multipart fields validated; missing required fields return 400
+- [x] Integration test against real Postgres + `LocalFileStorage`
 
 ### Validation
 

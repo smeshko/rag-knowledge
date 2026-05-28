@@ -19,6 +19,7 @@ dependencies = [
     "typer>=0.12",
     "langfuse>=4.6",
     "python-ulid>=2.2",
+    "python-multipart>=0.0.29",
 ]
 
 [project.optional-dependencies]
