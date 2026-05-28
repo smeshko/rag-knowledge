@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import random
 
+from rag_recipes.providers._observability import TraceContext
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.embeddings.types import Embedding
 
@@ -39,14 +40,16 @@ class FakeEmbeddingProvider(EmbeddingProvider):
         # invariant that embeddings from different provider/model spaces must
         # never be compared, so fake-backed retrieval tests can't silently pass
         # while missing an embedding_provider/embedding_model filter.
-        payload = "\x00".join(
-            [self._provider, self._model, str(self._dimensions), text]
-        )
+        payload = "\x00".join([self._provider, self._model, str(self._dimensions), text])
         seed = int.from_bytes(hashlib.sha256(payload.encode()).digest()[:8], "big")
         rng = random.Random(seed)
         return [rng.uniform(-1.0, 1.0) for _ in range(self._dimensions)]
 
-    async def embed_text(self, text: str) -> Embedding:
+    async def embed_text(
+        self, text: str, *, trace_context: TraceContext | None = None
+    ) -> Embedding:
+        # The Fake emits no traces; the param exists only to keep the override
+        # signature-compatible with the EmbeddingProvider contract.
         return Embedding(
             provider=self._provider,
             model=self._model,
@@ -54,5 +57,7 @@ class FakeEmbeddingProvider(EmbeddingProvider):
             vector=self._vector(text),
         )
 
-    async def embed_batch(self, texts: list[str]) -> list[Embedding]:
+    async def embed_batch(
+        self, texts: list[str], *, trace_context: TraceContext | None = None
+    ) -> list[Embedding]:
         return [await self.embed_text(text) for text in texts]
