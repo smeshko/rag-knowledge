@@ -1,6 +1,6 @@
 # Epic 7 — Async Job Runner
 
-**Status**: Blocked (depends on Epics 1, 2)
+**Status**: In progress (Phase 7.1 complete)
 
 ## Overview
 
@@ -44,11 +44,11 @@ Wire `arq` into the project so ingestion jobs run in a worker process separate f
 
 ### Acceptance criteria
 
-- [ ] `make dev-worker` starts an arq worker that connects to Redis and logs registration of `ping_job`
-- [ ] Enqueueing `ping_job` from the API or a test causes the worker to execute it
-- [ ] Worker configuration (timeout, retries, max_jobs) lives in code and is overridable via `Settings`
-- [ ] `make dev` starts both API and worker (and stopping one cleanly is documented)
-- [ ] Integration test for ping_job passes
+- [x] `make dev-worker` starts an arq worker that connects to Redis and logs registration of `ping_job`
+- [x] Enqueueing `ping_job` from the API or a test causes the worker to execute it
+- [x] Worker configuration (timeout, retries, max_jobs) lives in code and is overridable via `Settings`
+- [x] `make dev` starts both API and worker (and stopping one cleanly is documented)
+- [x] Integration test for ping_job passes
 
 ### Validation
 
@@ -89,8 +89,8 @@ Integration test demonstrates stuck-job auto-recovery; manual smoke test where a
 
 ## Epic-level acceptance criteria
 
-- [ ] arq worker runs and executes registered jobs
-- [ ] `make dev-worker` and `make dev` both work
+- [x] arq worker runs and executes registered jobs
+- [x] `make dev-worker` and `make dev` both work
 - [ ] Status transition helpers centralize all `Document.status` updates
 - [ ] Stuck-job recovery cron registered and tested
 - [ ] Failure mode records enough context to debug stuck jobs
