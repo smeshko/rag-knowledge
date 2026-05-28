@@ -563,3 +563,117 @@ async def test_pre_storage_put_object_failure_returns_500(
     assert failing_storage.delete_calls == []
     # Filesystem stayed empty.
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Cleanup-failure resilience (review round-2 #3)
+# ---------------------------------------------------------------------------
+
+
+class FlakyDeleteStorage(SpyLocalFileStorage):
+    """put_object stores normally; delete_object always raises."""
+
+    async def delete_object(self, key: str) -> None:
+        self.delete_calls.append(key)
+        raise FileStorageError("delete failed")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_race_recovery_survives_delete_failure(
+    savepoint_session: AsyncSession,
+    tmp_path: Path,
+    winner_seeded: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delete_object failure during duplicate-race cleanup must not abort
+    winner re-fetch. The orphan leaks (logged), but the user still gets the
+    winning document with 201.
+    """
+    flaky_storage = FlakyDeleteStorage(tmp_path)
+    real_repo_cls = DocumentRepository
+
+    class FlakyDuplicateLookupRepo(_IntegrityErrorRepo):
+        def __init__(self, session: AsyncSession) -> None:
+            super().__init__(session)
+            self._calls = 0
+
+        async def get_source_asset_by_content_hash(self, content_hash: str) -> SourceAsset | None:
+            self._calls += 1
+            if self._calls == 1:
+                return None
+            return await real_repo_cls.get_source_asset_by_content_hash(self, content_hash)
+
+    import rag_recipes.api.routes.documents as docs_route
+
+    monkeypatch.setattr(docs_route, "DocumentRepository", FlakyDuplicateLookupRepo)
+
+    async def _override_session() -> AsyncIterator[AsyncSession]:
+        yield savepoint_session
+
+    def _override_storage() -> FileStorageProvider:
+        return flaky_storage
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[get_file_storage] = _override_storage
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            response = await c.post(
+                "/api/v1/documents",
+                files={"file": ("loser.pdf", PDF_BYTES, "application/pdf")},
+            )
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_file_storage, None)
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["document"]["id"] == winner_seeded["document_id"]
+    assert body["document"]["asset_id"] == winner_seeded["asset_id"]
+    # Cleanup was attempted exactly once and failed silently.
+    assert len(flaky_storage.put_calls) == 1
+    assert len(flaky_storage.delete_calls) == 1
+    assert flaky_storage.put_calls[0] == flaky_storage.delete_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_post_storage_precommit_cleanup_failure_still_returns_500(
+    savepoint_session: AsyncSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a non-IntegrityError fires during flush AND delete_object then
+    fails, the route must still return the doc-6 500 envelope (not crash
+    into the outer catch-all without rollback semantics).
+    """
+    flaky_storage = FlakyDeleteStorage(tmp_path)
+
+    import rag_recipes.api.routes.documents as docs_route
+
+    monkeypatch.setattr(docs_route, "DocumentRepository", _NonIntegrityErrorRepo)
+
+    async def _override_session() -> AsyncIterator[AsyncSession]:
+        yield savepoint_session
+
+    def _override_storage() -> FileStorageProvider:
+        return flaky_storage
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[get_file_storage] = _override_storage
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            response = await c.post(
+                "/api/v1/documents",
+                files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
+            )
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(get_file_storage, None)
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["code"] == "internal_error"
+    # Cleanup was attempted once and failed silently.
+    assert len(flaky_storage.put_calls) == 1
+    assert len(flaky_storage.delete_calls) == 1

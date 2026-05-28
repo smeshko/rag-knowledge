@@ -16,8 +16,8 @@ Three failure classes (see PLAN Decisions):
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
+import logging
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -38,8 +38,27 @@ from rag_recipes.storage.repositories.documents import DocumentRepository
 
 router = APIRouter(tags=["documents"])
 
+logger = logging.getLogger(__name__)
+
 _PDF_MAGIC = b"%PDF-"
 _DEFAULT_FILENAME = "upload.pdf"
+
+
+async def _best_effort_rollback(session: AsyncSession) -> None:
+    try:
+        await session.rollback()
+    except Exception:
+        logger.exception("rollback failed during upload compensation")
+
+
+async def _best_effort_delete(storage: FileStorageProvider, key: str) -> None:
+    try:
+        await storage.delete_object(key)
+    except Exception:
+        # Orphan leak: log the key so it can be reconciled. Do not surface
+        # the cleanup error; the caller's primary path (e.g. duplicate-race
+        # winner recovery, or returning a 500) must still run.
+        logger.exception("failed to delete orphan upload key %s", key)
 
 
 def _is_pdf(data: bytes) -> bool:
@@ -194,8 +213,12 @@ async def _handle_upload(
             status=DocumentStatus.QUEUED,
         )
     except IntegrityError:
-        await session.rollback()
-        await storage.delete_object(key)
+        # Rollback and orphan cleanup are best-effort: a degraded
+        # filesystem or session must not abort the winner re-fetch, which
+        # is the whole point of the duplicate-race branch. Failures are
+        # logged so the orphan key can be reconciled later.
+        await _best_effort_rollback(session)
+        await _best_effort_delete(storage, key)
         winner = await repo.get_source_asset_by_content_hash(content_hash)
         if winner is None:
             raise ApiError(
@@ -215,8 +238,8 @@ async def _handle_upload(
             ingestion=UploadIngestion(status=winner_document.status.value),
         )
     except Exception as exc:
-        await session.rollback()
-        await storage.delete_object(key)
+        await _best_effort_rollback(session)
+        await _best_effort_delete(storage, key)
         raise ApiError(
             status_code=500,
             code=ErrorCode.INTERNAL_ERROR,
@@ -228,8 +251,7 @@ async def _handle_upload(
     try:
         await session.commit()
     except Exception as exc:
-        with contextlib.suppress(Exception):
-            await session.rollback()
+        await _best_effort_rollback(session)
         raise ApiError(
             status_code=500,
             code=ErrorCode.INTERNAL_ERROR,
