@@ -37,6 +37,8 @@ class KnowledgeItem(Base):
             ],
             name="fk_knowledge_items_extraction_run_document_version",
         ),
+        sa.Index("ix_knowledge_items_document_id", "document_id"),
+        sa.Index("ix_knowledge_items_status", "status"),
     )
 
     ID_PREFIX: ClassVar[str] = "item"

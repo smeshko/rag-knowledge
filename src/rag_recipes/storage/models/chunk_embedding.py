@@ -18,6 +18,14 @@ if TYPE_CHECKING:
 
 class ChunkEmbedding(Base):
     __tablename__ = "chunk_embeddings"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "chunk_id",
+            "embedding_provider",
+            "embedding_model",
+            name="uq_chunk_embeddings_chunk_provider_model",
+        ),
+    )
 
     ID_PREFIX: ClassVar[str] = "embedding"
 

@@ -60,6 +60,8 @@ class Document(Base):
         ),
         nullable=False,
     )
+    last_reprocess_mode: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    last_reprocess_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,
