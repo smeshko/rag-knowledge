@@ -123,3 +123,52 @@ def test_redis_url_invalid_scheme_rejected(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     with pytest.raises(ValidationError, match="not a valid Redis DSN"):
         Settings(_env_file=None)
+
+
+def _required_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+
+def test_worker_settings_have_expected_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    for var in (
+        "WORKER_MAX_JOBS",
+        "WORKER_JOB_TIMEOUT_SECONDS",
+        "WORKER_KEEP_RESULT_SECONDS",
+        "WORKER_HEALTH_CHECK_INTERVAL_SECONDS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.worker_max_jobs == 1
+    assert settings.worker_job_timeout_seconds == 600
+    assert settings.worker_keep_result_seconds == 60
+    assert settings.worker_health_check_interval_seconds == 30
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "WORKER_MAX_JOBS",
+        "WORKER_JOB_TIMEOUT_SECONDS",
+        "WORKER_HEALTH_CHECK_INTERVAL_SECONDS",
+    ],
+)
+def test_worker_positive_int_fields_reject_zero(
+    monkeypatch: pytest.MonkeyPatch, var: str
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv(var, "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert var.lower() in str(excinfo.value).lower()
+
+
+def test_worker_keep_result_seconds_rejects_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("WORKER_KEEP_RESULT_SECONDS", "-1")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "worker_keep_result_seconds" in str(excinfo.value).lower()

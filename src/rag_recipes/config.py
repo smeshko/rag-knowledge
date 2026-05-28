@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     recipe_keyword_boost_ingredients: float = 1.20
     recipe_vector_boost_summary: float = 1.20
 
+    worker_max_jobs: int = Field(default=1, ge=1)
+    worker_job_timeout_seconds: int = Field(default=600, ge=1)
+    worker_keep_result_seconds: int = Field(default=60, ge=0)
+    worker_health_check_interval_seconds: int = Field(default=30, ge=1)
+
     @field_validator("redis_url")
     @classmethod
     def _redis_url_requires_credentials(cls, value: str) -> str:

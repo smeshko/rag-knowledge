@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -19,9 +20,14 @@ import pytest
 import pytest_asyncio
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
+from arq import create_pool
+from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
+
+from rag_recipes.config import get_settings
+from rag_recipes.ingestion.queue import _build_redis_settings
 
 DEFAULT_TEST_DSN = "postgresql+asyncpg://postgres:postgres@localhost:5433/rag_recipes_test"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -171,6 +177,71 @@ AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return dict(AUTH_HEADERS)
+
+
+@pytest.fixture(scope="session")
+def redis_arq_settings() -> RedisSettings:
+    """Build `RedisSettings` against compose Redis; skip if unreachable.
+
+    Mirrors `postgres_test_dsn`'s skip behaviour so integration tests can run
+    on a developer machine without compose without failing the suite.
+    """
+    settings = get_settings()
+    rs = _build_redis_settings(settings)
+
+    async def _probe() -> None:
+        pool = await create_pool(rs)
+        try:
+            await pool.ping()
+        finally:
+            await pool.aclose()
+
+    try:
+        asyncio.run(_probe())
+    except Exception:
+        pytest.skip(
+            f"Redis not reachable at {settings.redis_url}; start compose with `just setup`."
+        )
+    return rs
+
+
+@pytest_asyncio.fixture
+async def arq_pool(redis_arq_settings: RedisSettings) -> AsyncIterator[ArqRedis]:
+    pool = await create_pool(redis_arq_settings)
+    try:
+        yield pool
+    finally:
+        await pool.aclose()
+
+
+@pytest.fixture
+def arq_queue_name(request: pytest.FixtureRequest) -> str:
+    safe = request.node.nodeid
+    for ch in ("/", ":", "[", "]"):
+        safe = safe.replace(ch, "_")
+    return f"arq:test:{safe}-{uuid.uuid4().hex[:8]}"
+
+
+@pytest_asyncio.fixture
+async def arq_queue_cleanup(
+    arq_pool: ArqRedis, arq_queue_name: str
+) -> AsyncIterator[str]:
+    """Yield the queue name; on teardown, delete every arq key for it.
+
+    arq lays out keys as `arq:queue:<name>`, `arq:in-progress:<name>:<job>`,
+    `arq:result:<name>:<job>`, `arq:job:<name>:<job>`, etc. A single SCAN
+    over `arq:*:<name>*` keeps cleanup exhaustive without enumerating arq's
+    internal key schema.
+    """
+    yield arq_queue_name
+    pattern = f"arq:*{arq_queue_name}*"
+    cursor = 0
+    while True:
+        cursor, keys = await arq_pool.scan(cursor=cursor, match=pattern, count=100)
+        if keys:
+            await arq_pool.delete(*keys)
+        if cursor == 0:
+            break
 
 
 @pytest.fixture

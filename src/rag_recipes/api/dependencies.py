@@ -6,6 +6,7 @@ import secrets
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from arq.connections import ArqRedis
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
@@ -33,6 +34,11 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
 def get_redis(request: Request) -> Redis:
     redis_client: Redis = request.app.state.redis
     return redis_client
+
+
+def get_arq_redis(request: Request) -> ArqRedis:
+    arq_redis: ArqRedis = request.app.state.arq_redis
+    return arq_redis
 
 
 def get_file_storage(
