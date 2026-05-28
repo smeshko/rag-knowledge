@@ -79,11 +79,11 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 
 ### Acceptance criteria
 
-- [ ] All three endpoints return the documented shapes
-- [ ] Filters on list endpoint work correctly
-- [ ] Aggregate counts in `GET /{id}` match real row counts
-- [ ] 404 error shape matches the consistent error format from doc 6
-- [ ] Status endpoint correctly identifies terminal statuses (`ready`, `needs_review`, `failed`)
+- [x] All three endpoints return the documented shapes
+- [x] Filters on list endpoint work correctly
+- [x] Aggregate counts in `GET /{id}` match real row counts
+- [x] 404 error shape matches the consistent error format from doc 6
+- [x] Status endpoint correctly identifies terminal statuses (`ready`, `needs_review`, `failed`)
 
 ### Validation
 
