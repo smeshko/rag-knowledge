@@ -75,11 +75,11 @@ Wire `arq` into the project so ingestion jobs run in a worker process separate f
 
 ### Acceptance criteria
 
-- [ ] Status-transition helper rejects illegal transitions with a clear error
-- [ ] Cron registered and visible in worker startup logs
-- [ ] Stuck-job detection works for all non-terminal statuses
-- [ ] Failures preserve enough context (timestamp, last status, reason) to debug
-- [ ] Configurable timeouts respected
+- [x] Status-transition helper rejects illegal transitions with a clear error
+- [x] Cron registered and visible in worker startup logs
+- [x] Stuck-job detection works for all non-terminal statuses
+- [x] Failures preserve enough context (timestamp, last status, reason) to debug
+- [x] Configurable timeouts respected
 
 ### Validation
 
@@ -91,7 +91,7 @@ Integration test demonstrates stuck-job auto-recovery; manual smoke test where a
 
 - [x] arq worker runs and executes registered jobs
 - [x] `make dev-worker` and `make dev` both work
-- [ ] Status transition helpers centralize all `Document.status` updates
-- [ ] Stuck-job recovery cron registered and tested
-- [ ] Failure mode records enough context to debug stuck jobs
-- [ ] Status in [`EPICS.md`](../EPICS.md) updated; Epic 8 unblocked (in combination with Epics 4, 6)
+- [x] Status transition helpers centralize all `Document.status` updates
+- [x] Stuck-job recovery cron registered and tested
+- [x] Failure mode records enough context to debug stuck jobs
+- [x] Status in [`EPICS.md`](../EPICS.md) updated; Epic 8 unblocked (in combination with Epics 4, 6)
