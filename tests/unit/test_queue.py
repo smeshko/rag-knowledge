@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
+from arq.connections import ArqRedis
 
 from rag_recipes.config import Settings
-from rag_recipes.ingestion.queue import _build_redis_settings
+from rag_recipes.ingestion.queue import _build_redis_settings, enqueue_job
 
 
 def _make_settings(monkeypatch: pytest.MonkeyPatch, redis_url: str, password: str) -> Settings:
@@ -54,3 +57,38 @@ def test_build_redis_settings_sets_ssl_for_rediss_scheme(
     settings = _make_settings(monkeypatch, "rediss://:redis@localhost:6379/0", "redis")
     rs = _build_redis_settings(settings)
     assert rs.ssl is True
+
+
+@pytest.mark.asyncio
+async def test_enqueue_job_forwards_session_id_as_underscore_kwarg() -> None:
+    mock = AsyncMock(spec=ArqRedis)
+    mock.enqueue_job.return_value = "job-handle"
+    await enqueue_job(mock, "ping_job", "hello", session_id="session_abc")
+    mock.enqueue_job.assert_awaited_once_with(
+        "ping_job", "hello", _job_id=None, _queue_name=None, _session_id="session_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_enqueue_job_passes_through_job_id_and_queue_name() -> None:
+    mock = AsyncMock(spec=ArqRedis)
+    await enqueue_job(
+        mock,
+        "ping_job",
+        "hello",
+        session_id=None,
+        _job_id="custom",
+        _queue_name="test_q",
+    )
+    mock.enqueue_job.assert_awaited_once_with(
+        "ping_job", "hello", _job_id="custom", _queue_name="test_q", _session_id=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_enqueue_job_returns_arqredis_result() -> None:
+    mock = AsyncMock(spec=ArqRedis)
+    sentinel = object()
+    mock.enqueue_job.return_value = sentinel
+    result = await enqueue_job(mock, "ping_job")
+    assert result is sentinel

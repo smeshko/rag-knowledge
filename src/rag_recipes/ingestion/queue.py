@@ -13,8 +13,11 @@ and worker. See `.claude/plans/epic-07-phase-7-1-arq-worker/DECISIONS.md`
 
 from __future__ import annotations
 
+from typing import Any
+
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
+from arq.jobs import Job
 from redis.asyncio.connection import SSLConnection
 from redis.asyncio.connection import parse_url as redis_parse_url
 
@@ -38,3 +41,31 @@ def _build_redis_settings(settings: Settings) -> RedisSettings:
 
 async def create_arq_pool(settings: Settings) -> ArqRedis:
     return await create_pool(_build_redis_settings(settings))
+
+
+async def enqueue_job(
+    redis: ArqRedis,
+    function: str,
+    *args: Any,
+    session_id: str | None = None,
+    _job_id: str | None = None,
+    _queue_name: str | None = None,
+    **kwargs: Any,
+) -> Job | None:
+    """Enqueue an arq job with a typed Langfuse-session passthrough.
+
+    `session_id` is smuggled to the job as the reserved kwarg `_session_id`
+    (underscore-prefixed to match arq's `_job_id` / `_queue_name` / `_defer_by`
+    convention). Job functions opt in by accepting `_session_id: str | None`
+    and entering `langfuse_session_scope(observability, _session_id)`. Always
+    forwarded — even when `None` — so the job's keyword signature stays
+    uniform. Callers must not pass a user kwarg called `_session_id`.
+    """
+    return await redis.enqueue_job(
+        function,
+        *args,
+        _job_id=_job_id,
+        _queue_name=_queue_name,
+        _session_id=session_id,
+        **kwargs,
+    )
