@@ -17,6 +17,7 @@ class ErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
     UNSUPPORTED_FILE_TYPE = "unsupported_file_type"
     DUPLICATE_SOURCE_ASSET = "duplicate_source_asset"
+    DOCUMENT_NOT_FOUND = "document_not_found"
     INTERNAL_ERROR = "internal_error"
 
 

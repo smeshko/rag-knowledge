@@ -9,13 +9,29 @@ the caller takes the next step.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    KnowledgeItemStatus,
+    SourceType,
+    UploadStatus,
+)
+from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
+from rag_recipes.storage.models.source_span import SourceSpan
+
+
+@dataclass(frozen=True)
+class KnowledgeItemCounts:
+    total: int
+    ready: int
+    needs_review: int
 
 
 class DocumentRepository:
@@ -117,3 +133,35 @@ class DocumentRepository:
         stmt = stmt.limit(limit).offset(offset)
         result = await self._session.execute(stmt)
         return result.scalars().all()
+
+    async def count_source_spans(self, document_id: str) -> int:
+        result = await self._session.execute(
+            select(func.count()).select_from(SourceSpan).where(
+                SourceSpan.document_id == document_id
+            )
+        )
+        return result.scalar_one()
+
+    async def count_chunks(self, document_id: str) -> int:
+        result = await self._session.execute(
+            select(func.count()).select_from(Chunk).where(
+                Chunk.document_id == document_id
+            )
+        )
+        return result.scalar_one()
+
+    async def count_knowledge_items(self, document_id: str) -> KnowledgeItemCounts:
+        # Single GROUP BY query — one round-trip for total / ready / needs_review.
+        result = await self._session.execute(
+            select(KnowledgeItem.status, func.count())
+            .where(KnowledgeItem.document_id == document_id)
+            .group_by(KnowledgeItem.status)
+        )
+        by_status: dict[KnowledgeItemStatus, int] = {
+            status: count for status, count in result.all()
+        }
+        return KnowledgeItemCounts(
+            total=sum(by_status.values()),
+            ready=by_status.get(KnowledgeItemStatus.READY, 0),
+            needs_review=by_status.get(KnowledgeItemStatus.NEEDS_REVIEW, 0),
+        )

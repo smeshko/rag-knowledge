@@ -51,3 +51,16 @@ class DocumentListItem(BaseModel):
 
 class DocumentListResponse(BaseModel):
     documents: list[DocumentListItem]
+
+
+class DocumentCounts(BaseModel):
+    source_spans: int
+    knowledge_items: int
+    ready_items: int
+    needs_review_items: int
+    chunks: int
+
+
+class DocumentDetailResponse(BaseModel):
+    document: DocumentResponse
+    counts: DocumentCounts

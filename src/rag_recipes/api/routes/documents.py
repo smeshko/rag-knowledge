@@ -30,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_recipes.api.dependencies import get_file_storage, get_session
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.documents import (
+    DocumentCounts,
+    DocumentDetailResponse,
     DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
@@ -368,6 +370,37 @@ async def list_documents(
         )
         return DocumentListResponse(
             documents=[DocumentListItem.model_validate(doc) for doc in documents],
+        )
+    except ApiError as err:
+        return JSONResponse(status_code=err.status_code, content=err.to_body())
+
+
+@router.get("/documents/{document_id}")
+async def get_document(
+    document_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> Any:
+    try:
+        repo = DocumentRepository(session)
+        document = await repo.get_document(document_id)
+        if document is None:
+            raise ApiError(
+                status_code=404,
+                code=ErrorCode.DOCUMENT_NOT_FOUND,
+                message=f"Document {document_id!r} not found.",
+                details={"document_id": document_id},
+            )
+        item_counts = await repo.count_knowledge_items(document_id)
+        counts = DocumentCounts(
+            source_spans=await repo.count_source_spans(document_id),
+            knowledge_items=item_counts.total,
+            ready_items=item_counts.ready,
+            needs_review_items=item_counts.needs_review,
+            chunks=await repo.count_chunks(document_id),
+        )
+        return DocumentDetailResponse(
+            document=DocumentResponse.model_validate(document),
+            counts=counts,
         )
     except ApiError as err:
         return JSONResponse(status_code=err.status_code, content=err.to_body())
