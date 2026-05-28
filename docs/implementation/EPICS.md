@@ -29,7 +29,7 @@ Architecture grounding:
 | 2 | [Data Model & Migrations](./epics/02-data-model.md) | 3 | Epic 1 | Done |
 | 3 | [Provider Interfaces & Fakes](./epics/03-provider-interfaces.md) | 2 | Epic 1 | Done |
 | 4 | [Storage & PDF Extraction](./epics/04-storage-and-pdf-extraction.md) | 2 | Epic 3 | Done |
-| 5 | [LLM & Embedding Providers](./epics/05-llm-and-embedding-providers.md) | 3 | Epic 3 | In progress |
+| 5 | [LLM & Embedding Providers](./epics/05-llm-and-embedding-providers.md) | 3 | Epic 3 | Done |
 | 6 | [Document Management API](./epics/06-document-api.md) | 3 | Epics 2, 4 | Blocked |
 | 7 | [Async Job Runner](./epics/07-async-job-runner.md) | 2 | Epics 1, 2 | Blocked |
 | 8 | [PDF Ingestion — Text & SourceSpans](./epics/08-pdf-ingestion-spans.md) | 2 | Epics 4, 6, 7 | Blocked |

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from rag_recipes.providers._observability import TraceContext
 from rag_recipes.providers.llm.types import StructuredOutputRequest, StructuredOutputResponse
 
 __all__ = ["LLMProvider"]
@@ -22,6 +23,14 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def generate_structured_output(
-        self, request: StructuredOutputRequest
+        self,
+        request: StructuredOutputRequest,
+        *,
+        trace_context: TraceContext | None = None,
     ) -> StructuredOutputResponse:
-        """Generate structured output for ``request`` and return the response."""
+        """Generate structured output for ``request`` and return the response.
+
+        ``trace_context`` carries optional observability fields (session/span
+        ids, input hash) for tracing; whether and how a trace is emitted is the
+        implementation's concern (the Fake ignores it).
+        """
