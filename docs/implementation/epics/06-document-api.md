@@ -107,8 +107,8 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 - **Personal API token auth** per [doc 6 § Authentication Note](../../architecture/06-backend-api-shape.md#authentication-note):
   - Dependency that checks `Authorization: Bearer <token>` against `Settings.personal_api_token`
   - Returns 401 with `code: "unauthorized"` on missing/invalid token
-  - **Fails closed: when `PERSONAL_API_TOKEN` is unset/empty, every documents route 401s.** No dev-mode bypass flag (Phase 6.3 supersedes the original "configurable bypass" wording in PLAN Decisions — safe-by-default beats ergonomic-by-default for a credentialed surface).
-  - Applied to the documents router via a router-level dependency (`/health` stays open)
+  - **Fails closed: when `PERSONAL_API_TOKEN` is unset/empty, every request 401s.** No dev-mode bypass flag (Phase 6.3 supersedes the original "configurable bypass" wording in PLAN Decisions — safe-by-default beats ergonomic-by-default for a credentialed surface).
+  - Applied at the FastAPI app level so every route — including `/health` — is gated.
 - **Consistent error shape** per [doc 6 § Error Shape](../../architecture/06-backend-api-shape.md#error-shape):
   - Centralized exception handlers translating common exceptions to `{ error: { code, message, details } }`
   - Initial error codes per doc 6: `invalid_request`, `unsupported_file_type`, `duplicate_source_asset`, `document_not_found`, `ingestion_already_running`, `internal_error`
@@ -118,8 +118,8 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 
 - [x] Reprocess endpoint accepts all three modes and sets `Document.status = "queued"`
 - [x] Reprocess from a non-terminal status returns 409 with `code: "ingestion_already_running"`
-- [x] All documents endpoints require a valid bearer token (`/health` stays open)
-- [x] Documents API fails closed: requires a valid bearer token; with `PERSONAL_API_TOKEN` unset every documents route 401s; behavior documented in README and `.env.example` (supersedes the original "auth-bypass flag" wording — see PLAN Decisions)
+- [x] Every route — including `/health` — requires a valid bearer token (no exceptions)
+- [x] API fails closed: requires a valid bearer token; with `PERSONAL_API_TOKEN` unset every route 401s; behavior documented in README and `.env.example` (supersedes the original "auth-bypass flag" wording — see PLAN Decisions)
 - [x] Errors across all endpoints use the consistent shape
 - [x] Integration tests cover happy path + 401 + 404 + 409
 
@@ -133,7 +133,7 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 
 - [x] Five endpoints functional: `POST /documents`, `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/status`, `POST /documents/{id}/reprocess`
 - [x] Duplicate-content uploads return the existing document
-- [x] Personal API token auth enforced on all non-health routes (fail-closed; no bypass flag)
+- [x] Personal API token auth enforced on every route, `/health` included (fail-closed; no bypass flag)
 - [x] Consistent error shape across all endpoints
 - [x] Reprocess endpoint flips status to `queued` (real dispatch lives in Epic 8/11)
 - [x] Integration test suite covering happy paths and key error paths

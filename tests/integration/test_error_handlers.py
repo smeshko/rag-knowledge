@@ -10,13 +10,19 @@ from rag_recipes.api.errors import ApiError, ErrorCode
 
 
 @pytest.fixture
-def client(monkeypatch: pytest.MonkeyPatch) -> httpx.AsyncClient:
+def client(
+    monkeypatch: pytest.MonkeyPatch,
+    override_settings_with_token: None,
+    auth_headers: dict[str, str],
+) -> httpx.AsyncClient:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
     monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
     monkeypatch.setenv("REDIS_PASSWORD", "redis")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     transport = httpx.ASGITransport(app=app)
-    return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+    return httpx.AsyncClient(
+        transport=transport, base_url="http://testserver", headers=auth_headers
+    )
 
 
 @app.get("/__test__/raises-api-error")
@@ -54,10 +60,11 @@ async def test_api_error_renders_envelope(client: httpx.AsyncClient) -> None:
 
 async def test_unhandled_exception_returns_500_envelope(
     client: httpx.AsyncClient,
+    auth_headers: dict[str, str],
 ) -> None:
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://testserver"
+        transport=transport, base_url="http://testserver", headers=auth_headers
     ) as c:
         response = await c.get("/__test__/raises-unexpected")
     assert response.status_code == 500

@@ -70,13 +70,13 @@ async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResp
     )
 
 
-app = FastAPI(title="rag-recipes", lifespan=lifespan)
+app = FastAPI(
+    title="rag-recipes",
+    lifespan=lifespan,
+    dependencies=[Depends(require_api_token)],
+)
 app.add_exception_handler(ApiError, _handle_api_error)
 app.add_exception_handler(RequestValidationError, _handle_request_validation_error)
 app.add_exception_handler(Exception, _handle_unexpected_error)
 app.include_router(health.router, prefix="/api/v1")
-app.include_router(
-    documents.router,
-    prefix="/api/v1",
-    dependencies=[Depends(require_api_token)],
-)
+app.include_router(documents.router, prefix="/api/v1")
