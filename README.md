@@ -52,6 +52,14 @@ curl http://localhost:8000/api/v1/health
 # {"status":"ok"}
 ```
 
+The documents API (`/api/v1/documents*`) is gated by a personal bearer token and **fails closed**: when `PERSONAL_API_TOKEN` is empty, every documents request returns `401 unauthorized`. Set the variable in `.env` and send it as a header to use the API locally:
+
+```sh
+curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8000/api/v1/documents
+```
+
+`/api/v1/health` stays open regardless.
+
 ## Test
 
 ```sh

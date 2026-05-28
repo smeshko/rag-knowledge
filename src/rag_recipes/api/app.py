@@ -12,11 +12,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from redis.asyncio import from_url as redis_from_url
 
+from rag_recipes.api.dependencies import require_api_token
 from rag_recipes.api.errors import ApiError, ErrorCode, error_body
 from rag_recipes.api.routes import documents, health
 from rag_recipes.config import get_settings
@@ -74,4 +75,8 @@ app.add_exception_handler(ApiError, _handle_api_error)
 app.add_exception_handler(RequestValidationError, _handle_request_validation_error)
 app.add_exception_handler(Exception, _handle_unexpected_error)
 app.include_router(health.router, prefix="/api/v1")
-app.include_router(documents.router, prefix="/api/v1")
+app.include_router(
+    documents.router,
+    prefix="/api/v1",
+    dependencies=[Depends(require_api_token)],
+)
