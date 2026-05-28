@@ -64,3 +64,19 @@ class DocumentCounts(BaseModel):
 class DocumentDetailResponse(BaseModel):
     document: DocumentResponse
     counts: DocumentCounts
+
+
+class IngestionProgress(BaseModel):
+    stage: str
+    message: str | None
+    pages_total: int | None
+    pages_processed: int | None
+
+
+class IngestionStatusResponse(BaseModel):
+    document_id: str
+    status: str
+    active_source_version: int | None
+    current_source_version: int | None
+    progress: IngestionProgress
+    terminal: bool

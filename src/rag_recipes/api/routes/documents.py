@@ -35,6 +35,8 @@ from rag_recipes.api.schemas.documents import (
     DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
+    IngestionProgress,
+    IngestionStatusResponse,
     UploadIngestion,
     UploadResponse,
 )
@@ -55,6 +57,11 @@ _DEFAULT_FILENAME = "upload.pdf"
 _LIST_LIMIT_DEFAULT = 50
 _LIST_LIMIT_MAX = 200
 _LIST_OFFSET_DEFAULT = 0
+
+# doc 6 §5: a document is terminal once it lands in one of these states.
+_TERMINAL_DOCUMENT_STATUSES: frozenset[DocumentStatus] = frozenset(
+    {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW, DocumentStatus.FAILED}
+)
 
 def _parse_enum[E: StrEnum](
     enum_cls: type[E], raw: str | None, *, field: str
@@ -375,6 +382,18 @@ async def list_documents(
         return JSONResponse(status_code=err.status_code, content=err.to_body())
 
 
+async def _require_document(repo: DocumentRepository, document_id: str) -> Any:
+    document = await repo.get_document(document_id)
+    if document is None:
+        raise ApiError(
+            status_code=404,
+            code=ErrorCode.DOCUMENT_NOT_FOUND,
+            message=f"Document {document_id!r} not found.",
+            details={"document_id": document_id},
+        )
+    return document
+
+
 @router.get("/documents/{document_id}")
 async def get_document(
     document_id: str,
@@ -382,14 +401,7 @@ async def get_document(
 ) -> Any:
     try:
         repo = DocumentRepository(session)
-        document = await repo.get_document(document_id)
-        if document is None:
-            raise ApiError(
-                status_code=404,
-                code=ErrorCode.DOCUMENT_NOT_FOUND,
-                message=f"Document {document_id!r} not found.",
-                details={"document_id": document_id},
-            )
+        document = await _require_document(repo, document_id)
         item_counts = await repo.count_knowledge_items(document_id)
         counts = DocumentCounts(
             source_spans=await repo.count_source_spans(document_id),
@@ -401,6 +413,35 @@ async def get_document(
         return DocumentDetailResponse(
             document=DocumentResponse.model_validate(document),
             counts=counts,
+        )
+    except ApiError as err:
+        return JSONResponse(status_code=err.status_code, content=err.to_body())
+
+
+@router.get("/documents/{document_id}/status")
+async def get_document_status(
+    document_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> Any:
+    try:
+        repo = DocumentRepository(session)
+        document = await _require_document(repo, document_id)
+        # `current_source_version` is a TEMPORARY Epic-8 placeholder that
+        # mirrors `active_source_version`. doc 6 §5 documents the two as
+        # diverging mid-ingestion (active: null, current: 1); Epic 8 Phase 8.2
+        # replaces this mirror once versioned spans + real progress exist.
+        return IngestionStatusResponse(
+            document_id=document.id,
+            status=document.status.value,
+            active_source_version=document.active_source_version,
+            current_source_version=document.active_source_version,
+            progress=IngestionProgress(
+                stage=document.status.value,
+                message=None,
+                pages_total=None,
+                pages_processed=None,
+            ),
+            terminal=document.status in _TERMINAL_DOCUMENT_STATUSES,
         )
     except ApiError as err:
         return JSONResponse(status_code=err.status_code, content=err.to_body())
