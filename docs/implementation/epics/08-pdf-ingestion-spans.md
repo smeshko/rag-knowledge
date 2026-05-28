@@ -52,14 +52,14 @@ Wire the first real ingestion job: when a Document is created via `POST /documen
 
 ### Acceptance criteria
 
-- [ ] After `POST /documents`, the worker picks up the job, extracts text, and writes one `SourceSpan` per page
-- [ ] `source_version = 1` on initial ingestion
-- [ ] `locator_hash` and `text_hash` populated
-- [ ] Uniqueness constraint enforced (no duplicate spans for the same page/version)
-- [ ] Failure during extraction transitions Document to `failed` with a clear error
-- [ ] Langfuse session ID set to `document_id`
-- [ ] PyMuPDF access is serialized (lock / single-worker executor / process pool) before running under job concurrency, with a concurrent-extraction regression test (deferred from Phase 4.2)
-- [ ] Integration test using a committed synthetic PDF fixture
+- [x] After `POST /documents`, the worker picks up the job, extracts text, and writes one `SourceSpan` per page
+- [x] `source_version = 1` on initial ingestion
+- [x] `locator_hash` and `text_hash` populated
+- [x] Uniqueness constraint enforced (no duplicate spans for the same page/version)
+- [x] Failure during extraction transitions Document to `failed` with a clear error
+- [x] Langfuse session ID set to `document_id`
+- [x] PyMuPDF access is serialized (lock / single-worker executor / process pool) before running under job concurrency, with a concurrent-extraction regression test (deferred from Phase 4.2)
+- [x] Integration test using a committed synthetic PDF fixture
 
 ### Validation
 
