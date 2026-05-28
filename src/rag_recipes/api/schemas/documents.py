@@ -31,3 +31,23 @@ class UploadIngestion(BaseModel):
 class UploadResponse(BaseModel):
     document: DocumentResponse
     ingestion: UploadIngestion
+
+
+class DocumentListItem(BaseModel):
+    """The doc §3 list item — smaller than ``DocumentResponse`` (no
+    ``asset_id``/``language``/timestamps)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    category: str
+    subcategory: str | None
+    title: str
+    author: str
+    source_type: str
+    status: str
+    active_source_version: int | None
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentListItem]

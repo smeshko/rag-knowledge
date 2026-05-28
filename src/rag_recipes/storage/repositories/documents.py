@@ -8,6 +8,8 @@ the caller takes the next step.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -93,3 +95,25 @@ class DocumentRepository:
 
     async def get_document(self, document_id: str) -> Document | None:
         return await self._session.get(Document, document_id)
+
+    async def list_documents(
+        self,
+        *,
+        category: str | None,
+        status: DocumentStatus | None,
+        source_type: SourceType | None,
+        limit: int,
+        offset: int,
+    ) -> Sequence[Document]:
+        stmt = select(Document)
+        if category is not None:
+            stmt = stmt.where(Document.category == category)
+        if status is not None:
+            stmt = stmt.where(Document.status == status)
+        if source_type is not None:
+            stmt = stmt.where(Document.source_type == source_type)
+        # id desc as a stable tiebreak when created_at collides.
+        stmt = stmt.order_by(Document.created_at.desc(), Document.id.desc())
+        stmt = stmt.limit(limit).offset(offset)
+        result = await self._session.execute(stmt)
+        return result.scalars().all()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -28,7 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.dependencies import get_file_storage, get_session
 from rag_recipes.api.errors import ApiError, ErrorCode
-from rag_recipes.api.schemas.documents import DocumentResponse, UploadIngestion, UploadResponse
+from rag_recipes.api.schemas.documents import (
+    DocumentListItem,
+    DocumentListResponse,
+    DocumentResponse,
+    UploadIngestion,
+    UploadResponse,
+)
 from rag_recipes.providers.errors import FileStorageError
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
@@ -42,6 +49,64 @@ logger = logging.getLogger(__name__)
 
 _PDF_MAGIC = b"%PDF-"
 _DEFAULT_FILENAME = "upload.pdf"
+
+_LIST_LIMIT_DEFAULT = 50
+_LIST_LIMIT_MAX = 200
+_LIST_OFFSET_DEFAULT = 0
+
+def _parse_enum[E: StrEnum](
+    enum_cls: type[E], raw: str | None, *, field: str
+) -> E | None:
+    """Coerce an optional string to a `StrEnum` member or raise the
+    doc-6 ``invalid_request`` envelope.
+
+    Filter params are typed ``str | None`` rather than enums so FastAPI's raw
+    422 never fires before the handler runs — every validation error stays
+    inside the ``ApiError`` envelope.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        return enum_cls(raw)
+    except ValueError as exc:
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message=f"Invalid value for {field!r}.",
+            details={"field": field, "value": raw},
+        ) from exc
+
+
+def _parse_int(
+    raw: str | None,
+    *,
+    field: str,
+    default: int,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    """Parse an optional integer query param with explicit bounds; raise
+    the doc-6 ``invalid_request`` envelope on any failure."""
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message=f"{field!r} must be an integer.",
+            details={"field": field, "value": raw},
+        ) from exc
+    if value < minimum or (maximum is not None and value > maximum):
+        bounds = f">= {minimum}" if maximum is None else f"in [{minimum}, {maximum}]"
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message=f"{field!r} must be {bounds}.",
+            details={"field": field, "value": raw},
+        )
+    return value
 
 
 async def _best_effort_rollback(session: AsyncSession) -> None:
@@ -264,3 +329,45 @@ async def _handle_upload(
         document=DocumentResponse.model_validate(document),
         ingestion=UploadIngestion(status=document.status.value),
     )
+
+
+@router.get("/documents")
+async def list_documents(
+    category: str | None = None,
+    status: str | None = None,
+    source_type: str | None = None,
+    limit: str | None = None,
+    offset: str | None = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> Any:
+    try:
+        status_enum = _parse_enum(DocumentStatus, status, field="status")
+        source_type_enum = _parse_enum(SourceType, source_type, field="source_type")
+        limit_int = _parse_int(
+            limit,
+            field="limit",
+            default=_LIST_LIMIT_DEFAULT,
+            minimum=1,
+            maximum=_LIST_LIMIT_MAX,
+        )
+        offset_int = _parse_int(
+            offset,
+            field="offset",
+            default=_LIST_OFFSET_DEFAULT,
+            minimum=0,
+        )
+        # `category` is free text per the plan — no enum validation.
+        category_value = category if category else None
+        repo = DocumentRepository(session)
+        documents = await repo.list_documents(
+            category=category_value,
+            status=status_enum,
+            source_type=source_type_enum,
+            limit=limit_int,
+            offset=offset_int,
+        )
+        return DocumentListResponse(
+            documents=[DocumentListItem.model_validate(doc) for doc in documents],
+        )
+    except ApiError as err:
+        return JSONResponse(status_code=err.status_code, content=err.to_body())
