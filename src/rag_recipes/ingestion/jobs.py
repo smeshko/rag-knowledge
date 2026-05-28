@@ -14,12 +14,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from arq.cron import cron
+
 from rag_recipes.config import Settings, get_settings
+from rag_recipes.ingestion.cron import sweep_stuck_jobs
 from rag_recipes.ingestion.queue import _build_redis_settings
 from rag_recipes.providers._observability import (
     ProviderObservability,
     build_provider_observability,
 )
+from rag_recipes.storage.session import build_engine, build_session_factory
 
 
 @contextmanager
@@ -63,6 +67,9 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     settings: Settings = get_settings()
     ctx["settings"] = settings
     ctx["observability"] = build_provider_observability(settings)
+    engine = build_engine(settings)
+    ctx["engine"] = engine
+    ctx["session_factory"] = build_session_factory(engine)
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
@@ -73,6 +80,9 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
         # Observability teardown failures must not crash worker shutdown.
         with contextlib.suppress(Exception):
             flush()
+    engine = ctx.get("engine")
+    if engine is not None:
+        await engine.dispose()
 
 
 _SETTINGS = get_settings()
@@ -80,6 +90,16 @@ _SETTINGS = get_settings()
 
 class WorkerSettings:
     functions = [ping_job]
+    cron_jobs = [
+        cron(
+            sweep_stuck_jobs,
+            minute=set(range(0, 60, _SETTINGS.stuck_job_check_interval_minutes)),
+            run_at_startup=False,
+            unique=True,
+            max_tries=1,
+            timeout=_SETTINGS.stuck_job_timeout_minutes * 60,
+        ),
+    ]
     redis_settings = _build_redis_settings(_SETTINGS)
     on_startup = on_startup
     on_shutdown = on_shutdown
