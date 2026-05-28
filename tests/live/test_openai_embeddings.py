@@ -42,4 +42,7 @@ async def test_openai_embeddings_embed_text_and_batch(
     batch = await provider.embed_batch(["alpha", "beta", "gamma"])
     assert len(batch) == 3
     first = await provider.embed_text("alpha")
-    assert batch[0].vector == first.vector
+    # OpenAI embeddings are unit-normalised but not bit-reproducible across batch
+    # vs single calls — low-order bits drift. Same direction is what we can rely on.
+    cosine = sum(a * b for a, b in zip(batch[0].vector, first.vector, strict=True))
+    assert cosine > 0.999
