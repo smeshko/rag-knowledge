@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -717,3 +719,81 @@ async def test_post_storage_precommit_cleanup_failure_still_returns_500(
     # Cleanup was attempted once and failed silently.
     assert len(flaky_storage.put_calls) == 1
     assert len(flaky_storage.delete_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Enqueue on fresh insert (Phase 8.1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_enqueues_process_document_on_fresh_insert(
+    client: httpx.AsyncClient,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    async with client:
+        response = await client.post(
+            "/api/v1/documents",
+            files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
+        )
+    assert response.status_code == 201, response.text
+    doc_id = response.json()["document"]["id"]
+    fake_arq_redis.enqueue_job.assert_awaited_once_with(
+        "process_document",
+        doc_id,
+        _job_id=None,
+        _queue_name=None,
+        _session_id=doc_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_does_not_enqueue_on_duplicate_recovery(
+    client: httpx.AsyncClient,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    async with client:
+        first = await client.post(
+            "/api/v1/documents",
+            files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
+        )
+        assert first.status_code == 201, first.text
+        second = await client.post(
+            "/api/v1/documents",
+            files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
+        )
+    assert second.status_code == 201, second.text
+    # Only the fresh insert enqueued; the duplicate-recovery path does not.
+    assert fake_arq_redis.enqueue_job.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_returns_201_even_when_enqueue_fails(
+    client: httpx.AsyncClient,
+    fake_arq_redis: AsyncMock,
+    savepoint_session: AsyncSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_arq_redis.enqueue_job.side_effect = RuntimeError("redis down")
+    # The Alembic migration that builds the test DB runs fileConfig with
+    # disable_existing_loggers=True, which disables this route logger. Re-enable
+    # it so the route's enqueue-failure warning is observable here.
+    route_logger = logging.getLogger("rag_recipes.api.routes.documents")
+    route_logger.disabled = False
+    with caplog.at_level(logging.WARNING, logger="rag_recipes.api.routes.documents"):
+        async with client:
+            response = await client.post(
+                "/api/v1/documents",
+                files={"file": ("recipe.pdf", PDF_BYTES, "application/pdf")},
+            )
+    assert response.status_code == 201, response.text
+    doc_id = response.json()["document"]["id"]
+    # The document row is committed despite the enqueue failure.
+    document = await savepoint_session.get(Document, doc_id)
+    assert document is not None
+    assert document.status == DocumentStatus.QUEUED
+    # The failure was logged for operator recovery.
+    assert any(
+        "Failed to enqueue process_document" in record.getMessage()
+        for record in caplog.records
+    )

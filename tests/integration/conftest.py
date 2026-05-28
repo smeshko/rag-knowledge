@@ -14,6 +14,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import pytest
@@ -242,6 +243,33 @@ async def arq_queue_cleanup(
             await arq_pool.delete(*keys)
         if cursor == 0:
             break
+
+
+@pytest.fixture
+def fake_arq_redis() -> AsyncMock:
+    """An ArqRedis stand-in whose enqueue_job awaitable always succeeds."""
+    m = AsyncMock(spec=ArqRedis)
+    m.enqueue_job = AsyncMock(return_value=AsyncMock())  # arq.jobs.Job
+    return m
+
+
+@pytest.fixture(autouse=True)
+def _override_arq_redis(fake_arq_redis: AsyncMock) -> Iterator[None]:
+    """Override the route's arq dependency so the upload route can enqueue.
+
+    Applies to every integration test (harmless for those that never hit the
+    upload route). pytest sets autouse fixtures up before explicitly-requested
+    ones, so a test that needs the *real* pool (the end-to-end worker test)
+    overrides ``get_arq_redis`` again in its own client fixture and wins.
+    """
+    from rag_recipes.api.app import app
+    from rag_recipes.api.dependencies import get_arq_redis
+
+    app.dependency_overrides[get_arq_redis] = lambda: fake_arq_redis
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_arq_redis, None)
 
 
 @pytest.fixture
