@@ -1,6 +1,6 @@
 # Epic 6 — Document Management API
 
-**Status**: In progress (Phase 6.1 done; 6.2/6.3 pending)
+**Status**: Done
 
 ## Overview
 
@@ -107,8 +107,8 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 - **Personal API token auth** per [doc 6 § Authentication Note](../../architecture/06-backend-api-shape.md#authentication-note):
   - Dependency that checks `Authorization: Bearer <token>` against `Settings.personal_api_token`
   - Returns 401 with `code: "unauthorized"` on missing/invalid token
-  - In development mode (configurable), allow auth bypass for ergonomics — document the flag clearly
-  - Applied to all routes via a router-level dependency
+  - **Fails closed: when `PERSONAL_API_TOKEN` is unset/empty, every documents route 401s.** No dev-mode bypass flag (Phase 6.3 supersedes the original "configurable bypass" wording in PLAN Decisions — safe-by-default beats ergonomic-by-default for a credentialed surface).
+  - Applied to the documents router via a router-level dependency (`/health` stays open)
 - **Consistent error shape** per [doc 6 § Error Shape](../../architecture/06-backend-api-shape.md#error-shape):
   - Centralized exception handlers translating common exceptions to `{ error: { code, message, details } }`
   - Initial error codes per doc 6: `invalid_request`, `unsupported_file_type`, `duplicate_source_asset`, `document_not_found`, `ingestion_already_running`, `internal_error`
@@ -116,12 +116,12 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 
 ### Acceptance criteria
 
-- [ ] Reprocess endpoint accepts all three modes and sets `Document.status = "queued"`
-- [ ] Reprocess from a non-terminal status returns 409 with `code: "ingestion_already_running"`
-- [ ] All endpoints require a valid bearer token (except `/health`)
-- [ ] Auth-bypass flag works in dev mode and is documented
-- [ ] Errors across all endpoints use the consistent shape
-- [ ] Integration tests cover happy path + 401 + 404 + 409
+- [x] Reprocess endpoint accepts all three modes and sets `Document.status = "queued"`
+- [x] Reprocess from a non-terminal status returns 409 with `code: "ingestion_already_running"`
+- [x] All documents endpoints require a valid bearer token (`/health` stays open)
+- [x] Documents API fails closed: requires a valid bearer token; with `PERSONAL_API_TOKEN` unset every documents route 401s; behavior documented in README and `.env.example` (supersedes the original "auth-bypass flag" wording — see PLAN Decisions)
+- [x] Errors across all endpoints use the consistent shape
+- [x] Integration tests cover happy path + 401 + 404 + 409
 
 ### Validation
 
@@ -131,10 +131,10 @@ Implement the document-lifecycle REST endpoints from [doc 6](../../architecture/
 
 ## Epic-level acceptance criteria
 
-- [ ] Five endpoints functional: `POST /documents`, `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/status`, `POST /documents/{id}/reprocess`
-- [ ] Duplicate-content uploads return the existing document
-- [ ] Personal API token auth enforced on all non-health routes
-- [ ] Consistent error shape across all endpoints
-- [ ] Reprocess endpoint flips status to `queued` (real dispatch lives in Epic 8/11)
-- [ ] Integration test suite covering happy paths and key error paths
-- [ ] Status in [`EPICS.md`](../EPICS.md) updated; Epic 8 unblocked (in combination with Epics 4, 7)
+- [x] Five endpoints functional: `POST /documents`, `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/status`, `POST /documents/{id}/reprocess`
+- [x] Duplicate-content uploads return the existing document
+- [x] Personal API token auth enforced on all non-health routes (fail-closed; no bypass flag)
+- [x] Consistent error shape across all endpoints
+- [x] Reprocess endpoint flips status to `queued` (real dispatch lives in Epic 8/11)
+- [x] Integration test suite covering happy paths and key error paths
+- [x] Status in [`EPICS.md`](../EPICS.md) updated; Epic 6 done (Epic 8 still gated on Epics 4 and 7)
