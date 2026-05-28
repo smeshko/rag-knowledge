@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,13 +37,16 @@ from rag_recipes.api.schemas.documents import (
     DocumentResponse,
     IngestionProgress,
     IngestionStatusResponse,
+    ReprocessRequest,
+    ReprocessResponse,
     UploadIngestion,
     UploadResponse,
 )
 from rag_recipes.providers.errors import FileStorageError
 from rag_recipes.providers.file_storage.base import FileStorageProvider
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import DocumentStatus, ReprocessMode, SourceType, UploadStatus
 from rag_recipes.storage.ids import new_id
+from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
 
@@ -422,4 +426,67 @@ async def get_document_status(
             pages_processed=None,
         ),
         terminal=document.status in _TERMINAL_DOCUMENT_STATUSES,
+    )
+
+
+@router.post("/documents/{document_id}/reprocess")
+async def reprocess_document(
+    document_id: str,
+    body: ReprocessRequest,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> Any:
+    try:
+        mode = ReprocessMode(body.mode)
+    except ValueError as exc:
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message="Invalid value for 'mode'.",
+            details={"field": "mode", "value": body.mode},
+        ) from exc
+
+    repo = DocumentRepository(session)
+    document = await repo.get_document(document_id)
+    if document is None:
+        raise ApiError(
+            status_code=404,
+            code=ErrorCode.DOCUMENT_NOT_FOUND,
+            message=f"Document {document_id!r} not found.",
+            details={"document_id": document_id},
+        )
+    previous = document.active_source_version
+
+    # Atomic guarded transition: the WHERE-clause status filter closes the
+    # check-then-write race. Two concurrent POSTs cannot both pass because
+    # Postgres serializes the row UPDATEs; the loser sees status='queued'
+    # (no longer in the terminal set) and matches 0 rows.
+    result = await session.execute(
+        update(Document)
+        .where(
+            Document.id == document_id,
+            Document.status.in_(_TERMINAL_DOCUMENT_STATUSES),
+        )
+        .values(
+            status=DocumentStatus.QUEUED,
+            last_reprocess_mode=mode.value,
+            last_reprocess_reason=body.reason,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:  # type: ignore[attr-defined]
+        raise ApiError(
+            status_code=409,
+            code=ErrorCode.INGESTION_ALREADY_RUNNING,
+            message="Document is not in a terminal state.",
+            details={"document_id": document_id},
+        )
+    await session.commit()
+
+    # `current_source_version` mirrors `active_source_version` until Epic 8
+    # writes versioned source spans (handoff documented in PLAN/TASK-006).
+    return ReprocessResponse(
+        document_id=document_id,
+        status=DocumentStatus.QUEUED.value,
+        previous_active_source_version=previous,
+        current_source_version=previous,
     )
