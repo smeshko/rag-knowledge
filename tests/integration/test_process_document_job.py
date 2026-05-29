@@ -176,6 +176,69 @@ async def test_process_document_writes_three_spans_and_transitions(
         await _cleanup(test_engine, ids)
 
 
+async def test_process_document_is_idempotent_on_duplicate_delivery(
+    test_engine: AsyncEngine,
+    redis_arq_settings: RedisSettings,
+    arq_queue_cleanup: str,
+    tmp_path: Path,
+    override_settings_with_token: None,
+) -> None:
+    # First run: the full happy path leaves the doc in CREATING_SOURCE_SPANS.
+    ids = await _upload_and_run_worker(
+        test_engine=test_engine,
+        redis_arq_settings=redis_arq_settings,
+        queue_name=arq_queue_cleanup,
+        tmp_path=tmp_path,
+    )
+    try:
+        settings = get_settings().model_copy(
+            update={"local_storage_root": str(tmp_path)}
+        )
+        session_factory = build_session_factory(test_engine)
+        ctx: dict[str, Any] = {
+            "settings": settings,
+            "session_factory": session_factory,
+        }
+
+        async with session_factory() as session:
+            first_spans = (
+                await session.execute(
+                    select(SourceSpan.id).where(
+                        SourceSpan.document_id == ids["document_id"]
+                    )
+                )
+            ).scalars().all()
+        assert len(first_spans) == 3
+
+        # A duplicate / manual re-delivery for the already-processed document
+        # must no-op rather than flip the successful CREATING_SOURCE_SPANS row
+        # to FAILED via the InvalidTransitionError -> mark_failed path.
+        result = await process_document(ctx, ids["document_id"])
+        assert result == 0
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == ids["document_id"])
+            )
+            assert status == DocumentStatus.CREATING_SOURCE_SPANS
+
+            spans = (
+                await session.execute(
+                    select(SourceSpan.id).where(
+                        SourceSpan.document_id == ids["document_id"]
+                    )
+                )
+            ).scalars().all()
+            assert sorted(spans) == sorted(first_spans)
+
+            failures = await FailuresRepository(session).list_failures(
+                ids["document_id"]
+            )
+            assert failures == []
+    finally:
+        await _cleanup(test_engine, ids)
+
+
 async def test_process_document_marks_empty_pdf_failed(
     test_engine: AsyncEngine,
     redis_arq_settings: RedisSettings,

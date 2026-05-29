@@ -18,6 +18,7 @@ from typing import Any
 
 from arq.cron import cron
 from arq.worker import func
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from rag_recipes.config import Settings, get_settings
@@ -40,6 +41,7 @@ from rag_recipes.providers.errors import FileStorageError, PdfExtractionError
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
 from rag_recipes.storage.enums import DocumentStatus
+from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.session import build_engine, build_session_factory
 
 logger = logging.getLogger(__name__)
@@ -125,6 +127,26 @@ async def process_document(
         extractor = PyMuPdfExtractor(min_text_chars=settings.pdf_min_text_chars_for_page)
         try:
             async with session_factory() as session:
+                # Idempotency guard against duplicate / manual re-enqueue. A
+                # second delivery for a document that's already past QUEUED
+                # would raise InvalidTransitionError on the first transition
+                # below, and the except block would then mark_failed — and
+                # since CREATING_SOURCE_SPANS -> FAILED is a legal edge, a
+                # *successfully processed* document would be silently flipped
+                # to FAILED. No-op instead: an in-flight or wedged doc is the
+                # stuck-job cron's responsibility, not a re-delivery's.
+                status = await session.scalar(
+                    select(Document.status).where(Document.id == document_id)
+                )
+                if status is None:
+                    raise LookupError(f"Document not found: {document_id}")
+                if status is not DocumentStatus.QUEUED:
+                    logger.info(
+                        "process_document skipping %s: status is %s, not queued",
+                        document_id,
+                        status.value,
+                    )
+                    return 0
                 await transition_to(session, document_id, DocumentStatus.EXTRACTING_TEXT)
                 await session.commit()
             async with session_factory() as session:
