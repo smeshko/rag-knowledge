@@ -30,6 +30,21 @@ from rag_recipes.storage.models.document import Document
 logger = logging.getLogger(__name__)
 
 
+# Phase 8.1 deliberately rests a successfully-extracted document at
+# CREATING_SOURCE_SPANS: extraction is done and spans are persisted, but there
+# is no consumer to advance it until Epic 9's process_extraction_run lands. The
+# sweep treats every non-terminal status as "stuck", so without this exemption
+# a *successful* extraction would be marked failed once it ages past the
+# timeout. Exempt the handoff state until Epic 9 owns it.
+#
+# REMOVE this exemption when process_extraction_run exists — at that point a
+# document wedged in CREATING_SOURCE_SPANS (spans written, item-extraction
+# stalled) is genuinely stuck and should be swept again.
+_SWEEP_EXEMPT_STATUSES: frozenset[DocumentStatus] = frozenset(
+    {DocumentStatus.CREATING_SOURCE_SPANS}
+)
+
+
 async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
     settings: Settings = ctx["settings"]
     session_factory: async_sessionmaker[Any] = ctx["session_factory"]
@@ -41,6 +56,7 @@ async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
         result = await session.execute(
             select(Document.id, Document.status)
             .where(Document.status.notin_(TERMINAL_STATUSES))
+            .where(Document.status.notin_(_SWEEP_EXEMPT_STATUSES))
             .where(Document.updated_at < threshold)
         )
         stuck: list[tuple[str, DocumentStatus]] = list(result.all())

@@ -54,6 +54,16 @@ class DocumentRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_source_asset_for_document(
+        self, document: Document
+    ) -> SourceAsset | None:
+        # Explicit query — never `await document.asset` from an AsyncSession
+        # (lazy-load trap, same as get_document_by_asset_id).
+        result = await self._session.execute(
+            select(SourceAsset).where(SourceAsset.id == document.asset_id)
+        )
+        return result.scalar_one_or_none()
+
     async def add_source_asset(
         self,
         *,

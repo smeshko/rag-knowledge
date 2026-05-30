@@ -212,6 +212,35 @@ async def test_sweep_skips_terminal_documents_even_if_old(
     assert failures == []
 
 
+async def test_sweep_exempts_creating_source_spans_handoff_state(
+    db_session: AsyncSession,
+) -> None:
+    # A document that finished Phase 8.1 rests at CREATING_SOURCE_SPANS with no
+    # consumer to advance it until Epic 9. Even aged well past the timeout it
+    # must NOT be swept to FAILED — a successful extraction is not "stuck".
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-handoff-css",
+        status=DocumentStatus.CREATING_SOURCE_SPANS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 0
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.CREATING_SOURCE_SPANS
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert failures == []
+
+
 async def test_sweep_continues_after_per_doc_error(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,

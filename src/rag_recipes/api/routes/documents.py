@@ -22,12 +22,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
+from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.api.dependencies import get_file_storage, get_session
+from rag_recipes.api.dependencies import get_arq_redis, get_file_storage, get_session
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.documents import (
     DocumentCounts,
@@ -42,6 +43,7 @@ from rag_recipes.api.schemas.documents import (
     UploadIngestion,
     UploadResponse,
 )
+from rag_recipes.ingestion.queue import enqueue_job
 from rag_recipes.providers.errors import FileStorageError
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.storage.enums import DocumentStatus, ReprocessMode, SourceType, UploadStatus
@@ -161,6 +163,7 @@ async def upload_document(
     language: Annotated[str | None, Form()] = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     storage: FileStorageProvider = Depends(get_file_storage),  # noqa: B008
+    arq_redis: ArqRedis = Depends(get_arq_redis),  # noqa: B008
 ) -> Any:
     return await _handle_upload(
         file=file,
@@ -171,6 +174,7 @@ async def upload_document(
         language=language,
         session=session,
         storage=storage,
+        arq_redis=arq_redis,
     )
 
 
@@ -184,6 +188,7 @@ async def _handle_upload(
     language: str | None,
     session: AsyncSession,
     storage: FileStorageProvider,
+    arq_redis: ArqRedis,
 ) -> UploadResponse:
     if file is None:
         raise ApiError(
@@ -324,6 +329,19 @@ async def _handle_upload(
         ) from exc
 
     await session.refresh(document)
+
+    # Fresh-insert path only — kick off ingestion. The duplicate-recovery
+    # paths above return before reaching here and must not re-enqueue.
+    try:
+        await enqueue_job(arq_redis, "process_document", document.id, session_id=document.id)
+    except Exception:
+        # The document row is committed and queued; the 7.2 stuck-job cron
+        # will mark it failed if it never gets picked up. Surface the error
+        # in logs so an operator can manually re-enqueue. Do NOT fail the 201.
+        logger.exception(
+            "Failed to enqueue process_document for %s; stuck-job cron will catch it",
+            document.id,
+        )
 
     return UploadResponse(
         document=DocumentResponse.model_validate(document),

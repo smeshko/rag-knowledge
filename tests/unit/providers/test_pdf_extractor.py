@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -157,3 +158,21 @@ async def test_document_closed_on_post_open_failure(monkeypatch: pytest.MonkeyPa
     with pytest.raises(PdfExtractionError):
         await extractor.extract_pages(_FIXTURE.read_bytes())
     assert [spy.close_calls for spy in spies] == [1]
+
+
+async def test_concurrent_extractions_against_synthetic_fixture() -> None:
+    """Regression test for the Phase 4.2 PyMuPDF concurrency footgun.
+
+    PyMuPDF runs MuPDF in single-threaded mode (reinit_singlethreaded() at
+    import); concurrent extract calls from multiple executor threads risk
+    native crashes or silent corruption. The provider now dispatches via a
+    module-level single-worker executor, so N concurrent calls must all
+    return identical, correct results.
+    """
+    extractor = PyMuPdfExtractor(min_text_chars=20)
+    pdf_bytes = _FIXTURE.read_bytes()
+    results = await asyncio.gather(
+        *[extractor.extract_pages(pdf_bytes) for _ in range(8)]
+    )
+    for pages in results:
+        assert [p.model_dump() for p in pages] == [p.model_dump() for p in _FIXTURE_PAGES]

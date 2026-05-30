@@ -14,6 +14,8 @@ own functions remain unannotated, so the few API calls carry targeted
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import pymupdf
 
@@ -22,6 +24,33 @@ from rag_recipes.providers.pdf_extractor.base import PdfTextExtractor
 from rag_recipes.providers.pdf_extractor.types import PdfPageText
 
 __all__ = ["PyMuPdfExtractor"]
+
+# PyMuPDF runs MuPDF in single-threaded mode (it calls reinit_singlethreaded()
+# at import); dispatching concurrent extractions onto multiple threads risks
+# native crashes or silent corruption (Phase 4.2 REVIEW.md round-1 #1 /
+# round-2 #1). Funnel every extraction through one dedicated worker thread so
+# MuPDF only ever sees a single caller, regardless of in-flight concurrency.
+# If a future PyMuPDF release drops the single-threaded constraint, this
+# executor can be removed and extract_pages can revert to asyncio.to_thread.
+_PDF_EXECUTOR: ThreadPoolExecutor | None = None
+_PDF_EXECUTOR_LOCK = Lock()
+
+
+def _get_pdf_executor() -> ThreadPoolExecutor:
+    """Lazily build the process-global single-worker PyMuPDF executor.
+
+    Double-checked locking keeps initialisation thread-safe while avoiding the
+    import-time cost of spawning the worker thread (test collection imports this
+    module without necessarily extracting anything).
+    """
+    global _PDF_EXECUTOR
+    if _PDF_EXECUTOR is None:
+        with _PDF_EXECUTOR_LOCK:
+            if _PDF_EXECUTOR is None:
+                _PDF_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="pymupdf"
+                )
+    return _PDF_EXECUTOR
 
 
 class PyMuPdfExtractor(PdfTextExtractor):
@@ -36,7 +65,8 @@ class PyMuPdfExtractor(PdfTextExtractor):
         self._min_text_chars = min_text_chars
 
     async def extract_pages(self, file: bytes) -> list[PdfPageText]:
-        return await asyncio.to_thread(self._extract, file)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_get_pdf_executor(), self._extract, file)
 
     def _extract(self, file: bytes) -> list[PdfPageText]:
         try:
