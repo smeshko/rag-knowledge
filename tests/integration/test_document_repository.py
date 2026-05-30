@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.source_asset import SourceAsset
+from rag_recipes.storage.models.source_span import SourceSpan
 from rag_recipes.storage.repositories.documents import DocumentRepository
 
 
@@ -38,6 +41,81 @@ async def _make_asset_and_document(
         status=DocumentStatus.QUEUED,
     )
     return asset, document.id
+
+
+async def _add_span(
+    session: AsyncSession,
+    *,
+    document_id: str,
+    source_version: int,
+    page_end: int,
+) -> None:
+    locator = {"type": "pdf_page_range", "page_start": page_end, "page_end": page_end}
+    marker = f"{document_id}-{source_version}-{page_end}"
+    session.add(
+        SourceSpan(
+            document_id=document_id,
+            source_version=source_version,
+            source_type=SourceType.PDF,
+            locator=locator,
+            locator_hash=hashlib.sha256(marker.encode()).hexdigest(),
+            text=f"text-{marker}",
+            text_hash=hashlib.sha256(f"text-{marker}".encode()).hexdigest(),
+        )
+    )
+    await session.flush()
+
+
+class TestGetPagesProgress:
+    @pytest.mark.asyncio
+    async def test_returns_zero_none_for_no_spans(
+        self, db_session: AsyncSession
+    ) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="prog-none")
+        assert await repo.get_pages_progress(document_id, 1) == (0, None)
+
+    @pytest.mark.asyncio
+    async def test_returns_count_and_max_for_contiguous_spans(
+        self, db_session: AsyncSession
+    ) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="prog-3")
+        for page in (1, 2, 3):
+            await _add_span(
+                db_session, document_id=document_id, source_version=1, page_end=page
+            )
+        assert await repo.get_pages_progress(document_id, 1) == (3, 3)
+
+    @pytest.mark.asyncio
+    async def test_scopes_to_source_version(self, db_session: AsyncSession) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="prog-ver")
+        for page in (1, 2, 3):
+            await _add_span(
+                db_session, document_id=document_id, source_version=1, page_end=page
+            )
+        for page in (1, 2):
+            await _add_span(
+                db_session, document_id=document_id, source_version=2, page_end=page
+            )
+        assert await repo.get_pages_progress(document_id, 1) == (3, 3)
+        assert await repo.get_pages_progress(document_id, 2) == (2, 2)
+
+    @pytest.mark.asyncio
+    async def test_handles_non_contiguous_pages(
+        self, db_session: AsyncSession
+    ) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="prog-gap")
+        await _add_span(
+            db_session, document_id=document_id, source_version=1, page_end=1
+        )
+        await _add_span(
+            db_session, document_id=document_id, source_version=1, page_end=5
+        )
+        # Diagnostic signal preserved: count (2) != max_page_end (5).
+        assert await repo.get_pages_progress(document_id, 1) == (2, 5)
 
 
 class TestGetSourceAssetByContentHash:
