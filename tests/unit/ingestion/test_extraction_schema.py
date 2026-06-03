@@ -15,7 +15,11 @@ import pytest
 from pydantic import ValidationError
 
 from rag_recipes.ingestion.pipeline.extraction import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
     RecipeExtractionOutput,
+    _load_prompt_template,
+    _render_prompt,
     build_recipe_v1_json_schema,
 )
 
@@ -196,3 +200,37 @@ def test_json_schema_uses_yield_alias_and_nullable_union() -> None:
     # listed in ``required`` (strict mode), never dropped.
     assert _type_allows_null(structured["properties"]["prep_time"])
     assert "prep_time" in structured["required"]
+
+
+def test_version_constants() -> None:
+    assert PROMPT_VERSION == "recipe-extraction-v1"
+    assert SCHEMA_VERSION == "recipe.v1"
+
+
+def test_prompt_template_loads_non_empty() -> None:
+    template = _load_prompt_template()
+    assert isinstance(template, str)
+    assert template.strip()
+    # The instruction surface the model acts on.
+    lowered = template.lower()
+    assert "recipe.v1" in lowered
+    assert "item_type" in lowered
+    assert "source_span_ids" in lowered
+    assert "null" in lowered
+    assert "confidence" in lowered
+
+
+def test_render_prompt_injects_window_at_placeholder() -> None:
+    rendered = _render_prompt("MARKER-WINDOW-TEXT")
+    assert "MARKER-WINDOW-TEXT" in rendered
+    # The placeholder token itself is consumed, and surrounding instructions stay.
+    assert "{source_spans}" not in rendered
+    assert "item_type" in rendered.lower()
+
+
+def test_render_prompt_tolerates_braces_in_window_text() -> None:
+    # Windowed source text may contain literal braces; str.replace must not choke
+    # the way str.format would.
+    rendered = _render_prompt("yield: {serves 4} and {unbalanced")
+    assert "{serves 4}" in rendered
+    assert "{unbalanced" in rendered

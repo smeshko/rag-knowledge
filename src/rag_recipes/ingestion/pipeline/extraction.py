@@ -13,11 +13,14 @@ to ``rejected`` here.
 
 from __future__ import annotations
 
+import importlib.resources
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "PROMPT_VERSION",
+    "SCHEMA_VERSION",
     "ExtractedIngredient",
     "ExtractedRecipe",
     "ExtractedStep",
@@ -29,6 +32,44 @@ __all__ = [
     "StepConfidence",
     "build_recipe_v1_json_schema",
 ]
+
+# LLM API contract versions — module constants, NOT ``Settings`` (DECISIONS #3).
+# They feed ``compute_input_hash`` and every ``ExtractionRun`` row, so they must
+# travel atomically with the prompt template / schema code they describe. A
+# meaningful change to either the prompt or the schema shape must bump these.
+PROMPT_VERSION = "recipe-extraction-v1"
+SCHEMA_VERSION = "recipe.v1"
+
+_PROMPT_PLACEHOLDER = "{source_spans}"
+_PROMPT_PACKAGE = "rag_recipes.ingestion.prompts"
+_PROMPT_RESOURCE = "recipe_extraction_v1.md"
+
+
+def _load_prompt_template() -> str:
+    """Load the versioned prompt template shipped as package data.
+
+    Loaded via ``importlib.resources`` so it resolves from the installed wheel
+    as well as the source tree. Read once and cached at module scope.
+    """
+    return (
+        importlib.resources.files(_PROMPT_PACKAGE)
+        .joinpath(_PROMPT_RESOURCE)
+        .read_text(encoding="utf-8")
+    )
+
+
+_PROMPT_TEMPLATE = _load_prompt_template()
+
+
+def _render_prompt(window_text: str) -> str:
+    """Inject the formatted page window into the prompt template.
+
+    Uses ``str.replace`` (not ``str.format``) because the windowed source text
+    may contain literal ``{``/``}`` that would break ``str.format``. The rendered
+    string is part of the prompt contract; any observable change to the template
+    must bump ``PROMPT_VERSION`` (see the template header).
+    """
+    return _PROMPT_TEMPLATE.replace(_PROMPT_PLACEHOLDER, window_text)
 
 
 class IngredientConfidence(BaseModel):
