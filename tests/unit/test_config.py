@@ -210,3 +210,64 @@ def test_stuck_job_timeout_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
     assert "stuck_job_timeout_minutes" in str(excinfo.value).lower()
+
+
+def test_extraction_threshold_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    for var in (
+        "EXTRACTION_MIN_OVERALL_CONFIDENCE",
+        "EXTRACTION_MIN_BOUNDARY_CONFIDENCE",
+        "EXTRACTION_MIN_NORMALIZATION_CONFIDENCE",
+        "EXTRACTION_MIN_RECIPE_CHARS",
+        "EXTRACTION_MAX_RECIPE_CHARS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.extraction_min_overall_confidence == 0.5
+    assert settings.extraction_min_boundary_confidence == 0.5
+    assert settings.extraction_min_normalization_confidence == 0.5
+    assert settings.extraction_min_recipe_chars == 200
+    assert settings.extraction_max_recipe_chars == 20000
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "EXTRACTION_MIN_OVERALL_CONFIDENCE",
+        "EXTRACTION_MIN_BOUNDARY_CONFIDENCE",
+        "EXTRACTION_MIN_NORMALIZATION_CONFIDENCE",
+    ],
+)
+@pytest.mark.parametrize("value", ["-0.1", "1.1"])
+def test_extraction_confidence_thresholds_out_of_range_rejected(
+    monkeypatch: pytest.MonkeyPatch, var: str, value: str
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv(var, value)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert var.lower() in str(excinfo.value).lower()
+
+
+def test_extraction_min_recipe_chars_rejects_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("EXTRACTION_MIN_RECIPE_CHARS", "-1")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "extraction_min_recipe_chars" in str(excinfo.value).lower()
+
+
+def test_extraction_max_recipe_chars_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("EXTRACTION_MAX_RECIPE_CHARS", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "extraction_max_recipe_chars" in str(excinfo.value).lower()
+
+
+def test_extraction_max_must_exceed_min(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("EXTRACTION_MIN_RECIPE_CHARS", "500")
+    monkeypatch.setenv("EXTRACTION_MAX_RECIPE_CHARS", "500")
+    with pytest.raises(ValidationError, match="extraction_max_recipe_chars"):
+        Settings(_env_file=None)

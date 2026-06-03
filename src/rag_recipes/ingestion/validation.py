@@ -27,7 +27,10 @@ from rag_recipes.ingestion.pipeline.windows import Window
 __all__ = [
     "HardValidationError",
     "HardValidationFailure",
+    "SoftValidationThresholds",
+    "SoftValidationWarning",
     "validate_hard",
+    "validate_soft",
 ]
 
 
@@ -167,3 +170,107 @@ def validate_hard(extracted: ExtractedRecipe, window: Window) -> list[HardValida
             )
 
     return failures
+
+
+@dataclass(frozen=True)
+class SoftValidationWarning:
+    """One soft-validation concern — the item is still stored as ``needs_review``.
+
+    ``code`` is a stable machine identifier (e.g. ``"no_ingredients"``);
+    ``message`` carries human detail.
+    """
+
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class SoftValidationThresholds:
+    """Threshold values for soft validation, passed in to keep ``validate_soft`` pure.
+
+    The orchestration layer (9.4) builds this from ``Settings.extraction_*`` and
+    passes it down; this module never reads ``get_settings()`` itself.
+    """
+
+    min_overall_confidence: float
+    min_boundary_confidence: float
+    min_normalization_confidence: float
+    min_recipe_chars: int
+    max_recipe_chars: int
+
+
+def validate_soft(
+    extracted: ExtractedRecipe,
+    *,
+    thresholds: SoftValidationThresholds,
+) -> list[SoftValidationWarning]:
+    """Return soft-validation warnings for ``extracted`` (empty = fully clean).
+
+    Soft failures do not drop the candidate — the caller persists it with
+    ``status="needs_review"`` and attaches the warning codes (doc 4 § Soft
+    validation). All warnings are collected; nothing short-circuits.
+    """
+    warnings: list[SoftValidationWarning] = []
+    structured = extracted.structured_data
+
+    if not structured.ingredients:
+        warnings.append(
+            SoftValidationWarning(
+                code="no_ingredients", message="structured_data has no ingredients"
+            )
+        )
+
+    if not structured.steps:
+        warnings.append(
+            SoftValidationWarning(code="no_steps", message="structured_data has no steps")
+        )
+
+    overall = extracted.confidence.overall
+    if overall < thresholds.min_overall_confidence:
+        warnings.append(
+            SoftValidationWarning(
+                code="low_overall_confidence",
+                message=f"overall confidence {overall} < {thresholds.min_overall_confidence}",
+            )
+        )
+
+    boundary = extracted.confidence.boundary
+    if boundary < thresholds.min_boundary_confidence:
+        warnings.append(
+            SoftValidationWarning(
+                code="low_boundary_confidence",
+                message=f"boundary confidence {boundary} < {thresholds.min_boundary_confidence}",
+            )
+        )
+
+    body_len = len(extracted.body_text)
+    if body_len < thresholds.min_recipe_chars:
+        warnings.append(
+            SoftValidationWarning(
+                code="recipe_too_short",
+                message=f"body_text length {body_len} < {thresholds.min_recipe_chars}",
+            )
+        )
+    elif body_len > thresholds.max_recipe_chars:
+        warnings.append(
+            SoftValidationWarning(
+                code="recipe_too_long",
+                message=f"body_text length {body_len} > {thresholds.max_recipe_chars}",
+            )
+        )
+
+    # Only meaningful when ingredients are present (else no_ingredients fires).
+    if structured.ingredients:
+        lowest = min(ing.confidence.normalization for ing in structured.ingredients)
+        if lowest < thresholds.min_normalization_confidence:
+            warnings.append(
+                SoftValidationWarning(
+                    code="low_normalization_confidence",
+                    message=(
+                        f"lowest ingredient normalization confidence {lowest} "
+                        f"< {thresholds.min_normalization_confidence}"
+                    ),
+                )
+            )
+
+    return warnings

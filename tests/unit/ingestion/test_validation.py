@@ -27,7 +27,10 @@ from rag_recipes.ingestion.pipeline.windows import Window
 from rag_recipes.ingestion.validation import (
     HardValidationError,
     HardValidationFailure,
+    SoftValidationThresholds,
+    SoftValidationWarning,
     validate_hard,
+    validate_soft,
 )
 from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -206,3 +209,78 @@ def test_hard_validation_error_carries_failures() -> None:
     error = HardValidationError(failures)
     assert error.failures == failures
     assert "missing_title" in str(error)
+
+
+# --- soft validation -------------------------------------------------------
+
+# Defaults mirror Settings: 0.5 confidence floors, 200..20000 char bounds.
+_THRESHOLDS = SoftValidationThresholds(
+    min_overall_confidence=0.5,
+    min_boundary_confidence=0.5,
+    min_normalization_confidence=0.5,
+    min_recipe_chars=200,
+    max_recipe_chars=20000,
+)
+
+
+def _soft_codes(warnings: list[SoftValidationWarning]) -> list[str]:
+    return [w.code for w in warnings]
+
+
+def test_clean_candidate_passes_soft() -> None:
+    assert validate_soft(_make_recipe(), thresholds=_THRESHOLDS) == []
+
+
+def test_no_ingredients() -> None:
+    recipe = _make_recipe(structured_data=_make_structured_data(ingredients=[]))
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["no_ingredients"]
+
+
+def test_no_steps() -> None:
+    recipe = _make_recipe(structured_data=_make_structured_data(steps=[]))
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["no_steps"]
+
+
+def test_low_overall_confidence() -> None:
+    recipe = _make_recipe(confidence=_recipe_confidence(overall=0.3))
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["low_overall_confidence"]
+
+
+def test_low_boundary_confidence() -> None:
+    recipe = _make_recipe(confidence=_recipe_confidence(boundary=0.3))
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["low_boundary_confidence"]
+
+
+def test_recipe_too_short() -> None:
+    recipe = _make_recipe(body_text="x" * 10)
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["recipe_too_short"]
+
+
+def test_recipe_too_long() -> None:
+    recipe = _make_recipe(body_text="x" * 20001)
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["recipe_too_long"]
+
+
+def test_low_normalization_confidence() -> None:
+    ingredient = _make_ingredient(confidence=_ingredient_confidence(normalization=0.3))
+    recipe = _make_recipe(structured_data=_make_structured_data(ingredients=[ingredient]))
+    codes = _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS))
+    assert codes == ["low_normalization_confidence"]
+
+
+def test_low_normalization_uses_lowest_ingredient() -> None:
+    # Lowest normalization across present ingredients drives the rule.
+    ingredients = [
+        _make_ingredient(position=1, confidence=_ingredient_confidence(normalization=0.9)),
+        _make_ingredient(position=2, confidence=_ingredient_confidence(normalization=0.2)),
+    ]
+    recipe = _make_recipe(structured_data=_make_structured_data(ingredients=ingredients))
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == [
+        "low_normalization_confidence"
+    ]
+
+
+def test_no_ingredients_skips_normalization_rule() -> None:
+    # With zero ingredients only no_ingredients fires (no normalization to check).
+    recipe = _make_recipe(structured_data=_make_structured_data(ingredients=[]))
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["no_ingredients"]

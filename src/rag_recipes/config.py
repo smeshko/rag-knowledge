@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     stuck_job_timeout_minutes: int = Field(default=30, ge=1)
     stuck_job_check_interval_minutes: int = Field(default=5, ge=1, le=60)
 
+    # Soft-validation thresholds (Epic 9 Phase 9.3, doc 4 § Soft validation).
+    # Review heuristics, not calibrated truth — a candidate below a confidence
+    # floor or outside the char band is persisted as needs_review, not dropped.
+    extraction_min_overall_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    extraction_min_boundary_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    extraction_min_normalization_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    extraction_min_recipe_chars: int = Field(default=200, ge=0)
+    extraction_max_recipe_chars: int = Field(default=20000, ge=1)
+
     @field_validator("redis_url")
     @classmethod
     def _redis_url_requires_credentials(cls, value: str) -> str:
@@ -94,6 +103,21 @@ class Settings(BaseSettings):
         if url_password != self.redis_password:
             raise ValueError(
                 "REDIS_URL password does not match REDIS_PASSWORD; update both in .env"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _extraction_recipe_char_band_is_ordered(self) -> Settings:
+        # The soft-validation "too short" / "too long" rules require a real band:
+        # an inverted or collapsed range (max <= min) would make every recipe
+        # both too short and too long. Reject at Settings load so the operator
+        # fixes the env rather than getting nonsensical needs_review flags.
+        if self.extraction_max_recipe_chars <= self.extraction_min_recipe_chars:
+            raise ValueError(
+                "extraction_max_recipe_chars must be greater than "
+                f"extraction_min_recipe_chars; got "
+                f"max={self.extraction_max_recipe_chars}, "
+                f"min={self.extraction_min_recipe_chars}"
             )
         return self
 
