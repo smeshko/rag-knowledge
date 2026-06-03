@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.storage.enums import (
@@ -151,6 +151,24 @@ class DocumentRepository:
             )
         )
         return result.scalar_one()
+
+    async def get_pages_progress(
+        self, document_id: str, source_version: int
+    ) -> tuple[int, int | None]:
+        # Combined count + max(page_end) in one round-trip. page_end lives in
+        # the JSONB locator column; the ->> accessor returns text, which we
+        # cast to int. max over zero rows is NULL → (0, None).
+        result = await self._session.execute(
+            select(
+                func.count(SourceSpan.id),
+                func.max(cast(SourceSpan.locator["page_end"].astext, Integer)),
+            ).where(
+                SourceSpan.document_id == document_id,
+                SourceSpan.source_version == source_version,
+            )
+        )
+        count, max_page = result.one()
+        return (count, max_page)
 
     async def count_chunks(self, document_id: str) -> int:
         result = await self._session.execute(

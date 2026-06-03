@@ -44,6 +44,7 @@ from rag_recipes.api.schemas.documents import (
     UploadResponse,
 )
 from rag_recipes.ingestion.queue import enqueue_job
+from rag_recipes.ingestion.status import is_terminal
 from rag_recipes.providers.errors import FileStorageError
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.storage.enums import DocumentStatus, ReprocessMode, SourceType, UploadStatus
@@ -426,24 +427,49 @@ async def get_document_status(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
+    """Report ingestion progress for a document.
+
+    8.2 covers initial ingestion only: ``current_source_version`` is ``1``
+    for any non-terminal status and ``None`` for terminal ones. Epic 11 must
+    revisit this logic for reprocess scenarios where ``active`` != ``current``
+    (a ready doc at v1 with v2 in flight).
+    """
     repo = DocumentRepository(session)
     document = await _require_document(repo, document_id)
-    # `current_source_version` is a TEMPORARY Epic-8 placeholder that
-    # mirrors `active_source_version`. doc 6 §5 documents the two as
-    # diverging mid-ingestion (active: null, current: 1); Epic 8 Phase 8.2
-    # replaces this mirror once versioned spans + real progress exist.
+    is_doc_terminal = is_terminal(document.status)
+    current_source_version = None if is_doc_terminal else 1
+    if is_doc_terminal:
+        # Report final counts for terminal docs that have an active version (a
+        # ready doc at v1 shows its spans); failed docs with active=null
+        # legitimately get (0, None).
+        version_for_progress = document.active_source_version
+    elif document.active_source_version is not None:
+        # Reprocess in flight: the doc is non-terminal but already has an active
+        # version from a prior run, so the new run's spans don't exist yet.
+        # Suppress progress (the surviving old-version spans are NOT this run's
+        # work). Epic 11 will compute the real in-flight version here.
+        version_for_progress = None
+    else:
+        # Initial ingestion: in-flight version is 1.
+        version_for_progress = 1
+    if version_for_progress is None:
+        pages_processed, pages_total = 0, None
+    else:
+        pages_processed, pages_total = await repo.get_pages_progress(
+            document_id, version_for_progress
+        )
     return IngestionStatusResponse(
         document_id=document.id,
         status=document.status.value,
         active_source_version=document.active_source_version,
-        current_source_version=document.active_source_version,
+        current_source_version=current_source_version,
         progress=IngestionProgress(
             stage=document.status.value,
             message=None,
-            pages_total=None,
-            pages_processed=None,
+            pages_total=pages_total,
+            pages_processed=pages_processed,
         ),
-        terminal=document.status in _TERMINAL_DOCUMENT_STATUSES,
+        terminal=is_doc_terminal,
     )
 
 

@@ -1,6 +1,6 @@
 # Epic 8 — PDF Ingestion: Text & SourceSpans
 
-**Status**: Blocked (depends on Epics 4, 6, 7)
+**Status**: Done
 
 ## Overview
 
@@ -79,9 +79,7 @@ Upload a small synthetic PDF; poll `GET /documents/{id}/status` until status mov
 
 - Populate `progress.pages_total` and `progress.pages_processed` on `GET /documents/{id}/status` while ingestion runs:
   - Either by writing partial progress into a Redis key (keyed by `document_id`) the job updates as it processes, or by counting `source_spans` rows for the current version (simpler; designer's choice — document it)
-- Stop the job from leaving the document in `creating_source_spans` forever — Epic 9 picks up here. For this epic, after spans are created, transition the document to `extracting_items` (the next stage per doc 2), and immediately to a placeholder "spans-ready" terminal-but-not-really state. Two options (pick one and document):
-  - **Option A**: leave `Document.status = "creating_source_spans"` and let Epic 9 take over the same job
-  - **Option B**: transition to `extracting_items` and let the stuck-job cron handle it if Epic 9 is not yet implemented (acceptable since the cron will mark it failed after timeout — but Epic 9 should land before this matters in practice)
+- **Resolved (Phase 8.2): Option A.** The job leaves the document at `creating_source_spans` after extraction; Epic 9's `process_extraction_run` job transitions `creating_source_spans → extracting_items` when it lands. Because a successfully-extracted document is *not* stuck, Phase 8.1's review (`fix(ingestion): exempt creating_source_spans from stuck-job sweep`) added `creating_source_spans` to the stuck-job cron's `_SWEEP_EXEMPT_STATUSES`: the document rests at `creating_source_spans` indefinitely until Epic 9 owns it, rather than being marked `failed` after the timeout. (The exemption is to be removed once `process_extraction_run` exists, at which point a document wedged at `creating_source_spans` with item-extraction stalled is genuinely stuck.) Rationale: state fields should reflect what actually happened (Option A), not what is supposed to happen next (Option B). See [`.claude/plans/epic-08-phase-8-2-status-progress/DECISIONS.md` §1](../../.claude/plans/epic-08-phase-8-2-status-progress/DECISIONS.md) and `tests/integration/test_sweep_stuck_jobs.py::test_sweep_exempts_creating_source_spans_handoff_state`.
 - Integration test pathway:
   - Use `FakeLLMProvider` and `FakePdfExtractor` (or real PyMuPDF against a committed synthetic PDF)
   - Upload via the API
@@ -91,11 +89,11 @@ Upload a small synthetic PDF; poll `GET /documents/{id}/status` until status mov
 
 ### Acceptance criteria
 
-- [ ] `progress.pages_total` and `progress.pages_processed` populated during/after extraction
-- [ ] Status accurately reflects extraction stage during the run
-- [ ] Integration test runs end-to-end from `POST /documents` to span rows in DB
-- [ ] Failure mid-extraction (simulated via a Fake that raises) marks document `failed` with the error message captured
-- [ ] No orphaned spans on failure (cleanup or leave-for-retry rule documented — for initial ingestion, leaving them is fine since `source_version=1` won't be reused for the same document if it failed; doc 2 source-span retry rule applies)
+- [x] `progress.pages_total` and `progress.pages_processed` populated during/after extraction
+- [x] Status accurately reflects extraction stage during the run
+- [x] Integration test runs end-to-end from `POST /documents` to span rows in DB
+- [x] Failure mid-extraction (simulated via a Fake that raises) marks document `failed` with the error message captured
+- [x] No orphaned spans on failure (cleanup or leave-for-retry rule documented — for initial ingestion, leaving them is fine since `source_version=1` won't be reused for the same document if it failed; doc 2 source-span retry rule applies)
 
 ### Validation
 
@@ -105,10 +103,10 @@ Upload a small synthetic PDF; poll `GET /documents/{id}/status` until status mov
 
 ## Epic-level acceptance criteria
 
-- [ ] Uploading a PDF triggers an arq job that extracts text and writes per-page SourceSpans
-- [ ] `source_version = 1` on initial ingestion; uniqueness constraint respected
-- [ ] Status accurately reflects progress through `extracting_text` and `creating_source_spans`
-- [ ] Failures transition the document to `failed` with a clear error
-- [ ] Langfuse session ID propagated for trace grouping (when enabled)
-- [ ] Integration test exercises upload → spans end-to-end
-- [ ] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked
+- [x] Uploading a PDF triggers an arq job that extracts text and writes per-page SourceSpans
+- [x] `source_version = 1` on initial ingestion; uniqueness constraint respected
+- [x] Status accurately reflects progress through `extracting_text` and `creating_source_spans`
+- [x] Failures transition the document to `failed` with a clear error
+- [x] Langfuse session ID propagated for trace grouping (when enabled)
+- [x] Integration test exercises upload → spans end-to-end
+- [x] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked
