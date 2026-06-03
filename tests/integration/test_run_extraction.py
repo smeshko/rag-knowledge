@@ -257,3 +257,104 @@ async def test_pydantic_rejection_retains_raw_output(db_session: AsyncSession) -
     assert run.error_message  # carries the ValidationError text
     assert run.output_json == invalid  # raw object retained for audit
     assert run.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_reuses_output_without_calling_provider(
+    db_session: AsyncSession,
+) -> None:
+    document_id, window = await _make_document_and_window(db_session)
+    payload = _canned_success_payload()
+    provider = FakeLLMProvider(default_output=payload)
+
+    first = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=provider,
+    )
+    assert first.status == ExtractionRunStatus.SUCCESS
+    assert len(provider.calls) == 1
+
+    # Same window/provider/model → cache hit; the provider must NOT be called.
+    second = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=provider,
+    )
+    assert len(provider.calls) == 1  # unchanged — provider skipped
+    assert second.id != first.id
+    assert second.status == ExtractionRunStatus.SUCCESS
+    assert second.output_json == first.output_json == payload
+    assert second.completed_at is not None
+
+    rows = await _runs_for(db_session, document_id)
+    assert len(rows) == 2  # a new audit row was still recorded (DECISIONS #2)
+
+
+@pytest.mark.asyncio
+async def test_rejected_prior_run_is_not_a_cache_hit(db_session: AsyncSession) -> None:
+    document_id, window = await _make_document_and_window(db_session)
+
+    # A prior REJECTED run with the matching key must not satisfy the cache.
+    rejected_provider = FakeLLMProvider(
+        default_output=StructuredOutputResponse(
+            output_json=None,
+            parse_error="nope",
+            raw_text="nope",
+            usage=TokenUsage(input_tokens=1, output_tokens=0),
+            provider="fake",
+            model="fake-model",
+        )
+    )
+    rejected = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=rejected_provider,
+    )
+    assert rejected.status == ExtractionRunStatus.REJECTED
+
+    # Now a real provider: the REJECTED row is not a hit, so it IS called.
+    success_provider = FakeLLMProvider(default_output=_canned_success_payload())
+    run = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=success_provider,
+    )
+    assert len(success_provider.calls) == 1  # provider was called (cache miss)
+    assert run.status == ExtractionRunStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_differing_model_is_a_cache_miss(db_session: AsyncSession) -> None:
+    document_id, window = await _make_document_and_window(db_session)
+    payload = _canned_success_payload()
+
+    first_provider = FakeLLMProvider(default_output=payload, default_model="model-a")
+    await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=first_provider,
+    )
+
+    # Different model → different cache key → provider must be called.
+    other_provider = FakeLLMProvider(default_output=payload, default_model="model-b")
+    run = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=other_provider,
+    )
+    assert len(other_provider.calls) == 1
+    assert run.status == ExtractionRunStatus.SUCCESS
+    assert run.model == "model-b"

@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.ingestion.pipeline.windows import (
@@ -249,6 +250,37 @@ def _finalize(
     run.completed_at = datetime.now(tz=UTC)
 
 
+async def _find_cached_run(
+    session: AsyncSession,
+    *,
+    input_hash: str,
+    provider: str,
+    model: str,
+) -> ExtractionRun | None:
+    """Return the most recent prior ``SUCCESS`` run for this cache key, or None.
+
+    The cache key is ``(input_hash, provider, model, prompt_version,
+    schema_version)`` — ``input_hash`` is ``compute_input_hash`` (over span
+    identity + versions), NOT ``FakeLLMProvider.request_hash``. Ordered by
+    ``created_at`` descending so the most recent prior success wins.
+    """
+    stmt = (
+        select(ExtractionRun)
+        .where(
+            ExtractionRun.status == ExtractionRunStatus.SUCCESS,
+            ExtractionRun.input_hash == input_hash,
+            ExtractionRun.provider == provider,
+            ExtractionRun.model == model,
+            ExtractionRun.prompt_version == PROMPT_VERSION,
+            ExtractionRun.schema_version == SCHEMA_VERSION,
+        )
+        .order_by(ExtractionRun.created_at.desc())
+        .limit(1)
+    )
+    result: ExtractionRun | None = await session.scalar(stmt)
+    return result
+
+
 async def run_extraction(
     session: AsyncSession,
     window: Window,
@@ -278,6 +310,37 @@ async def run_extraction(
     span_ids = window.span_ids
     provider_name = provider.provider
     model_name = provider.default_model
+
+    # Cache check (DECISIONS #2): reuse a prior SUCCESS run's output_json for an
+    # identical key, recording a new audit row and skipping the provider call.
+    # Ahead of the RUNNING insert so a hit never leaves a stray RUNNING row.
+    cached = await _find_cached_run(
+        session, input_hash=input_hash, provider=provider_name, model=model_name
+    )
+    if cached is not None:
+        logger.debug(
+            "extraction cache hit: reusing run %s for input_hash=%s provider=%s model=%s",
+            cached.id,
+            input_hash,
+            provider_name,
+            model_name,
+        )
+        cached_run = ExtractionRun(
+            document_id=document_id,
+            source_version=source_version,
+            provider=provider_name,
+            model=model_name,
+            prompt_version=PROMPT_VERSION,
+            schema_version=SCHEMA_VERSION,
+            input_source_span_ids=span_ids,
+            input_hash=input_hash,
+            status=ExtractionRunStatus.SUCCESS,
+            output_json=cached.output_json,
+            completed_at=datetime.now(tz=UTC),
+        )
+        session.add(cached_run)
+        await session.flush()
+        return cached_run
 
     run = ExtractionRun(
         document_id=document_id,
