@@ -1,6 +1,6 @@
 # Epic 8 — PDF Ingestion: Text & SourceSpans
 
-**Status**: Blocked (depends on Epics 4, 6, 7)
+**Status**: Done
 
 ## Overview
 
@@ -89,11 +89,11 @@ Upload a small synthetic PDF; poll `GET /documents/{id}/status` until status mov
 
 ### Acceptance criteria
 
-- [ ] `progress.pages_total` and `progress.pages_processed` populated during/after extraction
-- [ ] Status accurately reflects extraction stage during the run
-- [ ] Integration test runs end-to-end from `POST /documents` to span rows in DB
-- [ ] Failure mid-extraction (simulated via a Fake that raises) marks document `failed` with the error message captured
-- [ ] No orphaned spans on failure (cleanup or leave-for-retry rule documented — for initial ingestion, leaving them is fine since `source_version=1` won't be reused for the same document if it failed; doc 2 source-span retry rule applies)
+- [x] `progress.pages_total` and `progress.pages_processed` populated during/after extraction
+- [x] Status accurately reflects extraction stage during the run
+- [x] Integration test runs end-to-end from `POST /documents` to span rows in DB
+- [x] Failure mid-extraction (simulated via a Fake that raises) marks document `failed` with the error message captured
+- [x] No orphaned spans on failure (cleanup or leave-for-retry rule documented — for initial ingestion, leaving them is fine since `source_version=1` won't be reused for the same document if it failed; doc 2 source-span retry rule applies)
 
 ### Validation
 
@@ -103,10 +103,10 @@ Upload a small synthetic PDF; poll `GET /documents/{id}/status` until status mov
 
 ## Epic-level acceptance criteria
 
-- [ ] Uploading a PDF triggers an arq job that extracts text and writes per-page SourceSpans
-- [ ] `source_version = 1` on initial ingestion; uniqueness constraint respected
-- [ ] Status accurately reflects progress through `extracting_text` and `creating_source_spans`
-- [ ] Failures transition the document to `failed` with a clear error
-- [ ] Langfuse session ID propagated for trace grouping (when enabled)
-- [ ] Integration test exercises upload → spans end-to-end
-- [ ] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked
+- [x] Uploading a PDF triggers an arq job that extracts text and writes per-page SourceSpans
+- [x] `source_version = 1` on initial ingestion; uniqueness constraint respected
+- [x] Status accurately reflects progress through `extracting_text` and `creating_source_spans`
+- [x] Failures transition the document to `failed` with a clear error
+- [x] Langfuse session ID propagated for trace grouping (when enabled)
+- [x] Integration test exercises upload → spans end-to-end
+- [x] Status in [`EPICS.md`](../EPICS.md) updated; Epic 9 unblocked
