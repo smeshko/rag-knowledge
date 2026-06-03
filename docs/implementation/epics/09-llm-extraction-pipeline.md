@@ -1,6 +1,6 @@
 # Epic 9 — LLM Extraction Pipeline
 
-**Status**: Blocked (depends on Epics 5, 8)
+**Status**: In progress
 
 ## Overview
 
@@ -48,10 +48,10 @@ This is the largest epic by surface area. It has four phases that should land se
 
 ### Acceptance criteria
 
-- [ ] Windows respect configured size and overlap
-- [ ] Format matches doc 4 exactly (so the prompt can rely on it)
-- [ ] `compute_input_hash` is deterministic across runs
-- [ ] Unit tests cover normal, edge, and overlap-0 cases
+- [x] Windows respect configured size and overlap
+- [x] Format matches doc 4 exactly (so the prompt can rely on it)
+- [x] `compute_input_hash` is deterministic across runs
+- [x] Unit tests cover normal, edge, and overlap-0 cases
 
 ### Validation
 
