@@ -13,6 +13,7 @@ import pytest
 from rag_recipes.ingestion.pipeline.windows import (
     Window,
     build_windows,
+    format_window_for_llm,
 )
 from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -97,3 +98,25 @@ def test_window_span_ids_and_page_range() -> None:
     window = Window(spans=spans)
     assert window.span_ids == ["span_002", "span_003", "span_004"]
     assert window.page_range == (2, 4)
+
+
+def test_format_window_for_llm_two_spans() -> None:
+    window = Window(
+        spans=(
+            _make_span(42, "text of span 42"),
+            _make_span(43, "text of span 43"),
+        )
+    )
+    expected = (
+        "[SOURCE_SPAN span_042 | PDF page 42]\n"
+        "text of span 42\n"
+        "\n"
+        "[SOURCE_SPAN span_043 | PDF page 43]\n"
+        "text of span 43"
+    )
+    assert format_window_for_llm(window) == expected
+
+
+def test_format_window_for_llm_single_span_has_no_trailing_separator() -> None:
+    window = Window(spans=(_make_span(7, "lone page"),))
+    assert format_window_for_llm(window) == "[SOURCE_SPAN span_007 | PDF page 7]\nlone page"

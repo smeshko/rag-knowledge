@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from rag_recipes.storage.models.source_span import SourceSpan
 
-__all__ = ["Window", "build_windows"]
+__all__ = ["Window", "build_windows", "format_window_for_llm"]
 
 
 @dataclass(frozen=True)
@@ -72,3 +72,21 @@ def build_windows(
             break
         start += step
     return windows
+
+
+def format_window_for_llm(window: Window) -> str:
+    """Render a window as the doc-4 ``[SOURCE_SPAN <id> | PDF page N]`` input text.
+
+    One block per span — ``f"[SOURCE_SPAN {span.id} | PDF page {page}]\\n{text}"``
+    where ``page`` is the span's ``locator["page_start"]`` — joined by a blank
+    line. The span ids are load-bearing: the LLM must echo them in its output.
+
+    This shape is part of the prompt contract. Any observable change to it must
+    bump ``prompt_version`` (which feeds ``compute_input_hash``), otherwise a
+    stale cached extraction could be reused against the new format.
+    """
+    blocks = [
+        f"[SOURCE_SPAN {span.id} | PDF page {span.locator['page_start']}]\n{span.text}"
+        for span in window.spans
+    ]
+    return "\n\n".join(blocks)
