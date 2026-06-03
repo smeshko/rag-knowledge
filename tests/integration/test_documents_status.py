@@ -295,6 +295,41 @@ async def test_status_needs_review_reports_final_counts_via_active_version(
 
 
 @pytest.mark.asyncio
+async def test_status_reprocess_in_flight_does_not_report_stale_spans(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """A reprocess-queued doc must not report its old run's spans as progress.
+
+    ``POST /reprocess`` moves a terminal doc back to ``queued`` while keeping
+    ``active_source_version`` set and leaving the old-version spans in place.
+    The new run's spans don't exist yet, so progress must be ``(0, None)`` — not
+    the surviving v1 counts. Regression for review round-1 #1: without the
+    reprocess-in-flight guard the route would count the stale v1 spans and
+    report ``pages_processed == pages_total`` for a doc that hasn't started.
+    Epic 11 owns the real in-flight ``current_source_version`` arithmetic.
+    """
+    document = await _seed_document(
+        db_session,
+        content_hash="hash-reprocess-in-flight",
+        status=DocumentStatus.QUEUED,
+        active_source_version=1,
+    )
+    # Old run's spans survive the reprocess (the route only updates Document).
+    await _seed_spans(db_session, document=document, source_version=1, pages=3)
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["active_source_version"] == 1
+    assert body["current_source_version"] == 1
+    assert body["terminal"] is False
+    # Stale v1 spans must NOT leak into progress for the not-yet-started run.
+    assert body["progress"]["pages_processed"] == 0
+    assert body["progress"]["pages_total"] is None
+
+
+@pytest.mark.asyncio
 async def test_status_unknown_id_returns_404_envelope(client: httpx.AsyncClient) -> None:
     async with client:
         response = await client.get("/api/v1/documents/doc_does_not_exist/status")

@@ -438,10 +438,20 @@ async def get_document_status(
     document = await _require_document(repo, document_id)
     is_doc_terminal = is_terminal(document.status)
     current_source_version = None if is_doc_terminal else 1
-    # Report final counts for terminal docs that have an active version (a
-    # ready doc at v1 shows its spans); failed docs with active=null
-    # legitimately get (0, None).
-    version_for_progress = current_source_version or document.active_source_version
+    if is_doc_terminal:
+        # Report final counts for terminal docs that have an active version (a
+        # ready doc at v1 shows its spans); failed docs with active=null
+        # legitimately get (0, None).
+        version_for_progress = document.active_source_version
+    elif document.active_source_version is not None:
+        # Reprocess in flight: the doc is non-terminal but already has an active
+        # version from a prior run, so the new run's spans don't exist yet.
+        # Suppress progress (the surviving old-version spans are NOT this run's
+        # work). Epic 11 will compute the real in-flight version here.
+        version_for_progress = None
+    else:
+        # Initial ingestion: in-flight version is 1.
+        version_for_progress = 1
     if version_for_progress is None:
         pages_processed, pages_total = 0, None
     else:
