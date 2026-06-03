@@ -14,9 +14,24 @@ to ``rejected`` here.
 from __future__ import annotations
 
 import importlib.resources
+import logging
+from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from rag_recipes.ingestion.pipeline.windows import (
+    Window,
+    compute_input_hash,
+    format_window_for_llm,
+)
+from rag_recipes.providers._observability import ProviderObservability, TraceContext
+from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.llm.base import LLMProvider
+from rag_recipes.providers.llm.types import StructuredOutputRequest
+from rag_recipes.storage.enums import ExtractionRunStatus
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 
 __all__ = [
     "PROMPT_VERSION",
@@ -31,7 +46,10 @@ __all__ = [
     "RecipeV1StructuredData",
     "StepConfidence",
     "build_recipe_v1_json_schema",
+    "run_extraction",
 ]
+
+logger = logging.getLogger(__name__)
 
 # LLM API contract versions — module constants, NOT ``Settings`` (DECISIONS #3).
 # They feed ``compute_input_hash`` and every ``ExtractionRun`` row, so they must
@@ -211,3 +229,109 @@ def build_recipe_v1_json_schema() -> dict[str, Any]:
     schema = RecipeExtractionOutput.model_json_schema(by_alias=True)
     _strictify(schema)
     return schema
+
+
+def _finalize(
+    run: ExtractionRun,
+    *,
+    status: ExtractionRunStatus,
+    output_json: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    """Write a terminal status + audit fields onto a ``RUNNING`` run.
+
+    ``output_json`` is whole-object-assigned (always dirty-tracked on plain
+    JSONB); never mutate it in place (a 9.3 concern).
+    """
+    run.status = status
+    run.output_json = output_json
+    run.error_message = error
+    run.completed_at = datetime.now(tz=UTC)
+
+
+async def run_extraction(
+    session: AsyncSession,
+    window: Window,
+    *,
+    source_version: int,
+    document_id: str,
+    provider: LLMProvider,
+    observability: ProviderObservability | None = None,
+) -> ExtractionRun:
+    """Run one LLM extraction call for ``window`` and record an ``ExtractionRun``.
+
+    Inserts a ``RUNNING`` row, calls the injected ``provider``, and resolves the
+    row to exactly one terminal status (DECISIONS #1):
+
+    - ``FAILED`` — the provider raised ``LLMTechnicalError`` (transport/system).
+      The ``FAILED`` row is recorded, then the error is re-raised so the job's
+      ``mark_failed`` path engages (DECISIONS #6).
+    - ``REJECTED`` — the provider returned ``output_json=None`` (parse / refusal /
+      truncation), OR the parsed object failed ``recipe.v1`` Pydantic validation.
+    - ``SUCCESS`` — a valid parsed ``recipe.v1`` object.
+
+    Only flushes; the caller owns the transaction (mirrors ``pdf_text``). The
+    ``provider``/``model`` labels come from the injected provider (DECISIONS #7).
+    """
+    input_text = format_window_for_llm(window)
+    input_hash = compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION)
+    span_ids = window.span_ids
+    provider_name = provider.provider
+    model_name = provider.default_model
+
+    run = ExtractionRun(
+        document_id=document_id,
+        source_version=source_version,
+        provider=provider_name,
+        model=model_name,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+        input_source_span_ids=span_ids,
+        input_hash=input_hash,
+        status=ExtractionRunStatus.RUNNING,
+        output_json=None,
+    )
+    session.add(run)
+    await session.flush()
+
+    request = StructuredOutputRequest(
+        provider=provider_name,
+        model=model_name,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+        input=_render_prompt(input_text),
+        json_schema=build_recipe_v1_json_schema(),
+    )
+    trace_context = TraceContext(
+        session_id=document_id,
+        input_hash=input_hash,
+        input_source_span_ids=span_ids,
+    )
+
+    try:
+        response = await provider.generate_structured_output(request, trace_context=trace_context)
+    except LLMTechnicalError as exc:
+        _finalize(run, status=ExtractionRunStatus.FAILED, error=str(exc))
+        await session.flush()
+        raise
+
+    if response.output_json is None:
+        _finalize(run, status=ExtractionRunStatus.REJECTED, error=response.parse_error)
+        await session.flush()
+        return run
+
+    try:
+        RecipeExtractionOutput.model_validate(response.output_json)
+    except ValidationError as exc:
+        _finalize(
+            run,
+            status=ExtractionRunStatus.REJECTED,
+            output_json=response.output_json,
+            error=str(exc),
+        )
+        await session.flush()
+        return run
+
+    _finalize(run, status=ExtractionRunStatus.SUCCESS, output_json=response.output_json)
+    await session.flush()
+    return run

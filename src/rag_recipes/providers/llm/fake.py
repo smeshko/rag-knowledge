@@ -32,16 +32,26 @@ __all__ = ["FakeLLMProvider"]
 
 
 class FakeLLMProvider(LLMProvider):
-    """LLM provider returning canned structured output keyed on a request hash."""
+    """LLM provider returning canned structured output keyed on a request hash.
+
+    Exposes ``provider`` (class attr) and ``default_model`` (instance attr) so it
+    satisfies the same ``provider.provider`` / ``provider.default_model`` contract
+    as ``OpenAILLMProvider`` — callers (e.g. the extraction layer) read those to
+    label the audit record and the cache key without a separate ``model`` arg.
+    """
+
+    provider = "fake"
 
     def __init__(
         self,
         responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse] | None = None,
         *,
+        default_model: str = "fake-model",
         fail_technically: bool = False,
         default_usage: TokenUsage | None = None,
         default_output: dict[str, Any] | StructuredOutputResponse | None = None,
     ) -> None:
+        self.default_model = default_model
         self._responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse] = (
             copy.deepcopy(responses_by_hash or {})
         )
