@@ -87,12 +87,12 @@ This is the largest epic by surface area. It has four phases that should land se
 
 ### Acceptance criteria
 
-- [ ] `recipe.v1` Pydantic model matches doc 4 exactly (field names, nullability, nesting)
-- [ ] ExtractionRun written for every LLM attempt with full metadata
-- [ ] `success`, `failed`, `rejected` statuses distinguished correctly (failed = transport/system; rejected = output doesn't validate)
-- [ ] Cache hit on identical `input_hash` + provider/model/prompt_version/schema_version reuses prior output
-- [ ] Langfuse session grouping works
-- [ ] Integration test with `FakeLLMProvider` covers all three statuses (success, failed, rejected)
+- [x] `recipe.v1` Pydantic model matches doc 4 exactly (field names, nullability, nesting)
+- [x] ExtractionRun written for every LLM attempt with full metadata
+- [x] `success`, `failed`, `rejected` statuses distinguished correctly (failed = transport/system; rejected = output doesn't validate)
+- [x] Cache hit on identical `input_hash` + provider/model/prompt_version/schema_version reuses prior output
+- [x] Langfuse session grouping works
+- [x] Integration test with `FakeLLMProvider` covers all three statuses (success, failed, rejected)
 
 ### Validation
 

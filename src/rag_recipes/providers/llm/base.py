@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import ClassVar
 
 from rag_recipes.providers._observability import TraceContext
 from rag_recipes.providers.llm.types import StructuredOutputRequest, StructuredOutputResponse
@@ -19,7 +20,17 @@ class LLMProvider(ABC):
     interface returns the response with ``output_json=None`` and ``parse_error``
     set when the output could not be parsed, always preserving ``raw_text`` for
     debugging.
+
+    Implementations expose ``provider`` (a stable identity label) and
+    ``default_model`` (the model used by default). Callers read these to label
+    the ``ExtractionRun`` audit row and the cache key without passing a separate
+    ``model`` argument.
     """
+
+    #: Stable provider identity label, e.g. ``"openai"`` / ``"fake"``.
+    provider: ClassVar[str]
+    #: The model the provider uses by default.
+    default_model: str
 
     @abstractmethod
     async def generate_structured_output(
