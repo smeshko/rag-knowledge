@@ -14,11 +14,24 @@ trailing sub-windows fully contained in their predecessor (DECISIONS #1).
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
+from typing import Any
 
 from rag_recipes.storage.models.source_span import SourceSpan
 
-__all__ = ["Window", "build_windows", "format_window_for_llm"]
+__all__ = ["Window", "build_windows", "compute_input_hash", "format_window_for_llm"]
+
+
+def _sha256_json(d: dict[str, Any]) -> str:
+    """SHA-256 of a dict serialised to canonical JSON (sorted keys, no whitespace).
+
+    Reimplements the canonical form used in ``pipeline/pdf_text._sha256_json``
+    locally — that symbol is module-private, so it is not imported across modules.
+    """
+    canonical = json.dumps(d, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -90,3 +103,26 @@ def format_window_for_llm(window: Window) -> str:
         for span in window.spans
     ]
     return "\n\n".join(blocks)
+
+
+def compute_input_hash(
+    window: Window,
+    prompt_version: str,
+    schema_version: str,
+) -> str:
+    """Deterministic SHA-256 hex used as the extraction cache / dedup key.
+
+    Hashes canonical JSON of
+    ``{"prompt_version": …, "schema_version": …, "spans": [{"id", "text_hash"}, …]}``.
+    Hashing ``(id, text_hash)`` pairs — not raw text or the formatted string —
+    keys the cache to immutable source-text identity while staying stable against
+    cosmetic format changes (DECISIONS #2). ``prompt_version`` is inside the hash,
+    so a meaningful format change (which must bump it) correctly invalidates the
+    cache.
+    """
+    payload = {
+        "prompt_version": prompt_version,
+        "schema_version": schema_version,
+        "spans": [{"id": span.id, "text_hash": span.text_hash} for span in window.spans],
+    }
+    return _sha256_json(payload)

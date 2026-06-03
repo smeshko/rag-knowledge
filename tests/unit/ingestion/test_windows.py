@@ -7,12 +7,14 @@ their ``id`` / ``text`` / ``text_hash`` / ``locator`` attributes are read.
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
 from rag_recipes.ingestion.pipeline.windows import (
     Window,
     build_windows,
+    compute_input_hash,
     format_window_for_llm,
 )
 from rag_recipes.storage.models.source_span import SourceSpan
@@ -120,3 +122,67 @@ def test_format_window_for_llm_two_spans() -> None:
 def test_format_window_for_llm_single_span_has_no_trailing_separator() -> None:
     window = Window(spans=(_make_span(7, "lone page"),))
     assert format_window_for_llm(window) == "[SOURCE_SPAN span_007 | PDF page 7]\nlone page"
+
+
+def test_compute_input_hash_is_deterministic() -> None:
+    window = Window(spans=(_make_span(1), _make_span(2)))
+    first = compute_input_hash(window, prompt_version="p1", schema_version="s1")
+    second = compute_input_hash(window, prompt_version="p1", schema_version="s1")
+    assert first == second
+
+
+def test_compute_input_hash_matches_canonical_json() -> None:
+    span = _make_span(1, "page one")
+    window = Window(spans=(span,))
+    expected_doc = {
+        "prompt_version": "p1",
+        "schema_version": "s1",
+        "spans": [{"id": span.id, "text_hash": span.text_hash}],
+    }
+    canonical = json.dumps(expected_doc, sort_keys=True, separators=(",", ":"))
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert compute_input_hash(window, prompt_version="p1", schema_version="s1") == expected
+
+
+def test_compute_input_hash_changes_with_prompt_version() -> None:
+    window = Window(spans=(_make_span(1), _make_span(2)))
+    base = compute_input_hash(window, prompt_version="p1", schema_version="s1")
+    assert compute_input_hash(window, prompt_version="p2", schema_version="s1") != base
+
+
+def test_compute_input_hash_changes_with_schema_version() -> None:
+    window = Window(spans=(_make_span(1), _make_span(2)))
+    base = compute_input_hash(window, prompt_version="p1", schema_version="s1")
+    assert compute_input_hash(window, prompt_version="p1", schema_version="s2") != base
+
+
+def test_compute_input_hash_changes_with_span_order() -> None:
+    s1, s2 = _make_span(1), _make_span(2)
+    base = compute_input_hash(Window(spans=(s1, s2)), prompt_version="p1", schema_version="s1")
+    reordered = compute_input_hash(
+        Window(spans=(s2, s1)), prompt_version="p1", schema_version="s1"
+    )
+    assert reordered != base
+
+
+def test_compute_input_hash_changes_with_text_hash() -> None:
+    base = compute_input_hash(
+        Window(spans=(_make_span(1, "original"),)),
+        prompt_version="p1",
+        schema_version="s1",
+    )
+    changed = compute_input_hash(
+        Window(spans=(_make_span(1, "different"),)),
+        prompt_version="p1",
+        schema_version="s1",
+    )
+    assert changed != base
+
+
+def test_compute_input_hash_changes_with_span_id() -> None:
+    span = _make_span(1, "page one")
+    other = _make_span(1, "page one")
+    object.__setattr__(other, "id", "span_999")
+    base = compute_input_hash(Window(spans=(span,)), prompt_version="p1", schema_version="s1")
+    changed = compute_input_hash(Window(spans=(other,)), prompt_version="p1", schema_version="s1")
+    assert changed != base
