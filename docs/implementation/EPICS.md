@@ -33,7 +33,7 @@ Architecture grounding:
 | 6 | [Document Management API](./epics/06-document-api.md) | 3 | Epics 2, 4 | Done |
 | 7 | [Async Job Runner](./epics/07-async-job-runner.md) | 2 | Epics 1, 2 | Done |
 | 8 | [PDF Ingestion — Text & SourceSpans](./epics/08-pdf-ingestion-spans.md) | 2 | Epics 4, 6, 7 | Done |
-| 9 | [LLM Extraction Pipeline](./epics/09-llm-extraction-pipeline.md) | 4 | Epics 5, 8 | Ready for dev |
+| 9 | [LLM Extraction Pipeline](./epics/09-llm-extraction-pipeline.md) | 4 | Epics 5, 8 | In progress |
 | 10 | [Chunking, Embedding, Indexing](./epics/10-chunking-embedding-indexing.md) | 3 | Epics 5, 9 | Blocked |
 | 11 | [Reprocessing Modes](./epics/11-reprocessing.md) | 2 | Epic 10 | Blocked |
 | 12 | [Retrieval Layer](./epics/12-retrieval.md) | 3 | Epic 10 | Blocked |
