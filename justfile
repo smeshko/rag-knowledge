@@ -70,6 +70,11 @@ migrate:
 migration MSG:
     uv run alembic revision --autogenerate -m "{{MSG}}"
 
+# Regenerate the self-contained HTML viewer for the epics + plans (stdlib only, no deps).
+# Output: docs/implementation/epics-viewer.html — open it directly in a browser.
+epics-viewer:
+    python3 scripts/build_epics_viewer.py
+
 # Stop the compose stack. Volumes are preserved.
 down:
     docker compose down

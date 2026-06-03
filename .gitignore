@@ -36,3 +36,4 @@ evals/reports/*
 # Agents
 .claude/
 .pi/
+/docs
