@@ -33,8 +33,12 @@ from rag_recipes.config import get_settings
 from rag_recipes.ingestion.jobs import process_document
 from rag_recipes.providers._observability import ProviderObservability
 from rag_recipes.providers.file_storage.local import LocalFileStorage
+from rag_recipes.providers.llm.fake import FakeLLMProvider
+from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
 from rag_recipes.storage.repositories.failures import FailuresRepository
@@ -44,6 +48,18 @@ from tests.integration.conftest import AUTH_HEADERS
 pytestmark = pytest.mark.asyncio
 
 _FIXTURE = Path("data/fixtures/pdfs/sample_recipe.pdf")
+
+# This pathway test exercises the status-endpoint shape, not extraction quality,
+# so the LLM stage rejects every window (no real OpenAI call) — the doc still
+# advances through the dedup stage to creating_chunks with zero knowledge items.
+_REJECT_RESPONSE = StructuredOutputResponse(
+    output_json=None,
+    parse_error="no recipe in fixture",
+    raw_text="",
+    usage=TokenUsage(input_tokens=0, output_tokens=0),
+    provider="fake",
+    model="fake-model",
+)
 
 
 class _LangfuseSessionRecorder:
@@ -81,12 +97,20 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
                 IngestionFailure.document_id == ids["document_id"]
             )
         )
+        # The extended pipeline writes knowledge_items + extraction_runs that FK to
+        # the document (no ON DELETE CASCADE); drop them before the document.
+        await session.execute(
+            delete(KnowledgeItem).where(KnowledgeItem.document_id == ids["document_id"])
+        )
+        await session.execute(
+            delete(ExtractionRun).where(ExtractionRun.document_id == ids["document_id"])
+        )
         await session.execute(delete(Document).where(Document.id == ids["document_id"]))
         await session.execute(delete(SourceAsset).where(SourceAsset.id == ids["asset_id"]))
         await session.commit()
 
 
-async def test_full_upload_to_creating_source_spans_pathway(
+async def test_full_upload_to_creating_chunks_pathway(
     test_engine: AsyncEngine,
     redis_arq_settings: RedisSettings,
     arq_queue_cleanup: str,
@@ -118,6 +142,8 @@ async def test_full_upload_to_creating_source_spans_pathway(
         ctx["observability"] = ProviderObservability(
             None, enabled=False, session_scope=recorder
         )
+        # Benign fake so the extraction stage makes no real OpenAI call.
+        ctx["llm_provider"] = FakeLLMProvider(default_output=_REJECT_RESPONSE)
 
     ids: dict[str, str] | None = None
     try:
@@ -165,9 +191,11 @@ async def test_full_upload_to_creating_source_spans_pathway(
             finally:
                 await worker.close()
 
-            # Step 4: poll status after the worker — creating_source_spans shape.
+            # Step 4: poll status after the worker — the pipeline now runs through
+            # extraction + dedup (zero items from the rejecting fake) to
+            # creating_chunks, still non-terminal.
             after = await _get_status(client, document_id)
-            assert after["status"] == "creating_source_spans"
+            assert after["status"] == "creating_chunks"
             assert after["current_source_version"] == 1
             assert after["active_source_version"] is None
             assert after["progress"]["pages_processed"] == 3
