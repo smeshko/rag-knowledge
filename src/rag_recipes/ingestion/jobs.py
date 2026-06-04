@@ -183,17 +183,20 @@ def _build_embedding_provider(
     )
 
 
-async def _load_ordered_spans(session: AsyncSession, document_id: str) -> list[SourceSpan]:
-    """Load a document's v1 SourceSpans ordered by page_start (build_windows' contract).
+async def _load_ordered_spans(
+    session: AsyncSession, document_id: str, source_version: int
+) -> list[SourceSpan]:
+    """Load a document's SourceSpans for ``source_version``, ordered by page_start.
 
-    ``page_start`` lives in the JSONB ``locator``; the ``->>`` accessor returns
-    text, cast to int so the ordering is numeric (page 10 after page 9, not before).
+    Ordering is ``build_windows``' contract. ``page_start`` lives in the JSONB
+    ``locator``; the ``->>`` accessor returns text, cast to int so the ordering is
+    numeric (page 10 after page 9, not before).
     """
     result = await session.execute(
         select(SourceSpan)
         .where(
             SourceSpan.document_id == document_id,
-            SourceSpan.source_version == 1,
+            SourceSpan.source_version == source_version,
         )
         .order_by(cast(SourceSpan.locator["page_start"].astext, Integer))
     )
@@ -210,6 +213,7 @@ async def _run_extraction_batches(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
     settings: Settings,
     provider: LLMProvider,
     observability: ProviderObservability | None,
@@ -227,7 +231,7 @@ async def _run_extraction_batches(
     run from a hung one.
     """
     async with session_factory() as session:
-        spans = await _load_ordered_spans(session, document_id)
+        spans = await _load_ordered_spans(session, document_id, source_version)
         # Resume skip set (DECISIONS #2): the input_hashes that already have a
         # committed ExtractionRun for this (document_id, source_version). Keyed on
         # the committed audit fact — what survived a prior batch commit — so a
@@ -239,7 +243,7 @@ async def _run_extraction_batches(
                 await session.execute(
                     select(ExtractionRun.input_hash).where(
                         ExtractionRun.document_id == document_id,
-                        ExtractionRun.source_version == 1,
+                        ExtractionRun.source_version == source_version,
                     )
                 )
             )
@@ -261,7 +265,7 @@ async def _run_extraction_batches(
                 run = await run_extraction(
                     session,
                     window,
-                    source_version=1,
+                    source_version=source_version,
                     document_id=document_id,
                     provider=provider,
                     observability=observability,
@@ -279,7 +283,7 @@ async def _run_extraction_batches(
                             extracted,
                             extraction_run_id=run.id,
                             document_id=document_id,
-                            source_version=1,
+                            source_version=source_version,
                             window=window,
                             staging=True,
                             candidate_score=compute_candidate_score(
@@ -310,11 +314,12 @@ async def _finalize_extraction(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
 ) -> int:
     """Promote staged candidates to final status in one atomic transaction.
 
     Runs entirely from persisted rows (DECISIONS #3): loads every ``EXTRACTING``
-    candidate for ``(document_id, source_version=1)``, rebuilds ``CandidateRef``s
+    candidate for ``(document_id, source_version)``, rebuilds ``CandidateRef``s
     from the stored ``candidate_score`` / ``normalized_title``, runs
     ``select_best``, deletes the losers, promotes each winner to ``READY`` /
     ``NEEDS_REVIEW`` re-derived from its stored ``structured_data["warnings"]``
@@ -329,7 +334,7 @@ async def _finalize_extraction(
                 await session.execute(
                     select(KnowledgeItem).where(
                         KnowledgeItem.document_id == document_id,
-                        KnowledgeItem.source_version == 1,
+                        KnowledgeItem.source_version == source_version,
                         KnowledgeItem.status == KnowledgeItemStatus.EXTRACTING,
                     )
                 )
@@ -391,7 +396,7 @@ async def _finalize_extraction(
                 await session.execute(
                     select(ExtractionRun.id).where(
                         ExtractionRun.document_id == document_id,
-                        ExtractionRun.source_version == 1,
+                        ExtractionRun.source_version == source_version,
                     )
                 )
             )
@@ -561,6 +566,7 @@ async def process_document(
     ctx: dict[str, Any],
     document_id: str,
     *,
+    source_version: int = 1,
     _session_id: str | None = None,
 ) -> int:
     """Run a Document's full ingestion lifecycle to its terminal status.
@@ -614,7 +620,7 @@ async def process_document(
                         spans_count = await extract_and_persist_spans(
                             session,
                             document_id=document_id,
-                            source_version=1,
+                            source_version=source_version,
                             extractor=extractor,
                             storage=storage,
                         )
@@ -658,12 +664,13 @@ async def process_document(
                 await _run_extraction_batches(
                     session_factory,
                     document_id=document_id,
+                    source_version=source_version,
                     settings=settings,
                     provider=provider,
                     observability=observability,
                 )
                 chosen_count = await _finalize_extraction(
-                    session_factory, document_id=document_id
+                    session_factory, document_id=document_id, source_version=source_version
                 )
 
             if entry in ("fresh", "resume", "embed"):
