@@ -30,7 +30,15 @@ TERMINAL_STATUSES: frozenset[DocumentStatus] = frozenset(
 
 VALID_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
     DocumentStatus.QUEUED: frozenset(
-        {DocumentStatus.EXTRACTING_TEXT, DocumentStatus.FAILED}
+        # EXTRACTING_ITEMS is the reuse-source-spans entry edge (Epic 11.1): a
+        # reuse reprocess re-runs item extraction over the document's existing
+        # SourceSpans, so it skips the PDF text stage (EXTRACTING_TEXT /
+        # CREATING_SOURCE_SPANS) and jumps straight to item extraction.
+        {
+            DocumentStatus.EXTRACTING_TEXT,
+            DocumentStatus.EXTRACTING_ITEMS,
+            DocumentStatus.FAILED,
+        }
     ),
     DocumentStatus.EXTRACTING_TEXT: frozenset(
         {DocumentStatus.CREATING_SOURCE_SPANS, DocumentStatus.FAILED}

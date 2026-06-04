@@ -54,6 +54,14 @@ def test_valid_transitions_covers_linear_progression(
     assert expected_next in VALID_TRANSITIONS[current]
 
 
+def test_queued_allows_reuse_source_spans_entry_edge() -> None:
+    # Epic 11.1: a reuse reprocess skips the PDF text stage and enters item
+    # extraction directly, so QUEUED -> EXTRACTING_ITEMS is a legal edge (in
+    # addition to the fresh-ingestion QUEUED -> EXTRACTING_TEXT edge).
+    assert DocumentStatus.EXTRACTING_ITEMS in VALID_TRANSITIONS[DocumentStatus.QUEUED]
+    assert DocumentStatus.EXTRACTING_TEXT in VALID_TRANSITIONS[DocumentStatus.QUEUED]
+
+
 @pytest.mark.parametrize(
     "current",
     [s for s in DocumentStatus if s not in TERMINAL_STATUSES],
