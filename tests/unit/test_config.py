@@ -271,3 +271,50 @@ def test_extraction_max_must_exceed_min(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("EXTRACTION_MAX_RECIPE_CHARS", "500")
     with pytest.raises(ValidationError, match="extraction_max_recipe_chars"):
         Settings(_env_file=None)
+
+
+def test_extraction_batch_and_llm_retry_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    for var in (
+        "EXTRACTION_COMMIT_BATCH_SIZE",
+        "LLM_MAX_RATE_LIMIT_RETRIES",
+        "LLM_REQUEST_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.extraction_commit_batch_size == 5
+    assert settings.llm_max_rate_limit_retries == 5
+    assert settings.llm_request_timeout_seconds == 60.0
+
+
+def test_extraction_commit_batch_size_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("EXTRACTION_COMMIT_BATCH_SIZE", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "extraction_commit_batch_size" in str(excinfo.value).lower()
+
+
+def test_llm_max_rate_limit_retries_allows_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 0 is a valid "no retries" configuration — TASK-006 treats it as
+    # "raise on the first 429", so the bound is ge=0, not ge=1.
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_MAX_RATE_LIMIT_RETRIES", "0")
+    settings = Settings(_env_file=None)
+    assert settings.llm_max_rate_limit_retries == 0
+
+
+def test_llm_max_rate_limit_retries_rejects_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_MAX_RATE_LIMIT_RETRIES", "-1")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "llm_max_rate_limit_retries" in str(excinfo.value).lower()
+
+
+def test_llm_request_timeout_seconds_rejects_below_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "0.5")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "llm_request_timeout_seconds" in str(excinfo.value).lower()
