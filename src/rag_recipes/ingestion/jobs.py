@@ -388,23 +388,34 @@ async def _finalize_extraction(
                 else KnowledgeItemStatus.READY
             )
 
+        # Whether this pass produced an *accepted* (READY) replacement. This — not
+        # merely "chosen is non-empty" — is the gate for both superseding the prior
+        # set and (re)building chunks (review #2). A pass whose only winners are
+        # NEEDS_REVIEW, or a zero-winner pass, must NOT retire the prior active
+        # version: the epic's rule is "supersede only after the new run reaches
+        # ready" / "a needs_review/failed re-extraction must not auto-supersede"
+        # (DECISIONS #5).
+        has_ready_winner = any(
+            items_by_id[ref.item_id].status is KnowledgeItemStatus.READY
+            for ref in chosen
+        )
+
         # Supersede hook (DECISIONS #5): retire everything the document had before
         # this pass, keeping ONLY the runs whose items survived *this* pass's dedup
-        # (the `chosen` set). On a fresh first extraction there is nothing older, so
-        # nothing matches (no-op). On a reuse reprocess at the SAME source_version
-        # (Epic 11.1) the prior pass's runs are NOT in the keep-set, so its items
-        # flip to SUPERSEDED while this pass's winners are spared.
+        # (the `chosen` set — both its ready and needs_review winners). On a fresh
+        # first extraction there is nothing older, so nothing matches (no-op). On a
+        # reuse reprocess at the SAME source_version (Epic 11.1) the prior pass's
+        # runs are NOT in the keep-set, so its items flip to SUPERSEDED while this
+        # pass's winners are spared. Scoping the keep-set to `chosen` (not "every run
+        # at this version") is what makes same-version reuse correct.
         #
-        # Scoping the keep-set to `chosen` (not "every run at this version") is what
-        # makes same-version reuse correct: "every run at (document_id, version)"
-        # would include the prior pass's runs and wrongly spare its items.
-        #
-        # Gate on a non-empty accepted set: a zero-winner pass (provider rejected /
-        # no-itemed every window) must NOT supersede — an empty keep-set would
-        # retire every prior READY/NEEDS_REVIEW item with no replacement, leaving the
-        # document with no active items. Skip the call entirely so the prior active
-        # set survives until a pass actually produces an accepted replacement.
-        if chosen:
+        # Gate on an accepted READY replacement: a pass with no ready winner (every
+        # window rejected/no-item, OR only low-confidence needs_review winners) must
+        # NOT supersede — that would retire the prior live ready set with nothing
+        # searchable to replace it, making the document's content vanish. Skip the
+        # call so the prior active set survives until a pass actually produces a
+        # ready replacement.
+        if has_ready_winner:
             keep_run_ids = {ref.extraction_run_id for ref in chosen}
             await DocumentRepository(session).supersede_prior_items(
                 document_id, keep_extraction_run_ids=keep_run_ids
@@ -423,9 +434,20 @@ async def _finalize_extraction(
         # its `category` is read without a second query. The chunk INSERTs do not
         # collide with the discarded-candidate DELETE above: that DELETE already
         # executed (removing the losers) before any chunk is built for a winner.
-        chunk_count = await persist_chunks_for_ready_items(
-            session, document_id=document_id, category=doc.category
-        )
+        #
+        # Build chunks only when this pass produced a ready replacement. Without the
+        # gate a zero-/needs_review-winner reuse (which preserves the prior ready
+        # set above) would re-enter persist_chunks_for_ready_items and append a
+        # SECOND set of chunks for the already-chunked prior items (review #2). When
+        # there is no ready winner the prior items keep their existing chunks
+        # untouched; on a fresh run with no ready winner there were no chunks to
+        # build anyway, so the gate is a no-op there.
+        if has_ready_winner:
+            chunk_count = await persist_chunks_for_ready_items(
+                session, document_id=document_id, category=doc.category
+            )
+        else:
+            chunk_count = 0
         # Advance the stuck-job heartbeat: the post-extraction stages
         # (chunking/embedding/indexing) are no longer sweep-exempt, so each must
         # report progress or a long-but-healthy run would be reaped on the stale

@@ -440,6 +440,12 @@ async def test_reuse_zero_winner_does_not_supersede_prior(
                 )
             )
             assert old_item_id is not None
+            chunks_before = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunks_before == 5
 
         await _requeue(session_factory, document_id)
 
@@ -473,21 +479,30 @@ async def test_reuse_zero_winner_does_not_supersede_prior(
                 )
             )
             assert superseded == 0
+            # No chunks were re-built for the preserved prior items (review #2):
+            # the count is unchanged, not doubled.
+            chunks_after = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunks_after == chunks_before
     finally:
         await _cleanup(session_factory, document_id, asset_id)
 
 
-async def test_reuse_needs_review_winner_does_not_finalize_ready_off_stale_chunks(
+async def test_reuse_needs_review_only_winner_preserves_prior_ready_set(
     test_engine: AsyncEngine,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reuse whose only winner is NEEDS_REVIEW must not finalize READY (review #1).
+    """A reuse whose only winner is NEEDS_REVIEW must not retire the prior ready set.
 
-    The prior pass's chunks are retained (parented to the now-superseded items),
-    but they must not make the document look searchable: the terminal status and
-    the embedding stage count/select only chunks of currently-READY items, so a
-    reuse with no READY winner ends NEEDS_REVIEW with nothing live."""
+    The epic's invariant (DECISIONS #5; review #2): supersede only on an accepted
+    READY replacement — a needs_review re-extraction must not auto-supersede. So a
+    low-confidence reuse of a READY document keeps the prior ready item live (the
+    document stays READY off its existing chunks), records the new needs_review
+    item alongside, and does not rebuild/duplicate the prior chunks."""
     monkeypatch.setattr(
         "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
     )
@@ -508,12 +523,17 @@ async def test_reuse_needs_review_winner_does_not_finalize_ready_off_stale_chunk
                 )
             )
             assert old_item_id is not None
+            chunks_before = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunks_before == 5
 
         await _requeue(session_factory, document_id)
 
         # Reuse leg: a winner with low overall confidence (< 0.5 threshold) carries
-        # a soft-validation warning, so finalize promotes it to NEEDS_REVIEW — no
-        # new chunks are written.
+        # a soft-validation warning, so finalize promotes it to NEEDS_REVIEW.
         _bump_prompt_version(monkeypatch, _REUSE_PROMPT_VERSION)
         reuse_provider = FakeLLMProvider(
             responses_by_hash={
@@ -536,32 +556,33 @@ async def test_reuse_needs_review_winner_does_not_finalize_ready_off_stale_chunk
         async with session_factory() as session:
             doc = await session.get(Document, document_id)
             assert doc is not None
-            # The crux: stale superseded chunks must NOT finalize the doc READY.
-            assert doc.status is DocumentStatus.NEEDS_REVIEW
-            # Prior item superseded; new winner is needs_review.
+            # The prior ready content stays live — no ready replacement was produced.
+            assert doc.status is DocumentStatus.READY
             old_item = await session.get(KnowledgeItem, old_item_id)
             assert old_item is not None
-            assert old_item.status is KnowledgeItemStatus.SUPERSEDED
-            ready_count = await session.scalar(
-                select(func.count())
-                .select_from(KnowledgeItem)
-                .where(
-                    KnowledgeItem.document_id == document_id,
-                    KnowledgeItem.status == KnowledgeItemStatus.READY,
+            assert old_item.status is KnowledgeItemStatus.READY  # not superseded
+            # The new low-confidence item is recorded as needs_review alongside.
+            needs_review = list(
+                (
+                    await session.execute(
+                        select(KnowledgeItem).where(
+                            KnowledgeItem.document_id == document_id,
+                            KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
-            assert ready_count == 0
-            # No chunk of a currently-READY item exists, so nothing is live/embedded.
-            live_chunks = await session.scalar(
+            assert len(needs_review) == 1
+            assert needs_review[0].normalized_title == "carrot soup"
+            # The prior items were not re-chunked — count is unchanged, not doubled.
+            chunks_after = await session.scalar(
                 select(func.count())
                 .select_from(Chunk)
-                .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
-                .where(
-                    Chunk.document_id == document_id,
-                    KnowledgeItem.status == KnowledgeItemStatus.READY,
-                )
+                .where(Chunk.document_id == document_id)
             )
-            assert live_chunks == 0
+            assert chunks_after == chunks_before
     finally:
         await _cleanup(session_factory, document_id, asset_id)
 
