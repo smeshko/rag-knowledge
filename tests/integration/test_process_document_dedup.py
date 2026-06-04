@@ -264,6 +264,90 @@ async def test_overlapping_windows_resolve_to_one_knowledge_item(
         await _cleanup(session_factory, document_id, asset_id)
 
 
+async def test_chunks_committed_atomically_with_creating_chunks_and_exactly_once(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A document in ``creating_chunks`` always has its chunks, created once.
+
+    Phase 10.1 builds chunks in the same transaction that lands the document in
+    ``creating_chunks`` (review round-1 #1), so the status flip and the chunk rows
+    commit atomically — there is no committed ``creating_chunks``-without-chunks
+    window for a crash to expose. This drives the real pipeline to completion,
+    asserts the ready item's five canonical chunks are present, then re-delivers
+    the same job: ``_resume_or_fresh`` no-ops a terminal-for-now ``creating_chunks``
+    document, so the chunks stay at exactly five (never duplicated, never lost).
+    """
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans = _build_spans(document_id)
+        async with session_factory() as session:
+            session.add_all(spans)
+            await session.commit()
+
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+        provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low): _recipe_output(
+                    cited_span_id="span_p3", overall=0.6
+                ),
+                _request_hash_for(window_high): _recipe_output(
+                    cited_span_id="span_p3", overall=0.9
+                ),
+            }
+        )
+
+        result = await process_document(
+            _ctx(session_factory, provider, tmp_path), document_id
+        )
+        assert result == 1
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.CREATING_CHUNKS
+            ready_item_id = await session.scalar(
+                select(KnowledgeItem.id).where(
+                    KnowledgeItem.document_id == document_id,
+                    KnowledgeItem.status == KnowledgeItemStatus.READY,
+                )
+            )
+            chunks = list(
+                (
+                    await session.execute(
+                        select(Chunk).where(Chunk.document_id == document_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            # Atomic with the status flip: the ready item's five canonical chunks.
+            assert len(chunks) == 5
+            assert all(c.parent_id == ready_item_id for c in chunks)
+
+        # Duplicate delivery of an already-finished document: a no-op (skip), so
+        # chunks are neither re-created nor dropped — created exactly once.
+        redelivered = await process_document(
+            _ctx(session_factory, provider, tmp_path), document_id
+        )
+        assert redelivered == 0
+        async with session_factory() as session:
+            chunk_count = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunk_count == 5
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
 async def test_staging_candidates_not_visible_as_final_before_finalize(
     test_engine: AsyncEngine,
     tmp_path: Path,

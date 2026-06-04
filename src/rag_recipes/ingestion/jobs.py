@@ -377,38 +377,24 @@ async def _finalize_extraction(
         )
 
         await transition_to(session, document_id, DocumentStatus.VALIDATING_ITEMS)
-        await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
+        doc = await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
+        # Phase 10.1: build + persist the chunks for the surviving ready items in
+        # the SAME transaction that lands the document in CREATING_CHUNKS, so the
+        # status flip and the chunks commit atomically. This makes the stage
+        # crash-safe: a failure before commit rolls finalize back to EXTRACTING_ITEMS
+        # (the resumable entry point), and a committed CREATING_CHUNKS document
+        # always has its chunks — never the partial state a separate post-finalize
+        # transaction would leave. The onward CREATING_CHUNKS -> EMBEDDING_CHUNKS
+        # transition is Phase 10.2. `doc` is the row transition_to just locked, so
+        # its `category` is read without a second query. The chunk INSERTs do not
+        # collide with the discarded-candidate DELETE above: that DELETE already
+        # executed (removing the losers) before any chunk is built for a winner.
+        chunk_count = await persist_chunks_for_ready_items(
+            session, document_id=document_id, category=doc.category
+        )
+        logger.info("created %d chunks for %s", chunk_count, document_id)
         await session.commit()
         return len(chosen)
-
-
-async def _create_chunks(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    document_id: str,
-) -> int:
-    """Build + persist chunks for the document's ready items (Phase 10.1).
-
-    Runs as its own transaction after ``_finalize_extraction`` has landed the
-    document in ``CREATING_CHUNKS``: loads the ``Document`` for its ``category``,
-    persists one to five chunks per surviving ``READY`` ``KnowledgeItem``, and
-    commits — leaving the document in ``CREATING_CHUNKS`` (the onward
-    ``EMBEDDING_CHUNKS`` transition is Phase 10.2). Kept a **separate**
-    transaction from finalize on purpose: finalize's bulk discarded-candidate
-    ``DELETE`` and a dependent chunk ``INSERT`` cannot be ordered against each
-    other in one unit-of-work flush, so chunking reads the committed ready rows
-    from a clean session instead. Returns the number of chunks written.
-    """
-    async with session_factory() as session:
-        document = await session.get(Document, document_id)
-        if document is None:
-            raise LookupError(f"Document not found: {document_id}")
-        chunk_count = await persist_chunks_for_ready_items(
-            session, document_id=document_id, category=document.category
-        )
-        await session.commit()
-    logger.info("created %d chunks for %s", chunk_count, document_id)
-    return chunk_count
 
 
 async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
@@ -528,15 +514,7 @@ async def process_document(
                 provider=provider,
                 observability=observability,
             )
-            chosen_count = await _finalize_extraction(
-                session_factory, document_id=document_id
-            )
-            # Phase 10.1: chunk the surviving ready items in their own transaction.
-            # Finalize already landed the document in CREATING_CHUNKS, so this stage
-            # builds + persists chunks and leaves it there (the onward
-            # EMBEDDING_CHUNKS transition is Phase 10.2).
-            await _create_chunks(session_factory, document_id=document_id)
-            return chosen_count
+            return await _finalize_extraction(session_factory, document_id=document_id)
         except (
             EmptyPdfError,
             PdfExtractionError,
