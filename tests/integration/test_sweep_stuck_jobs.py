@@ -255,6 +255,85 @@ async def test_sweep_exempts_creating_source_spans_handoff_state(
     assert failures == []
 
 
+async def test_sweep_exempts_creating_chunks_handoff_state(
+    db_session: AsyncSession,
+) -> None:
+    # Phase 10.1 lands a successful document at CREATING_CHUNKS with its chunks
+    # committed atomically, then stops (the embedding consumer arrives in 10.2).
+    # Aged well past the timeout it must NOT be swept to FAILED — a chunked
+    # document is a success, not a stuck job (review round-2 #1).
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-handoff-chunks",
+        status=DocumentStatus.CREATING_CHUNKS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 0
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.CREATING_CHUNKS
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert failures == []
+
+
+async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Race (review round-3 #1): the stale SELECT snapshots a document as
+    # EXTRACTING_ITEMS, but the worker commits the atomic finalize into
+    # CREATING_CHUNKS before the sweep takes the row lock. CREATING_CHUNKS ->
+    # FAILED is a legal transition, so without a re-check under the lock the sweep
+    # would fail a successfully chunked document. Simulate the advance by hooking
+    # the sweep's first locking ``get`` to flip the row just before it reads.
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-race-advance",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+
+    real_get = db_session.get
+    triggered = {"done": False}
+
+    async def racing_get(entity: Any, ident: Any, **kwargs: Any) -> Any:
+        if not triggered["done"] and ident == document_id:
+            triggered["done"] = True
+            # Raw UPDATE (no onupdate bump) so the row stays stale-dated; only its
+            # status advances, isolating the exempt-status guard from the heartbeat.
+            await db_session.execute(
+                text("UPDATE documents SET status = 'creating_chunks' WHERE id = :id"),
+                {"id": document_id},
+            )
+        return await real_get(entity, ident, **kwargs)
+
+    monkeypatch.setattr(db_session, "get", racing_get)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert triggered["done"]  # the race was actually injected
+    assert count == 0
+    db_session.expire_all()
+    doc = await real_get(Document, document_id)
+    assert doc is not None
+    assert doc.status == DocumentStatus.CREATING_CHUNKS
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert failures == []
+
+
 async def test_sweep_skips_extracting_items_with_fresh_heartbeat(
     db_session: AsyncSession,
 ) -> None:

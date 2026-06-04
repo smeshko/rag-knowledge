@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from rag_recipes.config import Settings, get_settings
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
+from rag_recipes.ingestion.pipeline.chunking import persist_chunks_for_ready_items
 from rag_recipes.ingestion.pipeline.dedup import (
     CandidateRef,
     compute_candidate_score,
@@ -376,7 +377,22 @@ async def _finalize_extraction(
         )
 
         await transition_to(session, document_id, DocumentStatus.VALIDATING_ITEMS)
-        await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
+        doc = await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
+        # Phase 10.1: build + persist the chunks for the surviving ready items in
+        # the SAME transaction that lands the document in CREATING_CHUNKS, so the
+        # status flip and the chunks commit atomically. This makes the stage
+        # crash-safe: a failure before commit rolls finalize back to EXTRACTING_ITEMS
+        # (the resumable entry point), and a committed CREATING_CHUNKS document
+        # always has its chunks — never the partial state a separate post-finalize
+        # transaction would leave. The onward CREATING_CHUNKS -> EMBEDDING_CHUNKS
+        # transition is Phase 10.2. `doc` is the row transition_to just locked, so
+        # its `category` is read without a second query. The chunk INSERTs do not
+        # collide with the discarded-candidate DELETE above: that DELETE already
+        # executed (removing the losers) before any chunk is built for a winner.
+        chunk_count = await persist_chunks_for_ready_items(
+            session, document_id=document_id, category=doc.category
+        )
+        logger.info("created %d chunks for %s", chunk_count, document_id)
         await session.commit()
         return len(chosen)
 

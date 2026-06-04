@@ -30,18 +30,24 @@ from rag_recipes.storage.models.document import Document
 logger = logging.getLogger(__name__)
 
 
-# Phase 8.1 deliberately rests a successfully-extracted document at
-# CREATING_SOURCE_SPANS: extraction is done and spans are persisted, but there
-# is no consumer to advance it until Epic 9's process_extraction_run lands. The
-# sweep treats every non-terminal status as "stuck", so without this exemption
-# a *successful* extraction would be marked failed once it ages past the
-# timeout. Exempt the handoff state until Epic 9 owns it.
+# The sweep treats every non-terminal status as "stuck", so a status that a
+# successful document *rests* at — done for now, but with no consumer to advance
+# it until a later phase lands — must be exempted, or a successful document would
+# be marked failed once it ages past the timeout.
 #
-# REMOVE this exemption when process_extraction_run exists — at that point a
-# document wedged in CREATING_SOURCE_SPANS (spans written, item-extraction
-# stalled) is genuinely stuck and should be swept again.
+# - CREATING_SOURCE_SPANS (Phase 8.1): extraction done, spans persisted, awaiting
+#   Epic 9's process_extraction_run. (Epic 9 has since landed and advances past
+#   it, so this is now only reached transiently; kept until the handoff is retired.)
+# - CREATING_CHUNKS (Phase 10.1): the finalize transaction lands the document here
+#   *with* its chunks (atomic — see jobs._finalize_extraction) and intentionally
+#   stops; the embedding stage that consumes it arrives in Phase 10.2. Because
+#   chunk creation is atomic, any document at CREATING_CHUNKS is a *success*, never
+#   a partial crash, so exempting it never masks a genuinely stuck job.
+#
+# REMOVE each entry when its downstream consumer exists — at that point a document
+# wedged in that status is genuinely stuck and should be swept again.
 _SWEEP_EXEMPT_STATUSES: frozenset[DocumentStatus] = frozenset(
-    {DocumentStatus.CREATING_SOURCE_SPANS}
+    {DocumentStatus.CREATING_SOURCE_SPANS, DocumentStatus.CREATING_CHUNKS}
 )
 
 
@@ -73,18 +79,36 @@ async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
                 < threshold
             )
         )
-        stuck: list[tuple[str, DocumentStatus]] = list(result.all())
+        stuck: list[str] = [doc_id for doc_id, _ in result.all()]
 
-        for doc_id, last_status in stuck:
+        for doc_id in stuck:
             try:
                 async with session.begin_nested():
+                    # The SELECT snapshot is stale. Between it and this row lock the
+                    # worker can advance the document — the atomic finalize commits
+                    # straight into CREATING_CHUNKS — or refresh its heartbeat. Re-read
+                    # the now-locked row and skip if it has become terminal, reached a
+                    # sweep-exempt resting state, or progressed past the threshold.
+                    # Without this, mark_failed only checks the transition is *legal*,
+                    # and EXTRACTING_ITEMS -> CREATING_CHUNKS -> FAILED is legal, so a
+                    # successfully chunked document could still be failed (review #3).
+                    doc = await session.get(Document, doc_id, with_for_update=True)
+                    if doc is None:
+                        continue
+                    last_progress = doc.last_progress_at or doc.updated_at
+                    if (
+                        doc.status in TERMINAL_STATUSES
+                        or doc.status in _SWEEP_EXEMPT_STATUSES
+                        or last_progress >= threshold
+                    ):
+                        continue
                     await mark_failed(
                         session,
                         doc_id,
                         reason="stuck_job_timeout",
                         metadata_json={
                             "timeout_minutes": timeout_minutes,
-                            "last_seen_status": last_status.value,
+                            "last_seen_status": doc.status.value,
                         },
                     )
                 count += 1

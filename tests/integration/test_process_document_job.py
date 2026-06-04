@@ -30,6 +30,7 @@ from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from rag_recipes.storage.enums import DocumentStatus
+from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
@@ -147,7 +148,11 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
             )
         )
         # The extended pipeline writes knowledge_items + extraction_runs that FK to
-        # the document (no ON DELETE CASCADE); drop them before the document.
+        # the document (no ON DELETE CASCADE); drop them before the document. Chunks
+        # FK to knowledge_items (Phase 10.1), so drop those first of all.
+        await session.execute(
+            delete(Chunk).where(Chunk.document_id == ids["document_id"])
+        )
         await session.execute(
             delete(KnowledgeItem).where(KnowledgeItem.document_id == ids["document_id"])
         )
