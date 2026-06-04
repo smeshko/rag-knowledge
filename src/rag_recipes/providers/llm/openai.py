@@ -79,8 +79,9 @@ def _backoff_delay(
     cap: float = _RETRY_MAX_DELAY_SECONDS,
 ) -> float:
     """Capped exponential backoff with full jitter: ``min(base*2**attempt, cap) + U(0, base)``."""
-    capped = min(base * (2**attempt), cap)
-    return capped + random.uniform(0.0, base)
+    capped: float = min(base * (2**attempt), cap)
+    jitter: float = random.uniform(0.0, base)
+    return capped + jitter
 
 
 class OpenAILLMProvider(LLMProvider):
