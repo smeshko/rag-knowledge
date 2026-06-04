@@ -41,6 +41,10 @@ class KnowledgeItemStatus(StrEnum):
     READY = "ready"
     NEEDS_REVIEW = "needs_review"
     SUPERSEDED = "superseded"
+    # Phase 9.5: staging status for candidates committed mid-extraction. Keeps
+    # in-flight items invisible to readers querying ready/needs_review until
+    # finalize promotes the winners in one atomic transaction.
+    EXTRACTING = "extracting"
 
 
 class ChunkType(StrEnum):

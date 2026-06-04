@@ -74,7 +74,9 @@ def test_knowledge_item_status_members() -> None:
         "ready",
         "needs_review",
         "superseded",
+        "extracting",
     }
+    assert KnowledgeItemStatus.EXTRACTING.value == "extracting"
 
 
 def test_chunk_type_members() -> None:

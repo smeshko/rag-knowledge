@@ -13,8 +13,10 @@ no post-parse JSON-Schema validation (``recipe.v1`` validation is Epic 9).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import random
 import re
 from typing import Any
 
@@ -39,6 +41,47 @@ __all__ = ["OpenAILLMProvider"]
 
 _DISALLOWED_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 _TRUNCATING_FINISH_REASONS = frozenset({"length", "content_filter"})
+
+# Phase 9.5 rate-limit retry tuning. base/cap bound the exponential backoff;
+# only an explicit transient ``rate_limit_exceeded`` 429 is retried.
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 30.0
+_RETRYABLE_RATE_LIMIT_CODE = "rate_limit_exceeded"
+
+
+def _is_retryable_rate_limit(exc: openai.RateLimitError) -> bool:
+    """True only for an explicit transient ``rate_limit_exceeded`` 429.
+
+    ``insufficient_quota`` — and any absent or unknown error code — is treated as
+    non-retryable: fail fast rather than loop against a quota wall or an
+    unclassifiable error (RESEARCH Uncertainty: default to fail-fast).
+    """
+    return getattr(exc, "code", None) == _RETRYABLE_RATE_LIMIT_CODE
+
+
+def _rate_limit_retry_after_seconds(exc: openai.RateLimitError) -> float | None:
+    """Parse a non-negative ``Retry-After`` (seconds) from the 429 response, else None."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        seconds = float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _backoff_delay(
+    attempt: int,
+    *,
+    base: float = _RETRY_BASE_DELAY_SECONDS,
+    cap: float = _RETRY_MAX_DELAY_SECONDS,
+) -> float:
+    """Capped exponential backoff with full jitter: ``min(base*2**attempt, cap) + U(0, base)``."""
+    capped: float = min(base * (2**attempt), cap)
+    jitter: float = random.uniform(0.0, base)
+    return capped + jitter
 
 
 class OpenAILLMProvider(LLMProvider):
@@ -67,10 +110,17 @@ class OpenAILLMProvider(LLMProvider):
         default_model: str,
         client: AsyncOpenAI | None = None,
         observability: ProviderObservability | None = None,
+        max_rate_limit_retries: int = 5,
+        request_timeout: float = 60.0,
     ) -> None:
         self._client = client or AsyncOpenAI(api_key=api_key, max_retries=0)
         self.default_model = default_model
         self._obs = observability or ProviderObservability(None, enabled=False)
+        # Phase 9.5: explicit retry/timeout, kept separate from the SDK (pinned at
+        # max_retries=0) so retries stay inside the one observability span and a
+        # post-generation timeout never triggers an unrecorded duplicate call.
+        self._max_rate_limit_retries = max_rate_limit_retries
+        self._request_timeout = request_timeout
 
     async def generate_structured_output(
         self,
@@ -103,14 +153,38 @@ class OpenAILLMProvider(LLMProvider):
             ]
             # A technical failure raises inside the ``with`` so the observability
             # wrapper records an ERROR observation before the exception propagates.
-            try:
-                completion = await self._client.chat.completions.create(
-                    model=request.model,
-                    messages=messages,
-                    response_format=response_format,
-                )
-            except openai.APIError as exc:
-                raise LLMTechnicalError(str(exc)) from exc
+            # The retry loop stays inside this one span: a transient
+            # rate_limit_exceeded 429 is retried (Retry-After preferred, else
+            # capped exponential backoff with jitter) up to
+            # ``self._max_rate_limit_retries``; insufficient_quota / unknown codes
+            # fail fast. The SDK at max_retries=0 means one billable call per
+            # attempt, all recorded under this single trace_generation.
+            attempt = 0
+            while True:
+                try:
+                    completion = await self._client.chat.completions.create(
+                        model=request.model,
+                        messages=messages,
+                        response_format=response_format,
+                        timeout=self._request_timeout,
+                    )
+                    break
+                except openai.RateLimitError as exc:
+                    if (
+                        not _is_retryable_rate_limit(exc)
+                        or attempt >= self._max_rate_limit_retries
+                    ):
+                        raise LLMTechnicalError(str(exc)) from exc
+                    retry_after = _rate_limit_retry_after_seconds(exc)
+                    delay = (
+                        retry_after
+                        if retry_after is not None
+                        else _backoff_delay(attempt)
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                except openai.APIError as exc:
+                    raise LLMTechnicalError(str(exc)) from exc
 
             choice = completion.choices[0]
             message = choice.message

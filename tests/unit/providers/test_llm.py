@@ -27,7 +27,7 @@ from openai import (
 from rag_recipes.providers._observability import ProviderObservability, TraceContext
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.fake import FakeLLMProvider
-from rag_recipes.providers.llm.openai import OpenAILLMProvider
+from rag_recipes.providers.llm.openai import OpenAILLMProvider, _backoff_delay
 from rag_recipes.providers.llm.types import StructuredOutputRequest
 from tests.contracts.llm import LLMContract
 
@@ -317,6 +317,178 @@ async def test_technical_errors_wrapped(error: Exception) -> None:
     with pytest.raises(LLMTechnicalError) as exc_info:
         await provider.generate_structured_output(_OPENAI_REQUEST)
     assert exc_info.value.__cause__ is error
+
+
+# --- rate-limit retry / backoff / timeout (Phase 9.5) -----------------------
+
+
+class _SequenceCompletions:
+    """``chat.completions`` stub that replays a scripted list of outcomes.
+
+    Each action is either an exception to raise or a ``_FakeCompletion`` to
+    return, popped in order on successive ``create`` calls.
+    """
+
+    def __init__(self, actions: list[Any]) -> None:
+        self._actions = list(actions)
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeCompletion:
+        self.calls.append(kwargs)
+        action = self._actions.pop(0)
+        if isinstance(action, Exception):
+            raise action
+        return action
+
+
+class _SequenceClient:
+    def __init__(self, actions: list[Any]) -> None:
+        self.completions = _SequenceCompletions(actions)
+        self.chat = _FakeChat(self.completions)
+
+
+def _rate_limit_error(code: str | None, *, retry_after: str | None = None) -> RateLimitError:
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(429, headers=headers, request=_REQUEST_OBJ)
+    # body must be a dict for the SDK to populate ``.code`` from it.
+    return RateLimitError("rate limited", response=response, body={"code": code})
+
+
+@pytest.fixture
+def _recorded_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    delays: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(
+        "rag_recipes.providers.llm.openai.asyncio.sleep", _fake_sleep
+    )
+    return delays
+
+
+async def test_rate_limit_retried_then_succeeds_honors_retry_after(
+    _recorded_sleep: list[float],
+) -> None:
+    client = _SequenceClient(
+        [
+            _rate_limit_error("rate_limit_exceeded", retry_after="2"),
+            _completion(content='{"ok": true}'),
+        ]
+    )
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        client=client,
+        max_rate_limit_retries=5,
+    )
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json == {"ok": True}
+    assert len(client.completions.calls) == 2
+    # Retry-After header is preferred over computed backoff.
+    assert _recorded_sleep == [2.0]
+
+
+async def test_rate_limit_exhausts_retries_raises(_recorded_sleep: list[float]) -> None:
+    err = _rate_limit_error("rate_limit_exceeded")
+    client = _SequenceClient([err, err, err])
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        client=client,
+        max_rate_limit_retries=2,
+    )
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # 1 initial attempt + 2 retries = 3 calls, 2 sleeps.
+    assert len(client.completions.calls) == 3
+    assert len(_recorded_sleep) == 2
+
+
+async def test_insufficient_quota_fails_fast_no_retry(
+    _recorded_sleep: list[float],
+) -> None:
+    client = _SequenceClient(
+        [_rate_limit_error("insufficient_quota", retry_after="5")]
+    )
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        client=client,
+        max_rate_limit_retries=5,
+    )
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert len(client.completions.calls) == 1
+    assert _recorded_sleep == []
+
+
+async def test_zero_retries_raises_on_first_rate_limit(
+    _recorded_sleep: list[float],
+) -> None:
+    client = _SequenceClient([_rate_limit_error("rate_limit_exceeded")])
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        client=client,
+        max_rate_limit_retries=0,
+    )
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert len(client.completions.calls) == 1
+    assert _recorded_sleep == []
+
+
+async def test_create_receives_request_timeout() -> None:
+    client = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        client=client,
+        request_timeout=42.0,
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert client.completions.calls[0]["timeout"] == 42.0
+
+
+async def test_retries_stay_in_one_observability_span(
+    _recorded_sleep: list[float],
+) -> None:
+    fake = _FakeLangfuse()
+    client = _SequenceClient(
+        [
+            _rate_limit_error("rate_limit_exceeded", retry_after="1"),
+            _completion(content='{"ok": true}'),
+        ]
+    )
+    provider = OpenAILLMProvider(
+        api_key="sk-secret-key",
+        default_model="gpt-4.1",
+        client=client,
+        observability=ProviderObservability(fake, enabled=True),
+        max_rate_limit_retries=5,
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # Two billable attempts, but exactly one span for the whole operation.
+    assert len(client.completions.calls) == 2
+    assert len(fake.start_calls) == 1
+
+
+def test_backoff_delay_is_bounded_and_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin jitter to 0 to test the deterministic core: base at attempt 0, capped
+    # at the ceiling for large attempts.
+    monkeypatch.setattr(
+        "rag_recipes.providers.llm.openai.random.uniform", lambda _a, _b: 0.0
+    )
+    assert _backoff_delay(0, base=0.5, cap=30.0) == pytest.approx(0.5)
+    assert _backoff_delay(2, base=0.5, cap=30.0) == pytest.approx(2.0)
+    assert _backoff_delay(100, base=0.5, cap=30.0) == pytest.approx(30.0)
 
 
 # --- Langfuse tracing --------------------------------------------------------

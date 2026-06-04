@@ -143,6 +143,89 @@ async def test_persist_hard_candidate_raises_and_adds_nothing() -> None:
     assert session.added == []
 
 
+# --- persist_knowledge_item staging mode (Phase 9.5) -----------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_staging_clean_is_extracting_with_score() -> None:
+    session = _FakeSession()
+    item = await persist_knowledge_item(
+        session,  # type: ignore[arg-type]
+        _make_recipe(),
+        extraction_run_id="run_x",
+        document_id="doc_x",
+        source_version=1,
+        window=_make_window(),
+        thresholds=_THRESHOLDS,
+        staging=True,
+        candidate_score=0.8,
+    )
+    assert item.status == KnowledgeItemStatus.EXTRACTING
+    assert item.candidate_score == 0.8
+    # Warnings still stored so finalize can re-derive ready/needs_review.
+    assert item.structured_data["warnings"] == []
+    assert session.added == [item]
+
+
+@pytest.mark.asyncio
+async def test_persist_staging_soft_failing_keeps_warnings() -> None:
+    session = _FakeSession()
+    recipe = _make_recipe(
+        structured_data=_make_structured_data(steps=[]),
+        confidence=_recipe_confidence(overall=0.3),
+    )
+    item = await persist_knowledge_item(
+        session,  # type: ignore[arg-type]
+        recipe,
+        extraction_run_id="run_x",
+        document_id="doc_x",
+        source_version=1,
+        window=_make_window(),
+        thresholds=_THRESHOLDS,
+        staging=True,
+        candidate_score=0.4,
+    )
+    # Staging status regardless of soft warnings; warnings preserved for finalize.
+    assert item.status == KnowledgeItemStatus.EXTRACTING
+    assert item.candidate_score == 0.4
+    assert set(item.structured_data["warnings"]) == {"no_steps", "low_overall_confidence"}
+
+
+@pytest.mark.asyncio
+async def test_persist_staging_hard_fail_raises_and_adds_nothing() -> None:
+    session = _FakeSession()
+    recipe = _make_recipe(source_span_ids=["span_999"])
+    with pytest.raises(HardValidationError):
+        await persist_knowledge_item(
+            session,  # type: ignore[arg-type]
+            recipe,
+            extraction_run_id="run_x",
+            document_id="doc_x",
+            source_version=1,
+            window=_make_window(),
+            thresholds=_THRESHOLDS,
+            staging=True,
+            candidate_score=0.9,
+        )
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_persist_non_staging_leaves_candidate_score_none() -> None:
+    session = _FakeSession()
+    item = await persist_knowledge_item(
+        session,  # type: ignore[arg-type]
+        _make_recipe(),
+        extraction_run_id="run_x",
+        document_id="doc_x",
+        source_version=1,
+        window=_make_window(),
+        thresholds=_THRESHOLDS,
+    )
+    assert item.status == KnowledgeItemStatus.READY
+    assert item.candidate_score is None
+
+
 # --- JSONB write contract (DECISIONS #1) -----------------------------------
 
 

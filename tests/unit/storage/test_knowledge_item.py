@@ -28,6 +28,7 @@ def test_table_columns_match_doc_2() -> None:
         "structured_data",
         "confidence",
         "status",
+        "candidate_score",
         "created_at",
         "updated_at",
     ]
@@ -59,6 +60,7 @@ def test_nullable_columns() -> None:
     cols = KnowledgeItem.__table__.columns
     assert cols["summary"].nullable is True
     assert cols["confidence"].nullable is True
+    assert cols["candidate_score"].nullable is True
     for name in [
         "id",
         "document_id",
@@ -81,7 +83,18 @@ def test_status_enum_uses_knowledge_item_status_enum_type() -> None:
     col_type = KnowledgeItem.__table__.columns["status"].type
     assert isinstance(col_type, sa.Enum)
     assert col_type.name == "knowledge_item_status_enum"
-    assert col_type.enums == ["ready", "needs_review", "superseded"]
+    assert col_type.enums == ["ready", "needs_review", "superseded", "extracting"]
+
+
+def test_candidate_score_is_float_nullable_and_defaults_to_none() -> None:
+    # Phase 9.5 (DECISIONS #3): the dedup score is persisted on the staging row
+    # so select_best can run over committed rows at finalize. Purely a
+    # dedup-time signal — nullable, no default.
+    item = KnowledgeItem()
+    assert item.candidate_score is None
+    col = KnowledgeItem.__table__.columns["candidate_score"]
+    assert col.nullable is True
+    assert isinstance(col.type, (sa.Double, sa.Float))
 
 
 def test_invalid_status_raises() -> None:

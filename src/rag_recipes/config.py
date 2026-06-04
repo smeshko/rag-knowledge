@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     openai_api_key: str
 
     llm_model: str = "gpt-4.1"
+    # Phase 9.5: bound the provider's rate-limit retry loop and per-request
+    # timeout. retries=0 disables retries (raise on the first 429); the timeout
+    # is a float so it feeds chat.completions.create(timeout=…) without a cast.
+    llm_max_rate_limit_retries: int = Field(default=5, ge=0)
+    llm_request_timeout_seconds: float = Field(default=60.0, ge=1)
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
     embedding_batch_size: int = Field(default=100, ge=1, le=2048)
@@ -46,6 +51,11 @@ class Settings(BaseSettings):
     pdf_window_size_pages: int = 3
     pdf_overlap_pages: int = 1
     pdf_min_text_chars_for_page: int = 20
+
+    # Phase 9.5: windows per per-batch commit in the extraction loop. A crash
+    # rolls back the in-flight batch, so at most batch_size − 1 windows of
+    # OpenAI spend are repeated on resume (DECISIONS #4).
+    extraction_commit_batch_size: int = Field(default=5, ge=1)
 
     search_default_limit: int = 10
     search_keyword_top_k: int = 50
