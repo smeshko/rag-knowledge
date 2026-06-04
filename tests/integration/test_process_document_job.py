@@ -195,11 +195,11 @@ async def test_process_document_writes_three_spans_and_transitions(
             status = await session.scalar(
                 select(Document.status).where(Document.id == ids["document_id"])
             )
-            # The pipeline now continues past spans through extraction + dedup +
-            # chunking + embedding; with the rejecting fake there are zero items
-            # (so zero chunks), but the embedding stage still advances the empty
-            # document to EMBEDDING_CHUNKS.
-            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            # The pipeline now runs the full lifecycle: extraction + dedup +
+            # chunking + embedding + indexing. With the rejecting fake there are
+            # zero items (so zero chunks), so the terminal transition lands the
+            # document at NEEDS_REVIEW (zero chunks => not searchable).
+            assert status == DocumentStatus.NEEDS_REVIEW
 
             spans = (
                 await session.execute(
@@ -260,10 +260,10 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
             ).scalars().all()
         assert len(first_spans) == 3
 
-        # A duplicate / manual re-delivery for the already-processed document
-        # must no-op rather than flip the successful EMBEDDING_CHUNKS row to
-        # FAILED via the InvalidTransitionError -> mark_failed path. (The guard
-        # short-circuits before the LLM stage, so this ctx needs no provider.)
+        # A duplicate / manual re-delivery for the already-terminal document must
+        # no-op rather than flip the NEEDS_REVIEW row to FAILED via the
+        # InvalidTransitionError -> mark_failed path. (The guard short-circuits
+        # before any stage, so this ctx needs no provider.)
         result = await process_document(ctx, ids["document_id"])
         assert result == 0
 
@@ -271,7 +271,7 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
             status = await session.scalar(
                 select(Document.status).where(Document.id == ids["document_id"])
             )
-            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            assert status == DocumentStatus.NEEDS_REVIEW
 
             spans = (
                 await session.execute(

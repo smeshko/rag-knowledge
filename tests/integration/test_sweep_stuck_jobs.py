@@ -255,16 +255,16 @@ async def test_sweep_exempts_creating_source_spans_handoff_state(
     assert failures == []
 
 
-async def test_sweep_exempts_embedding_chunks_handoff_state(
+async def test_sweep_reaps_embedding_chunks_once_indexing_consumes_it(
     db_session: AsyncSession,
 ) -> None:
-    # Phase 10.2 lands a successful document at EMBEDDING_CHUNKS with its embeddings
-    # committed atomically, then stops (the indexing/terminal transition arrives in
-    # 10.3). Aged well past the timeout it must NOT be swept to FAILED — an embedded
-    # document is a success, not a stuck job (review round-2 #1, carried to 10.2).
+    # Phase 10.3's indexing/terminal stage now consumes EMBEDDING_CHUNKS, so it is
+    # no longer a resting state: a document wedged there past the timeout (crashed
+    # after embedding, before the terminal transition) is genuinely stuck and must
+    # be swept to FAILED so it is visible for reprocessing — not exempt forever.
     document_id = await _make_document(
         db_session,
-        content_hash="sweep-handoff-embedding",
+        content_hash="sweep-stuck-embedding-chunks",
         status=DocumentStatus.EMBEDDING_CHUNKS,
     )
     await _backdate_updated_at(db_session, document_id, minutes_ago=120)
@@ -275,14 +275,15 @@ async def test_sweep_exempts_embedding_chunks_handoff_state(
     }
     count = await sweep_stuck_jobs(ctx)
 
-    assert count == 0
+    assert count == 1
     db_session.expire_all()
     status = await db_session.scalar(
         select(Document.status).where(Document.id == document_id)
     )
-    assert status == DocumentStatus.EMBEDDING_CHUNKS
+    assert status == DocumentStatus.FAILED
     failures = await FailuresRepository(db_session).list_failures(document_id)
-    assert failures == []
+    assert len(failures) == 1
+    assert failures[0].last_status == DocumentStatus.EMBEDDING_CHUNKS
 
 
 async def test_sweep_reaps_creating_chunks_once_embedding_consumes_it(
@@ -317,19 +318,19 @@ async def test_sweep_reaps_creating_chunks_once_embedding_consumes_it(
     assert failures[0].last_status == DocumentStatus.CREATING_CHUNKS
 
 
-async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
+async def test_sweep_rechecks_heartbeat_under_lock_against_concurrent_progress(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Race (review round-3 #1): the stale SELECT snapshots a document as
-    # EXTRACTING_ITEMS, but the worker advances it into the exempt resting state
-    # (EMBEDDING_CHUNKS after Phase 10.2) before the sweep takes the row lock.
-    # EMBEDDING_CHUNKS -> FAILED is a legal transition, so without a re-check under
-    # the lock the sweep would fail a successfully embedded document. Simulate the
-    # advance by hooking the sweep's first locking ``get`` to flip the row.
+    # Race (review round-3 #1): the stale SELECT snapshots a long-running
+    # EXTRACTING_ITEMS document, but it commits a fresh extraction batch (advancing
+    # last_progress_at) before the sweep takes the row lock. EXTRACTING_ITEMS ->
+    # FAILED is legal, so without re-evaluating the heartbeat under the lock the
+    # sweep would fail a still-healthy document. Simulate the heartbeat refresh by
+    # hooking the sweep's first locking ``get``.
     document_id = await _make_document(
         db_session,
-        content_hash="sweep-race-advance",
+        content_hash="sweep-race-progress",
         status=DocumentStatus.EXTRACTING_ITEMS,
     )
     await _backdate_updated_at(db_session, document_id, minutes_ago=120)
@@ -340,10 +341,10 @@ async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
     async def racing_get(entity: Any, ident: Any, **kwargs: Any) -> Any:
         if not triggered["done"] and ident == document_id:
             triggered["done"] = True
-            # Raw UPDATE (no onupdate bump) so the row stays stale-dated; only its
-            # status advances, isolating the exempt-status guard from the heartbeat.
+            # The worker commits another batch: a fresh heartbeat lands between the
+            # sweep's stale SELECT and this row lock.
             await db_session.execute(
-                text("UPDATE documents SET status = 'embedding_chunks' WHERE id = :id"),
+                text("UPDATE documents SET last_progress_at = now() WHERE id = :id"),
                 {"id": document_id},
             )
         return await real_get(entity, ident, **kwargs)
@@ -361,7 +362,7 @@ async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
     db_session.expire_all()
     doc = await real_get(Document, document_id)
     assert doc is not None
-    assert doc.status == DocumentStatus.EMBEDDING_CHUNKS
+    assert doc.status == DocumentStatus.EXTRACTING_ITEMS
     failures = await FailuresRepository(db_session).list_failures(document_id)
     assert failures == []
 
