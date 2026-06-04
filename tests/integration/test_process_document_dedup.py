@@ -40,7 +40,12 @@ from rag_recipes.ingestion.pipeline.windows import (
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    KnowledgeItemStatus,
+    SourceType,
+    UploadStatus,
+)
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
@@ -252,6 +257,86 @@ async def test_overlapping_windows_resolve_to_one_knowledge_item(
                 .where(ExtractionRun.document_id == document_id)
             )
             assert run_count == 2
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
+async def test_staging_candidates_not_visible_as_final_before_finalize(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-run: batch-committed candidates are EXTRACTING, never ready/needs_review.
+
+    Stops the job just before finalize (patching ``_finalize_extraction`` to
+    raise) so the test can observe the post-batch, pre-finalize state: the doc is
+    still ``extracting_items`` (no ``creating_chunks`` signal), every persisted
+    candidate is in the ``EXTRACTING`` staging status with a ``candidate_score``,
+    and none has been promoted to ``ready``/``needs_review`` (Phase 9.5
+    acceptance; DECISIONS #1).
+    """
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+
+    async def _boom(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("stop before finalize")
+
+    monkeypatch.setattr("rag_recipes.ingestion.jobs._finalize_extraction", _boom)
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans = _build_spans(document_id)
+        async with session_factory() as session:
+            session.add_all(spans)
+            await session.commit()
+
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+        provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low): _recipe_output(
+                    cited_span_id="span_p3", overall=0.6
+                ),
+                _request_hash_for(window_high): _recipe_output(
+                    cited_span_id="span_p3", overall=0.9
+                ),
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="stop before finalize"):
+            await process_document(
+                _ctx(session_factory, provider, tmp_path), document_id
+            )
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            # Finalize never ran, so the doc has not advanced past extraction.
+            assert status == DocumentStatus.EXTRACTING_ITEMS
+
+            items = (
+                await session.execute(
+                    select(KnowledgeItem).where(
+                        KnowledgeItem.document_id == document_id
+                    )
+                )
+            ).scalars().all()
+            # The batch loop committed both windows' candidates...
+            assert len(items) == 2
+            # ...all in the staging status, scored, none promoted.
+            assert all(item.status == KnowledgeItemStatus.EXTRACTING for item in items)
+            assert all(item.candidate_score is not None for item in items)
+            assert not any(
+                item.status in (KnowledgeItemStatus.READY, KnowledgeItemStatus.NEEDS_REVIEW)
+                for item in items
+            )
+
+            # last_progress_at heartbeated on the batch commit.
+            last_progress_at = await session.scalar(
+                select(Document.last_progress_at).where(Document.id == document_id)
+            )
+            assert last_progress_at is not None
     finally:
         await _cleanup(session_factory, document_id, asset_id)
 

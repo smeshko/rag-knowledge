@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from arq.cron import cron
-from arq.worker import func
-from sqlalchemy import Integer, cast, delete, select
+from arq.worker import func as arq_func
+from sqlalchemy import Integer, cast, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from rag_recipes.config import Settings, get_settings
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
@@ -38,7 +38,7 @@ from rag_recipes.ingestion.pipeline.pdf_text import (
     extract_and_persist_spans,
 )
 from rag_recipes.ingestion.pipeline.persist import persist_knowledge_item
-from rag_recipes.ingestion.pipeline.windows import build_windows
+from rag_recipes.ingestion.pipeline.windows import Window, build_windows
 from rag_recipes.ingestion.queue import _build_redis_settings
 from rag_recipes.ingestion.status import (
     InvalidTransitionError,
@@ -59,8 +59,13 @@ from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
-from rag_recipes.storage.enums import DocumentStatus, ExtractionRunStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionRunStatus,
+    KnowledgeItemStatus,
+)
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_span import SourceSpan
 from rag_recipes.storage.repositories.documents import DocumentRepository
@@ -160,6 +165,191 @@ async def _load_ordered_spans(session: AsyncSession, document_id: str) -> list[S
     return list(result.scalars().all())
 
 
+def _chunked(windows: list[Window], size: int) -> Iterator[list[Window]]:
+    """Yield ``windows`` in contiguous slices of at most ``size`` (the batch size)."""
+    for start in range(0, len(windows), size):
+        yield windows[start : start + size]
+
+
+async def _run_extraction_batches(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    document_id: str,
+    settings: Settings,
+    provider: LLMProvider,
+    observability: ProviderObservability | None,
+) -> None:
+    """Extract every window, committing per batch (Phase 9.5, DECISIONS #4).
+
+    Loads the document's ordered spans, builds the overlapping page windows, then
+    processes them in chunks of ``settings.extraction_commit_batch_size``. Each
+    batch is one transaction: its ``ExtractionRun``s + staging ``KnowledgeItem``s
+    (status ``EXTRACTING``, ``candidate_score`` set) + a ``last_progress_at``
+    heartbeat commit together. A crash rolls back only the in-flight batch, so at
+    most ``batch_size - 1`` windows of OpenAI spend are repeated on resume. The
+    heartbeat advances on every batch commit (server ``func.now()``, never via
+    ``onupdate``) so the progress-aware stuck-job sweep can tell a slow-but-healthy
+    run from a hung one.
+    """
+    async with session_factory() as session:
+        spans = await _load_ordered_spans(session, document_id)
+    windows = build_windows(
+        spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
+    )
+
+    for batch in _chunked(windows, settings.extraction_commit_batch_size):
+        async with session_factory() as session:
+            for window in batch:
+                run = await run_extraction(
+                    session,
+                    window,
+                    source_version=1,
+                    document_id=document_id,
+                    provider=provider,
+                    observability=observability,
+                )
+                if (
+                    run.status is not ExtractionRunStatus.SUCCESS
+                    or run.output_json is None
+                ):
+                    continue
+                parsed = RecipeExtractionOutput.model_validate(run.output_json)
+                for extracted in parsed.items:
+                    try:
+                        await persist_knowledge_item(
+                            session,
+                            extracted,
+                            extraction_run_id=run.id,
+                            document_id=document_id,
+                            source_version=1,
+                            window=window,
+                            staging=True,
+                            candidate_score=compute_candidate_score(
+                                extracted, window_span_ids=window.span_ids
+                            ),
+                        )
+                    except HardValidationError as exc:
+                        # Per-candidate rejection: persist no row, never fail the
+                        # document (9.3 DECISIONS #3). Log and move on.
+                        logger.info(
+                            "dropping hard-invalid candidate for %s: %s",
+                            document_id,
+                            exc,
+                        )
+                        continue
+            # Heartbeat the batch commit: only a committed batch counts as
+            # progress, so this is set explicitly (not via the updated_at onupdate
+            # that bumps on any write).
+            await session.execute(
+                update(Document)
+                .where(Document.id == document_id)
+                .values(last_progress_at=func.now())
+            )
+            await session.commit()
+
+
+async def _finalize_extraction(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    document_id: str,
+) -> int:
+    """Promote staged candidates to final status in one atomic transaction.
+
+    Runs entirely from persisted rows (DECISIONS #3): loads every ``EXTRACTING``
+    candidate for ``(document_id, source_version=1)``, rebuilds ``CandidateRef``s
+    from the stored ``candidate_score`` / ``normalized_title``, runs
+    ``select_best``, deletes the losers, promotes each winner to ``READY`` /
+    ``NEEDS_REVIEW`` re-derived from its stored ``structured_data["warnings"]``
+    (DECISIONS #1), runs the supersede hook, and advances ``extracting_items →
+    validating_items → creating_chunks``. One transaction so no reader ever sees a
+    half-finalized document (the atomicity 9.4's Session #4 gave, now scoped to
+    finalize). Returns the number of surviving (chosen) items.
+    """
+    async with session_factory() as session:
+        items = list(
+            (
+                await session.execute(
+                    select(KnowledgeItem).where(
+                        KnowledgeItem.document_id == document_id,
+                        KnowledgeItem.source_version == 1,
+                        KnowledgeItem.status == KnowledgeItemStatus.EXTRACTING,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = [
+            CandidateRef(
+                item_id=item.id,
+                normalized_title=item.normalized_title,
+                # candidate_score is written on every staging row; coerce a stray
+                # NULL to 0.0 so a row never silently wins on a missing score.
+                candidate_score=item.candidate_score or 0.0,
+                extraction_run_id=item.extraction_run_id,
+            )
+            for item in items
+        ]
+        chosen, discarded = select_best(candidates)
+        logger.info(
+            "dedup for %s: %d candidates, %d chosen, %d discarded",
+            document_id,
+            len(candidates),
+            len(chosen),
+            len(discarded),
+        )
+        for ref in discarded:
+            logger.info(
+                "dedup discard for %s: item=%s title=%r score=%.4f",
+                document_id,
+                ref.item_id,
+                ref.normalized_title,
+                ref.candidate_score,
+            )
+        if discarded:
+            await session.execute(
+                delete(KnowledgeItem).where(
+                    KnowledgeItem.id.in_([ref.item_id for ref in discarded])
+                )
+            )
+
+        # Promote winners: re-derive final status from the stored warnings
+        # (DECISIONS #1) — empty → ready, any warning → needs_review.
+        items_by_id = {item.id: item for item in items}
+        for ref in chosen:
+            item = items_by_id[ref.item_id]
+            warnings = item.structured_data.get("warnings") or []
+            item.status = (
+                KnowledgeItemStatus.NEEDS_REVIEW
+                if warnings
+                else KnowledgeItemStatus.READY
+            )
+
+        # Supersede hook: keep every run from this source_version's pass, so v1's
+        # first extraction matches nothing older (no-op). Epic 11 reuses this with
+        # a new source-version's runs to retire the prior version (DECISIONS #4).
+        run_ids = set(
+            (
+                await session.execute(
+                    select(ExtractionRun.id).where(
+                        ExtractionRun.document_id == document_id,
+                        ExtractionRun.source_version == 1,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await DocumentRepository(session).supersede_prior_items(
+            document_id, keep_extraction_run_ids=run_ids
+        )
+
+        await transition_to(session, document_id, DocumentStatus.VALIDATING_ITEMS)
+        await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
+        await session.commit()
+        return len(chosen)
+
+
 async def process_document(
     ctx: dict[str, Any],
     document_id: str,
@@ -228,110 +418,24 @@ async def process_document(
 
             # Session #3: short-lived transition-only scope. Releases the row lock
             # before the (slow) LLM stage and marks the doc as in extraction so the
-            # stuck-job cron sees progress (DECISIONS #5).
+            # stuck-job cron sees progress.
             async with session_factory() as session:
                 await transition_to(session, document_id, DocumentStatus.EXTRACTING_ITEMS)
                 await session.commit()
 
-            # Session #4: ONE transaction (DECISIONS #5). Extract every window,
-            # persist + score each candidate, select one winner per recipe, prune
-            # the losers, run the (v1 no-op) supersede hook, then advance through
-            # validating_items to creating_chunks. Atomic so no reader ever sees a
-            # half-deduplicated document or a chunks-ready signal with losers still
-            # present.
-            async with session_factory() as session:
-                spans = await _load_ordered_spans(session, document_id)
-                windows = build_windows(
-                    spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
-                )
-                candidates: list[CandidateRef] = []
-                run_ids: set[str] = set()
-                for window in windows:
-                    run = await run_extraction(
-                        session,
-                        window,
-                        source_version=1,
-                        document_id=document_id,
-                        provider=provider,
-                        observability=observability,
-                    )
-                    run_ids.add(run.id)
-                    if (
-                        run.status is not ExtractionRunStatus.SUCCESS
-                        or run.output_json is None
-                    ):
-                        continue
-                    parsed = RecipeExtractionOutput.model_validate(run.output_json)
-                    for extracted in parsed.items:
-                        try:
-                            item = await persist_knowledge_item(
-                                session,
-                                extracted,
-                                extraction_run_id=run.id,
-                                document_id=document_id,
-                                source_version=1,
-                                window=window,
-                            )
-                        except HardValidationError as exc:
-                            # Per-candidate rejection: persist no row, never fail the
-                            # document (9.3 DECISIONS #3). Log and move on.
-                            logger.info(
-                                "dropping hard-invalid candidate for %s: %s",
-                                document_id,
-                                exc,
-                            )
-                            continue
-                        candidates.append(
-                            CandidateRef(
-                                item_id=item.id,
-                                normalized_title=item.normalized_title,
-                                candidate_score=compute_candidate_score(
-                                    extracted, window_span_ids=window.span_ids
-                                ),
-                                extraction_run_id=run.id,
-                            )
-                        )
-
-                chosen, discarded = select_best(candidates)
-                logger.info(
-                    "dedup for %s: %d candidates, %d chosen, %d discarded",
-                    document_id,
-                    len(candidates),
-                    len(chosen),
-                    len(discarded),
-                )
-                # Log each discard before pruning (observability, DECISIONS #6).
-                for ref in discarded:
-                    logger.info(
-                        "dedup discard for %s: item=%s title=%r score=%.4f",
-                        document_id,
-                        ref.item_id,
-                        ref.normalized_title,
-                        ref.candidate_score,
-                    )
-                if discarded:
-                    await session.execute(
-                        delete(KnowledgeItem).where(
-                            KnowledgeItem.id.in_([ref.item_id for ref in discarded])
-                        )
-                    )
-
-                # Supersede hook: no-op for first extraction (the keep-set covers
-                # every run from this pass, so nothing older matches). Epic 10.3 /
-                # Epic 11 are the real consumers (DECISIONS #4).
-                await DocumentRepository(session).supersede_prior_items(
-                    document_id, keep_extraction_run_ids=run_ids
-                )
-
-                await transition_to(
-                    session, document_id, DocumentStatus.VALIDATING_ITEMS
-                )
-                await transition_to(
-                    session, document_id, DocumentStatus.CREATING_CHUNKS
-                )
-                await session.commit()
-
-            return len(chosen)
+            # Phase 9.5: extract every window committing per batch (durable,
+            # heartbeated progress; DECISIONS #4), then promote the staged
+            # candidates in one atomic finalize transaction (dedup from persisted
+            # rows; DECISIONS #1, #3). Both run inside this method's try/except so a
+            # batch-level LLMTechnicalError still routes to mark_failed.
+            await _run_extraction_batches(
+                session_factory,
+                document_id=document_id,
+                settings=settings,
+                provider=provider,
+                observability=observability,
+            )
+            return await _finalize_extraction(session_factory, document_id=document_id)
         except (
             EmptyPdfError,
             PdfExtractionError,
@@ -389,7 +493,7 @@ _SETTINGS = get_settings()
 
 
 class WorkerSettings:
-    functions = [ping_job, func(process_document, name="process_document", max_tries=1)]
+    functions = [ping_job, arq_func(process_document, name="process_document", max_tries=1)]
     cron_jobs = [
         cron(
             sweep_stuck_jobs,
