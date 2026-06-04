@@ -151,6 +151,8 @@ def _build_llm_provider(
         settings.openai_api_key,
         default_model=settings.llm_model,
         observability=observability,
+        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+        request_timeout=settings.llm_request_timeout_seconds,
     )
 
 
