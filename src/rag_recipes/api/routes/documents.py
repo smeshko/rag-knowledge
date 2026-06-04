@@ -478,6 +478,7 @@ async def reprocess_document(
     document_id: str,
     body: ReprocessRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    arq_redis: ArqRedis = Depends(get_arq_redis),  # noqa: B008
 ) -> Any:
     try:
         mode = ReprocessMode(body.mode)
@@ -526,8 +527,49 @@ async def reprocess_document(
         )
     await session.commit()
 
-    # `current_source_version` mirrors `active_source_version` until Epic 8
-    # writes versioned source spans (handoff documented in PLAN/TASK-006).
+    # Epic 11.1: only `reuse_source_spans` actually starts work here. `auto` /
+    # `new_source_version` are accepted (row flipped to QUEUED, mode/reason
+    # recorded above) but enqueue NO job — dispatching the reuse pipeline for them
+    # would run the wrong work (reuse skips PDF re-extraction and would supersede
+    # live items against stale source text while last_reprocess_mode records a
+    # different mode). The stuck-job cron is the existing backstop for any
+    # un-picked-up QUEUED doc.
+    # TODO(11.2): add the auto selector + new_source_version re-extraction enqueue.
+    if mode is ReprocessMode.REUSE_SOURCE_SPANS:
+        # Resolve the version to reuse: the active version if the doc has one,
+        # else the highest existing span version. Do NOT fabricate
+        # source_version=1 — a terminal doc with no spans (active and max both
+        # None, e.g. an early FAILED whose first extraction never persisted spans)
+        # has no source text to reuse, so a reuse job would be a queued no-op.
+        # Skip the enqueue entirely in that case.
+        resolved_version = (
+            previous
+            if previous is not None
+            else await repo.max_source_version(document_id)
+        )
+        if resolved_version is not None:
+            # Best-effort, mirroring upload_document: the row is committed and
+            # QUEUED, so a failed enqueue is logged (not fatal) and the stuck-job
+            # cron will catch the un-picked-up doc. Enqueue AFTER the commit so a
+            # rolled-back guard (the 409 path above) never leaves a job queued.
+            try:
+                await enqueue_job(
+                    arq_redis,
+                    "process_document",
+                    document_id,
+                    session_id=document_id,
+                    source_version=resolved_version,
+                    reuse_source_spans=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to enqueue reuse process_document for %s; "
+                    "stuck-job cron will catch it",
+                    document_id,
+                )
+
+    # `current_source_version` mirrors `active_source_version`: a reuse reprocess
+    # re-runs the existing version, so the active version is unchanged.
     return ReprocessResponse(
         document_id=document_id,
         status=DocumentStatus.QUEUED.value,
