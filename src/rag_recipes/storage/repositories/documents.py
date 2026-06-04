@@ -190,6 +190,22 @@ class DocumentRepository:
         )
         return result.scalar_one()
 
+    async def max_source_version(self, document_id: str) -> int | None:
+        """Return the document's highest ``SourceSpan.source_version``, or None.
+
+        Used by the reprocess endpoint to resolve the version a reuse run reuses
+        when the document has no ``active_source_version`` yet (e.g. a FAILED doc
+        whose first extraction persisted spans but never reached READY). The
+        aggregate yields exactly one row whose value is NULL → ``None`` when the
+        document has no spans at all.
+        """
+        result = await self._session.execute(
+            select(func.max(SourceSpan.source_version)).where(
+                SourceSpan.document_id == document_id
+            )
+        )
+        return result.scalar_one()
+
     async def get_pages_progress(
         self, document_id: str, source_version: int
     ) -> tuple[int, int | None]:

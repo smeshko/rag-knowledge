@@ -183,17 +183,20 @@ def _build_embedding_provider(
     )
 
 
-async def _load_ordered_spans(session: AsyncSession, document_id: str) -> list[SourceSpan]:
-    """Load a document's v1 SourceSpans ordered by page_start (build_windows' contract).
+async def _load_ordered_spans(
+    session: AsyncSession, document_id: str, source_version: int
+) -> list[SourceSpan]:
+    """Load a document's SourceSpans for ``source_version``, ordered by page_start.
 
-    ``page_start`` lives in the JSONB ``locator``; the ``->>`` accessor returns
-    text, cast to int so the ordering is numeric (page 10 after page 9, not before).
+    Ordering is ``build_windows``' contract. ``page_start`` lives in the JSONB
+    ``locator``; the ``->>`` accessor returns text, cast to int so the ordering is
+    numeric (page 10 after page 9, not before).
     """
     result = await session.execute(
         select(SourceSpan)
         .where(
             SourceSpan.document_id == document_id,
-            SourceSpan.source_version == 1,
+            SourceSpan.source_version == source_version,
         )
         .order_by(cast(SourceSpan.locator["page_start"].astext, Integer))
     )
@@ -210,6 +213,7 @@ async def _run_extraction_batches(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
     settings: Settings,
     provider: LLMProvider,
     observability: ProviderObservability | None,
@@ -227,7 +231,7 @@ async def _run_extraction_batches(
     run from a hung one.
     """
     async with session_factory() as session:
-        spans = await _load_ordered_spans(session, document_id)
+        spans = await _load_ordered_spans(session, document_id, source_version)
         # Resume skip set (DECISIONS #2): the input_hashes that already have a
         # committed ExtractionRun for this (document_id, source_version). Keyed on
         # the committed audit fact — what survived a prior batch commit — so a
@@ -239,7 +243,7 @@ async def _run_extraction_batches(
                 await session.execute(
                     select(ExtractionRun.input_hash).where(
                         ExtractionRun.document_id == document_id,
-                        ExtractionRun.source_version == 1,
+                        ExtractionRun.source_version == source_version,
                     )
                 )
             )
@@ -261,7 +265,7 @@ async def _run_extraction_batches(
                 run = await run_extraction(
                     session,
                     window,
-                    source_version=1,
+                    source_version=source_version,
                     document_id=document_id,
                     provider=provider,
                     observability=observability,
@@ -279,7 +283,7 @@ async def _run_extraction_batches(
                             extracted,
                             extraction_run_id=run.id,
                             document_id=document_id,
-                            source_version=1,
+                            source_version=source_version,
                             window=window,
                             staging=True,
                             candidate_score=compute_candidate_score(
@@ -310,11 +314,12 @@ async def _finalize_extraction(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
 ) -> int:
     """Promote staged candidates to final status in one atomic transaction.
 
     Runs entirely from persisted rows (DECISIONS #3): loads every ``EXTRACTING``
-    candidate for ``(document_id, source_version=1)``, rebuilds ``CandidateRef``s
+    candidate for ``(document_id, source_version)``, rebuilds ``CandidateRef``s
     from the stored ``candidate_score`` / ``normalized_title``, runs
     ``select_best``, deletes the losers, promotes each winner to ``READY`` /
     ``NEEDS_REVIEW`` re-derived from its stored ``structured_data["warnings"]``
@@ -329,7 +334,7 @@ async def _finalize_extraction(
                 await session.execute(
                     select(KnowledgeItem).where(
                         KnowledgeItem.document_id == document_id,
-                        KnowledgeItem.source_version == 1,
+                        KnowledgeItem.source_version == source_version,
                         KnowledgeItem.status == KnowledgeItemStatus.EXTRACTING,
                     )
                 )
@@ -383,24 +388,38 @@ async def _finalize_extraction(
                 else KnowledgeItemStatus.READY
             )
 
-        # Supersede hook: keep every run from this source_version's pass, so v1's
-        # first extraction matches nothing older (no-op). Epic 11 reuses this with
-        # a new source-version's runs to retire the prior version (DECISIONS #4).
-        run_ids = set(
-            (
-                await session.execute(
-                    select(ExtractionRun.id).where(
-                        ExtractionRun.document_id == document_id,
-                        ExtractionRun.source_version == 1,
-                    )
-                )
+        # Whether this pass produced an *accepted* (READY) replacement. This — not
+        # merely "chosen is non-empty" — is the gate for both superseding the prior
+        # set and (re)building chunks (review #2). A pass whose only winners are
+        # NEEDS_REVIEW, or a zero-winner pass, must NOT retire the prior active
+        # version: the epic's rule is "supersede only after the new run reaches
+        # ready" / "a needs_review/failed re-extraction must not auto-supersede"
+        # (DECISIONS #5).
+        has_ready_winner = any(
+            items_by_id[ref.item_id].status is KnowledgeItemStatus.READY
+            for ref in chosen
+        )
+
+        # Supersede hook (DECISIONS #5): retire everything the document had before
+        # this pass, keeping ONLY the runs whose items survived *this* pass's dedup
+        # (the `chosen` set — both its ready and needs_review winners). On a fresh
+        # first extraction there is nothing older, so nothing matches (no-op). On a
+        # reuse reprocess at the SAME source_version (Epic 11.1) the prior pass's
+        # runs are NOT in the keep-set, so its items flip to SUPERSEDED while this
+        # pass's winners are spared. Scoping the keep-set to `chosen` (not "every run
+        # at this version") is what makes same-version reuse correct.
+        #
+        # Gate on an accepted READY replacement: a pass with no ready winner (every
+        # window rejected/no-item, OR only low-confidence needs_review winners) must
+        # NOT supersede — that would retire the prior live ready set with nothing
+        # searchable to replace it, making the document's content vanish. Skip the
+        # call so the prior active set survives until a pass actually produces a
+        # ready replacement.
+        if has_ready_winner:
+            keep_run_ids = {ref.extraction_run_id for ref in chosen}
+            await DocumentRepository(session).supersede_prior_items(
+                document_id, keep_extraction_run_ids=keep_run_ids
             )
-            .scalars()
-            .all()
-        )
-        await DocumentRepository(session).supersede_prior_items(
-            document_id, keep_extraction_run_ids=run_ids
-        )
 
         await transition_to(session, document_id, DocumentStatus.VALIDATING_ITEMS)
         doc = await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
@@ -415,9 +434,20 @@ async def _finalize_extraction(
         # its `category` is read without a second query. The chunk INSERTs do not
         # collide with the discarded-candidate DELETE above: that DELETE already
         # executed (removing the losers) before any chunk is built for a winner.
-        chunk_count = await persist_chunks_for_ready_items(
-            session, document_id=document_id, category=doc.category
-        )
+        #
+        # Build chunks only when this pass produced a ready replacement. Without the
+        # gate a zero-/needs_review-winner reuse (which preserves the prior ready
+        # set above) would re-enter persist_chunks_for_ready_items and append a
+        # SECOND set of chunks for the already-chunked prior items (review #2). When
+        # there is no ready winner the prior items keep their existing chunks
+        # untouched; on a fresh run with no ready winner there were no chunks to
+        # build anyway, so the gate is a no-op there.
+        if has_ready_winner:
+            chunk_count = await persist_chunks_for_ready_items(
+                session, document_id=document_id, category=doc.category
+            )
+        else:
+            chunk_count = 0
         # Advance the stuck-job heartbeat: the post-extraction stages
         # (chunking/embedding/indexing) are no longer sweep-exempt, so each must
         # report progress or a long-but-healthy run would be reaped on the stale
@@ -455,8 +485,18 @@ async def _embed_document_chunks(
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.EMBEDDING_CHUNKS)
+        # Embed only chunks whose parent KnowledgeItem is still READY. On a reuse
+        # run the prior pass's items are superseded but their chunks are retained
+        # (for audit); re-embedding that stale content would waste API calls and
+        # leave superseded chunks searchable. On a fresh run every chunk is
+        # READY-parented, so this join selects the same set as before (review #1).
         result = await session.execute(
-            select(Chunk).where(Chunk.document_id == document_id)
+            select(Chunk)
+            .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
+            .where(
+                Chunk.document_id == document_id,
+                KnowledgeItem.status == KnowledgeItemStatus.READY,
+            )
         )
         chunks = list(result.scalars().all())
         embeddings = await embed_chunks(
@@ -497,10 +537,21 @@ async def _index_and_finalize(
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.INDEXING)
+        # Count only chunks whose parent KnowledgeItem is still READY. A reuse run
+        # (Epic 11.1) can supersede the prior pass's items while their chunks are
+        # retained in the table (for audit); those retained chunks must NOT make a
+        # document look searchable. Without the join, a reuse whose only winners are
+        # NEEDS_REVIEW (no new chunks) would still see the prior pass's stale chunks
+        # and finalize READY with no ready items (review #1). On a fresh run every
+        # chunk is READY-parented, so the join is a no-op there.
         chunk_count = await session.scalar(
             select(func.count())
             .select_from(Chunk)
-            .where(Chunk.document_id == document_id)
+            .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
+            .where(
+                Chunk.document_id == document_id,
+                KnowledgeItem.status == KnowledgeItemStatus.READY,
+            )
         )
         terminal = (
             DocumentStatus.READY
@@ -522,19 +573,23 @@ async def _index_and_finalize(
     return terminal
 
 
-async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
+async def _resume_or_fresh(
+    session: AsyncSession, document_id: str, *, reuse_source_spans: bool = False
+) -> str:
     """Decide how to (re-)enter ``process_document`` from the document's status.
 
     Returns ``"fresh"`` for a ``QUEUED`` doc (run text → spans → extraction),
-    ``"resume"`` for one already in ``EXTRACTING_ITEMS`` (a re-driven job after a
-    kill/timeout — skip straight to the idempotent window loop, which the
-    ``input_hash`` skip set makes safe), ``"embed"`` for one in ``CREATING_CHUNKS``
-    (a re-driven job after a crash between the atomic finalize commit and the
-    embedding commit — its chunks are persisted, so resume straight into the
-    idempotent embedding stage), or ``"skip"`` for any other status (a duplicate
-    delivery of an in-flight or completed doc; the caller no-ops rather than risk
-    flipping a good row to FAILED). Raises ``LookupError`` when the document does
-    not exist.
+    ``"reuse"`` for a ``QUEUED`` doc dispatched with ``reuse_source_spans=True``
+    (a reuse reprocess — skip the PDF text stage and re-run item extraction over
+    the existing spans, Epic 11.1), ``"resume"`` for one already in
+    ``EXTRACTING_ITEMS`` (a re-driven job after a kill/timeout — skip straight to
+    the idempotent window loop, which the ``input_hash`` skip set makes safe),
+    ``"embed"`` for one in ``CREATING_CHUNKS`` (a re-driven job after a crash
+    between the atomic finalize commit and the embedding commit — its chunks are
+    persisted, so resume straight into the idempotent embedding stage), or
+    ``"skip"`` for any other status (a duplicate delivery of an in-flight or
+    completed doc; the caller no-ops rather than risk flipping a good row to
+    FAILED). Raises ``LookupError`` when the document does not exist.
     """
     status = await session.scalar(
         select(Document.status).where(Document.id == document_id)
@@ -542,7 +597,7 @@ async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
     if status is None:
         raise LookupError(f"Document not found: {document_id}")
     if status is DocumentStatus.QUEUED:
-        return "fresh"
+        return "reuse" if reuse_source_spans else "fresh"
     if status is DocumentStatus.EXTRACTING_ITEMS:
         return "resume"
     if status is DocumentStatus.CREATING_CHUNKS:
@@ -561,6 +616,8 @@ async def process_document(
     ctx: dict[str, Any],
     document_id: str,
     *,
+    source_version: int = 1,
+    reuse_source_spans: bool = False,
     _session_id: str | None = None,
 ) -> int:
     """Run a Document's full ingestion lifecycle to its terminal status.
@@ -575,6 +632,14 @@ async def process_document(
     reflects the failure too. Langfuse session defaults to ``document_id`` (the
     project's session_id == document_id convention) when the caller didn't pass
     ``_session_id``.
+
+    When ``reuse_source_spans`` is true (Epic 11.1 reuse reprocess), the PDF text
+    stage is skipped entirely: the document transitions ``QUEUED →
+    EXTRACTING_ITEMS`` directly (it never enters ``EXTRACTING_TEXT`` /
+    ``CREATING_SOURCE_SPANS`` and ``extract_and_persist_spans`` is not called),
+    and item extraction re-runs over the already-persisted ``SourceSpan`` rows for
+    ``source_version``. Finalize supersedes the prior pass's items (see
+    ``_finalize_extraction``); no new spans are written.
     """
     session_factory = ctx["session_factory"]
     settings = ctx["settings"]
@@ -591,12 +656,23 @@ async def process_document(
             # (an in-flight or completed doc is the stuck-job cron's concern, not
             # a re-delivery's — flipping a good row to FAILED would be worse).
             async with session_factory() as session:
-                entry = await _resume_or_fresh(session, document_id)
+                entry = await _resume_or_fresh(
+                    session, document_id, reuse_source_spans=reuse_source_spans
+                )
                 if entry == "skip":
                     return 0
                 if entry == "fresh":
                     await transition_to(
                         session, document_id, DocumentStatus.EXTRACTING_TEXT
+                    )
+                    await session.commit()
+                elif entry == "reuse":
+                    # Reuse reprocess (Epic 11.1): skip the PDF text stage. Jump
+                    # straight to item extraction over the existing spans via the
+                    # QUEUED -> EXTRACTING_ITEMS edge — the doc never enters
+                    # EXTRACTING_TEXT / CREATING_SOURCE_SPANS.
+                    await transition_to(
+                        session, document_id, DocumentStatus.EXTRACTING_ITEMS
                     )
                     await session.commit()
 
@@ -608,13 +684,13 @@ async def process_document(
             # rolls back to the resumable status it started from.
             chosen_count = 0
 
-            if entry in ("fresh", "resume"):
+            if entry in ("fresh", "resume", "reuse"):
                 if entry == "fresh":
                     async with session_factory() as session:
                         spans_count = await extract_and_persist_spans(
                             session,
                             document_id=document_id,
-                            source_version=1,
+                            source_version=source_version,
                             extractor=extractor,
                             storage=storage,
                         )
@@ -645,6 +721,16 @@ async def process_document(
                             session, document_id, DocumentStatus.EXTRACTING_ITEMS
                         )
                         await session.commit()
+                elif entry == "reuse":
+                    # The reuse entry already landed the doc in EXTRACTING_ITEMS
+                    # (skipping the text stage), so just run the item loop over the
+                    # existing v=source_version spans.
+                    logger.info(
+                        "reuse reprocess for %s: re-extracting items over existing "
+                        "v%d spans (text stage skipped)",
+                        document_id,
+                        source_version,
+                    )
                 else:
                     logger.info(
                         "resuming extraction for %s from extracting_items", document_id
@@ -658,15 +744,16 @@ async def process_document(
                 await _run_extraction_batches(
                     session_factory,
                     document_id=document_id,
+                    source_version=source_version,
                     settings=settings,
                     provider=provider,
                     observability=observability,
                 )
                 chosen_count = await _finalize_extraction(
-                    session_factory, document_id=document_id
+                    session_factory, document_id=document_id, source_version=source_version
                 )
 
-            if entry in ("fresh", "resume", "embed"):
+            if entry in ("fresh", "resume", "reuse", "embed"):
                 # Phase 10.2: embed the persisted chunks (CREATING_CHUNKS ->
                 # EMBEDDING_CHUNKS). The "embed" entry resumes here after a crash
                 # between the finalize commit and the embedding commit (chunks
