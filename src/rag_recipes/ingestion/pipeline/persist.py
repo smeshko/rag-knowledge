@@ -8,6 +8,10 @@ Turns a parsed ``recipe.v1`` ``ExtractedRecipe`` (Phase 9.2) plus its source
   and the warning codes attached.
 - fully clean            → persist a ``KnowledgeItem`` with ``status="ready"``.
 
+In Phase 9.5 ``staging`` mode the row is instead written in the ``extracting``
+staging status carrying its ``candidate_score``; warnings are still stored so
+finalize re-derives the eventual ready/needs_review status (DECISIONS #1).
+
 **JSONB write contract (DECISIONS #1):** build the full object, assign once;
 never edit a JSONB attribute (``structured_data``, ``confidence``,
 ``source_span_ids``) in place. The columns are plain ``postgresql.JSONB`` with no
@@ -79,14 +83,25 @@ async def persist_knowledge_item(
     source_version: int,
     window: Window,
     thresholds: SoftValidationThresholds | None = None,
+    staging: bool = False,
+    candidate_score: float | None = None,
 ) -> KnowledgeItem:
     """Validate ``extracted`` and persist a ``KnowledgeItem`` (or reject it).
 
     Runs hard validation first: any failure persists nothing and raises
     ``HardValidationError`` carrying the full failure list (the run is left
-    untouched — DECISIONS #3). Otherwise runs soft validation and persists a row
-    with ``status=NEEDS_REVIEW`` (warning codes in ``structured_data["warnings"]``)
-    when any soft rule fires, else ``status=READY`` with an empty warnings list.
+    untouched — DECISIONS #3). Otherwise runs soft validation and persists a row.
+
+    When ``staging`` is false (default), the row's final status is set directly:
+    ``status=NEEDS_REVIEW`` (warning codes in ``structured_data["warnings"]``)
+    when any soft rule fires, else ``status=READY``.
+
+    When ``staging`` is true (Phase 9.5), the row is written in the
+    ``EXTRACTING`` staging status with ``candidate_score`` stored for the
+    separate finalize transaction's dedup pass (DECISIONS #3). Warnings are
+    still computed and stored in ``structured_data["warnings"]`` exactly as in
+    the non-staging path, so finalize can re-derive the eventual ready/
+    needs_review status purely from the persisted warnings (DECISIONS #1).
 
     Flushes before returning so composite-FK / ``@validates`` violations surface
     here; never commits. ``thresholds`` defaults to the application ``Settings``.
@@ -101,11 +116,16 @@ async def persist_knowledge_item(
 
     # Whole-object assembly (DECISIONS #1, #2): warning codes live alongside the
     # LLM's own warnings under structured_data; never mutated in place afterwards.
+    # Stored regardless of staging — they are the source of truth from which
+    # finalize re-derives the final ready/needs_review status (DECISIONS #1).
     structured_data = {
         **extracted.structured_data.model_dump(mode="json", by_alias=True),
         "warnings": [w.code for w in warnings],
     }
-    status = KnowledgeItemStatus.NEEDS_REVIEW if warnings else KnowledgeItemStatus.READY
+    if staging:
+        status = KnowledgeItemStatus.EXTRACTING
+    else:
+        status = KnowledgeItemStatus.NEEDS_REVIEW if warnings else KnowledgeItemStatus.READY
 
     item = KnowledgeItem(
         document_id=document_id,
@@ -120,6 +140,7 @@ async def persist_knowledge_item(
         structured_data=structured_data,
         confidence=extracted.confidence.model_dump(mode="json", by_alias=True),
         status=status,
+        candidate_score=candidate_score,
     )
     session.add(item)
     await session.flush()
