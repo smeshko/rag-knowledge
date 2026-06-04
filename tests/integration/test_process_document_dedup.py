@@ -48,6 +48,7 @@ from rag_recipes.storage.enums import (
     UploadStatus,
 )
 from rag_recipes.storage.ids import new_id
+from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
@@ -166,7 +167,8 @@ async def _cleanup(
     session_factory: async_sessionmaker[AsyncSession], document_id: str, asset_id: str
 ) -> None:
     async with session_factory() as session:
-        for model in (KnowledgeItem, ExtractionRun, SourceSpan, IngestionFailure):
+        # Chunk first: its FK to knowledge_items would block their delete (Phase 10.1).
+        for model in (Chunk, KnowledgeItem, ExtractionRun, SourceSpan, IngestionFailure):
             await session.execute(
                 delete(model).where(model.document_id == document_id)
             )

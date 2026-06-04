@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from rag_recipes.config import Settings, get_settings
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
+from rag_recipes.ingestion.pipeline.chunking import persist_chunks_for_ready_items
 from rag_recipes.ingestion.pipeline.dedup import (
     CandidateRef,
     compute_candidate_score,
@@ -381,6 +382,35 @@ async def _finalize_extraction(
         return len(chosen)
 
 
+async def _create_chunks(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    document_id: str,
+) -> int:
+    """Build + persist chunks for the document's ready items (Phase 10.1).
+
+    Runs as its own transaction after ``_finalize_extraction`` has landed the
+    document in ``CREATING_CHUNKS``: loads the ``Document`` for its ``category``,
+    persists one to five chunks per surviving ``READY`` ``KnowledgeItem``, and
+    commits — leaving the document in ``CREATING_CHUNKS`` (the onward
+    ``EMBEDDING_CHUNKS`` transition is Phase 10.2). Kept a **separate**
+    transaction from finalize on purpose: finalize's bulk discarded-candidate
+    ``DELETE`` and a dependent chunk ``INSERT`` cannot be ordered against each
+    other in one unit-of-work flush, so chunking reads the committed ready rows
+    from a clean session instead. Returns the number of chunks written.
+    """
+    async with session_factory() as session:
+        document = await session.get(Document, document_id)
+        if document is None:
+            raise LookupError(f"Document not found: {document_id}")
+        chunk_count = await persist_chunks_for_ready_items(
+            session, document_id=document_id, category=document.category
+        )
+        await session.commit()
+    logger.info("created %d chunks for %s", chunk_count, document_id)
+    return chunk_count
+
+
 async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
     """Decide how to (re-)enter ``process_document`` from the document's status.
 
@@ -498,7 +528,15 @@ async def process_document(
                 provider=provider,
                 observability=observability,
             )
-            return await _finalize_extraction(session_factory, document_id=document_id)
+            chosen_count = await _finalize_extraction(
+                session_factory, document_id=document_id
+            )
+            # Phase 10.1: chunk the surviving ready items in their own transaction.
+            # Finalize already landed the document in CREATING_CHUNKS, so this stage
+            # builds + persists chunks and leaves it there (the onward
+            # EMBEDDING_CHUNKS transition is Phase 10.2).
+            await _create_chunks(session_factory, document_id=document_id)
+            return chosen_count
         except (
             EmptyPdfError,
             PdfExtractionError,

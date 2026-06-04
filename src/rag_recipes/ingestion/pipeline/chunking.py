@@ -33,11 +33,14 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from rag_recipes.storage.enums import ChunkParentType, ChunkType, KnowledgeItemStatus
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
-__all__ = ["build_chunks"]
+__all__ = ["build_chunks", "persist_chunks_for_ready_items"]
 
 
 def _sha256_text(s: str) -> str:
@@ -126,3 +129,30 @@ def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
             )
         )
     return chunks
+
+
+async def persist_chunks_for_ready_items(
+    session: AsyncSession, *, document_id: str, category: str
+) -> int:
+    """Build and persist the chunks for every ``READY`` item of a document.
+
+    Loads the document's ``READY`` ``KnowledgeItem`` rows, builds each item's
+    chunks with ``build_chunks``, adds them all, and flushes (surfacing the
+    composite FK / ``@validates`` checks at the call site). Returns the total
+    number of chunks written. The caller owns the transaction — this never
+    commits, mirroring ``extract_and_persist_spans`` / ``persist_knowledge_item``.
+    ``NEEDS_REVIEW`` / ``SUPERSEDED`` items are not loaded, so they contribute
+    no chunks.
+    """
+    result = await session.execute(
+        select(KnowledgeItem).where(
+            KnowledgeItem.document_id == document_id,
+            KnowledgeItem.status == KnowledgeItemStatus.READY,
+        )
+    )
+    chunks: list[Chunk] = []
+    for item in result.scalars().all():
+        chunks.extend(build_chunks(item, category=category))
+    session.add_all(chunks)
+    await session.flush()
+    return len(chunks)
