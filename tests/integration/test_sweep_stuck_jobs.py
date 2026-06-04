@@ -255,6 +255,36 @@ async def test_sweep_exempts_creating_source_spans_handoff_state(
     assert failures == []
 
 
+async def test_sweep_exempts_creating_chunks_handoff_state(
+    db_session: AsyncSession,
+) -> None:
+    # Phase 10.1 lands a successful document at CREATING_CHUNKS with its chunks
+    # committed atomically, then stops (the embedding consumer arrives in 10.2).
+    # Aged well past the timeout it must NOT be swept to FAILED — a chunked
+    # document is a success, not a stuck job (review round-2 #1).
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-handoff-chunks",
+        status=DocumentStatus.CREATING_CHUNKS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 0
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.CREATING_CHUNKS
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert failures == []
+
+
 async def test_sweep_skips_extracting_items_with_fresh_heartbeat(
     db_session: AsyncSession,
 ) -> None:

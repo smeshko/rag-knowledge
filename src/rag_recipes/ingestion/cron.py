@@ -30,18 +30,24 @@ from rag_recipes.storage.models.document import Document
 logger = logging.getLogger(__name__)
 
 
-# Phase 8.1 deliberately rests a successfully-extracted document at
-# CREATING_SOURCE_SPANS: extraction is done and spans are persisted, but there
-# is no consumer to advance it until Epic 9's process_extraction_run lands. The
-# sweep treats every non-terminal status as "stuck", so without this exemption
-# a *successful* extraction would be marked failed once it ages past the
-# timeout. Exempt the handoff state until Epic 9 owns it.
+# The sweep treats every non-terminal status as "stuck", so a status that a
+# successful document *rests* at — done for now, but with no consumer to advance
+# it until a later phase lands — must be exempted, or a successful document would
+# be marked failed once it ages past the timeout.
 #
-# REMOVE this exemption when process_extraction_run exists — at that point a
-# document wedged in CREATING_SOURCE_SPANS (spans written, item-extraction
-# stalled) is genuinely stuck and should be swept again.
+# - CREATING_SOURCE_SPANS (Phase 8.1): extraction done, spans persisted, awaiting
+#   Epic 9's process_extraction_run. (Epic 9 has since landed and advances past
+#   it, so this is now only reached transiently; kept until the handoff is retired.)
+# - CREATING_CHUNKS (Phase 10.1): the finalize transaction lands the document here
+#   *with* its chunks (atomic — see jobs._finalize_extraction) and intentionally
+#   stops; the embedding stage that consumes it arrives in Phase 10.2. Because
+#   chunk creation is atomic, any document at CREATING_CHUNKS is a *success*, never
+#   a partial crash, so exempting it never masks a genuinely stuck job.
+#
+# REMOVE each entry when its downstream consumer exists — at that point a document
+# wedged in that status is genuinely stuck and should be swept again.
 _SWEEP_EXEMPT_STATUSES: frozenset[DocumentStatus] = frozenset(
-    {DocumentStatus.CREATING_SOURCE_SPANS}
+    {DocumentStatus.CREATING_SOURCE_SPANS, DocumentStatus.CREATING_CHUNKS}
 )
 
 
