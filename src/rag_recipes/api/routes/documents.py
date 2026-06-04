@@ -515,6 +515,13 @@ async def reprocess_document(
             status=DocumentStatus.QUEUED,
             last_reprocess_mode=mode.value,
             last_reprocess_reason=body.reason,
+            # Reset the extraction heartbeat (review #3): sweep_stuck_jobs reaps on
+            # coalesce(last_progress_at, updated_at). A terminal doc carries a
+            # last_progress_at from its *original* run, possibly days old; leaving it
+            # would let the cron mark this freshly-requeued reprocess FAILED before
+            # the worker even starts. NULL falls back to the just-bumped updated_at,
+            # matching a fresh upload's pre-progress state.
+            last_progress_at=None,
         )
         .execution_options(synchronize_session=False)
     )

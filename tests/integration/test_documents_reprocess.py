@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.app import app
@@ -367,6 +367,49 @@ async def test_reuse_with_no_spans_does_not_enqueue(
     ).scalar_one()
     await savepoint_session.refresh(refreshed)
     assert refreshed.status is DocumentStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_reprocess_resets_stale_last_progress_at(
+    client: httpx.AsyncClient,
+    savepoint_session: AsyncSession,
+) -> None:
+    """Reprocess clears the stale extraction heartbeat (review #3).
+
+    A terminal doc carries a last_progress_at from its original run. If reprocess
+    left it intact, sweep_stuck_jobs — which reaps on
+    coalesce(last_progress_at, updated_at) — could mark the freshly-requeued job
+    FAILED before the worker starts. The UPDATE must reset it to NULL so the
+    just-bumped updated_at governs the pre-progress stage."""
+    doc = await _seed_document(
+        savepoint_session,
+        content_hash="hash-stale-heartbeat",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    # Backdate the heartbeat far past any stuck-job timeout.
+    await savepoint_session.execute(
+        text(
+            "UPDATE documents "
+            "SET last_progress_at = now() - make_interval(mins => 10000) "
+            "WHERE id = :id"
+        ),
+        {"id": doc.id},
+    )
+    await savepoint_session.flush()
+    async with client:
+        response = await client.post(
+            f"/api/v1/documents/{doc.id}/reprocess",
+            json={"mode": "reuse_source_spans"},
+        )
+    assert response.status_code == 200, response.text
+    refreshed = (
+        await savepoint_session.execute(select(Document).where(Document.id == doc.id))
+    ).scalar_one()
+    await savepoint_session.refresh(refreshed)
+    assert refreshed.status is DocumentStatus.QUEUED
+    # The stale heartbeat is cleared, so the cron falls back to the fresh updated_at.
+    assert refreshed.last_progress_at is None
 
 
 @pytest.mark.asyncio
