@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import Integer, cast, func, select
+from sqlalchemy import CursorResult, Integer, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.storage.enums import (
@@ -63,6 +63,44 @@ class DocumentRepository:
             select(SourceAsset).where(SourceAsset.id == document.asset_id)
         )
         return result.scalar_one_or_none()
+
+    async def supersede_prior_items(
+        self, document_id: str, *, keep_extraction_run_ids: set[str]
+    ) -> int:
+        """Supersede a document's prior KnowledgeItems, sparing the kept runs.
+
+        Single bulk indexed UPDATE flipping every non-superseded ``KnowledgeItem``
+        for ``document_id`` whose ``extraction_run_id`` is NOT in
+        ``keep_extraction_run_ids`` to ``SUPERSEDED``; returns the affected row
+        count. The keep-set framing ("supersede everything *not* produced by the
+        accepted run") is exact and clock-skew-proof versus a timestamp filter
+        (DECISIONS #4): Epic 10.3 calls it with the just-accepted run ids at the
+        READY transition and Epic 11 with the new source-version's runs. For first
+        extraction the keep-set covers the current pass's runs, so nothing matches
+        and 0 is returned. Already-``SUPERSEDED`` rows are excluded by the status
+        guard and never re-touched.
+
+        Caller owns the transaction (consistent with the other repo writes and
+        ``transition_to``); this flush-level write does not commit.
+        ``synchronize_session=False`` keeps it a single round-trip — the caller
+        does not rely on the in-session ORM objects reflecting the new status.
+        """
+        stmt = (
+            update(KnowledgeItem)
+            .where(
+                KnowledgeItem.document_id == document_id,
+                KnowledgeItem.status != KnowledgeItemStatus.SUPERSEDED,
+                KnowledgeItem.extraction_run_id.notin_(keep_extraction_run_ids),
+            )
+            .values(status=KnowledgeItemStatus.SUPERSEDED)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(stmt)
+        # AsyncSession.execute is typed Result[Any]; an UPDATE yields a
+        # CursorResult, whose rowcount is the affected-row count. Narrow for the
+        # typed int access.
+        assert isinstance(result, CursorResult)
+        return result.rowcount
 
     async def add_source_asset(
         self,
