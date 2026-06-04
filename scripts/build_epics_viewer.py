@@ -12,10 +12,11 @@ Sources scanned:
   .claude/plans/*/                      -> active plans (PLAN + DECISIONS + RESEARCH + tasks)
   .claude/plans/archive/*/              -> archived plans (same shape)
 
-Each plan folder is concatenated into one doc: PLAN.md as-is, then DECISIONS.md and
-RESEARCH.md (demoted one heading level so each becomes a single section), then every
-task under one "Task details" section. Cross-links are wired so the overview links to
-epics, each epic links to its plans, and plans link back to their epic.
+The doc switcher holds the overview + one doc per epic. Each epic's plans are nested
+*inside* that epic's doc: every plan becomes a single ``## Plan X.Y`` section inserted
+right after its matching ``## Phase X.Y`` section, with the plan's PLAN/DECISIONS/
+RESEARCH/tasks demoted beneath it. So plans live under their epic and never render as an
+empty separate document.
 
 No third-party dependencies; standard library only.
 """
@@ -38,9 +39,6 @@ OUTPUT = ROOT / "docs" / "implementation" / "epics-viewer.html"
 STORAGE_KEY = "rag-recipes-epics-v1"
 EXPORT_SLUG = "epics-viewer"
 EXPORT_TITLE = "rag-recipes epics & plans — review comments"
-
-# Status -> a short coloured glyph for the sub-line (kept plain text; the viewer styles it).
-STATUS_ORDER = {"Done": 0, "In progress": 1, "Ready for dev": 2, "Blocked": 3}
 
 # --- dir name: [YYYY-MM-DD-]epic-<E>-phase-<MAJ>-<MIN>-<rest> -----------------------------
 PLAN_DIR_RE = re.compile(
@@ -73,8 +71,7 @@ def demote_headings(md: str, levels: int) -> str:
     out: list[str] = []
     in_fence = False
     for line in md.split("\n"):
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
+        if line.lstrip().startswith(("```", "~~~")):
             in_fence = not in_fence
             out.append(line)
             continue
@@ -82,6 +79,28 @@ def demote_headings(md: str, levels: int) -> str:
         if m and not in_fence:
             hashes = "#" * min(6, len(m.group(1)) + levels)
             out.append(hashes + m.group(2))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def neutralize_fence_headings(md: str) -> str:
+    r"""Space-prefix ``#``/``##`` lines that live *inside* fenced code blocks.
+
+    The bundled viewer's section splitter is not fence-aware: a shell comment like
+    ``# Inspect health.`` inside a ```` ```bash ```` block starts with ``# `` and would be
+    treated as a heading, spawning a junk nav section. A single leading space stops the
+    ``^#{1,2}\s`` match while the code still renders verbatim. Real headings live outside
+    fences and are untouched.
+    """
+    out: list[str] = []
+    in_fence = False
+    for line in md.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+            out.append(line)
+        elif in_fence and re.match(r"^#{1,2}\s", line):
+            out.append(" " + line)
         else:
             out.append(line)
     return "\n".join(out)
@@ -102,6 +121,17 @@ def strip_status_line(md: str) -> str:
         if line.startswith("## "):  # reached the first section; nothing to strip
             break
     return "\n".join(lines)
+
+
+def strip_h1(md: str) -> str:
+    """Drop the leading ``# …`` title line (and any blank lines above it)."""
+    lines = md.split("\n")
+    i = 0
+    while i < len(lines) and lines[i].strip() == "":
+        i += 1
+    if i < len(lines) and re.match(r"^# ", lines[i]):
+        del lines[i]
+    return "\n".join(lines).strip("\n")
 
 
 def short_title(h1: str) -> str:
@@ -162,55 +192,87 @@ def collect_plans() -> list[dict]:
     return plans
 
 
-def build_plan_doc_md(plan: dict) -> str:
-    """Concatenate PLAN + DECISIONS + RESEARCH + tasks into one doc's Markdown."""
-    parts = [plan["plan_text"].rstrip()]
+def plan_state(plan: dict) -> str:
+    if not plan["archived"]:
+        return "active"
+    return f"archived · {plan['date']}" if plan["date"] else "archived"
+
+
+def plan_section_md(plan: dict) -> str:
+    """Render one plan as a single ``## Plan X.Y`` section to nest inside its epic doc.
+
+    All of the plan's own headings are demoted beneath this ``##`` so the whole plan stays
+    in one navigable section: PLAN.md becomes h3 groups, with the decision log, research
+    notes, and task breakdown grouped under their own h3 sub-headings.
+    """
     d = plan["dir"]
+    out = [f"## Plan {plan['phase']} — {plan['short']}  ·  {plan_state(plan)}", ""]
+    # PLAN.md: drop its redundant '# Plan: …' line, demote '##' -> '###'.
+    out.append(demote_headings(strip_h1(plan["plan_text"]), 1))
 
     decisions = d / "DECISIONS.md"
     if decisions.exists():
-        parts.append(demote_headings(read(decisions).strip(), 1))
+        out += ["", "### Decision log", "", demote_headings(strip_h1(read(decisions)), 2)]
 
     research = d / "RESEARCH.md"
     if research.exists():
-        parts.append(demote_headings(read(research).strip(), 1))
+        out += ["", "### Research notes", "", demote_headings(strip_h1(read(research)), 2)]
 
     tasks_dir = d / "tasks"
     if tasks_dir.is_dir():
         task_files = sorted(tasks_dir.glob("*.md"))
         if task_files:
-            chunks = ["## Task details", ""]
-            # Demote two levels so every task sits *under* the single "Task details"
-            # section as an h3 group (its sub-headings become h4) rather than spawning
-            # one nav section per task.
-            chunks += [demote_headings(read(t).strip(), 2) for t in task_files]
-            parts.append("\n\n".join(chunks))
+            out += ["", "### Task breakdown", ""]
+            # Demote +3 (keeping each task's '# TASK-NNN' title as an h4) so tasks sit
+            # under "Task breakdown" without spawning their own nav sections.
+            out += [demote_headings(read(t).strip(), 3) for t in task_files]
 
-    return "\n\n".join(parts)
+    return "\n".join(out)
 
 
-def related_plans_md(epic_num: int, plans: list[dict]) -> str:
-    """A '## Related plans' section linking an epic to its plan docs (cross-doc links)."""
-    mine = [p for p in plans if p["epic"] == epic_num]
-    lines = ["## Related plans", ""]
-    if not mine:
-        lines.append("_No plans recorded yet._")
-        return "\n".join(lines)
-    for p in mine:
-        if p["archived"]:
-            state = f"archived · {p['date']}" if p["date"] else "archived"
-        else:
-            state = "active"
-        # `{slug}.md` resolves to the plan doc via the viewer's auto-registered slug map.
-        lines.append(f"- [Phase {p['phase']} — {p['short']}]({p['slug']}.md) — {state}")
-    return "\n".join(lines)
+def split_top_sections(body: str) -> list[str]:
+    """Split an epic body into chunks at each ``## `` heading, ignoring fenced code."""
+    chunks: list[str] = []
+    cur: list[str] = []
+    in_fence = False
+    for line in body.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and re.match(r"^## ", line):
+            chunks.append("\n".join(cur))
+            cur = []
+        cur.append(line)
+    chunks.append("\n".join(cur))
+    return chunks
+
+
+def nest_plans_into_epic(epic_body: str, epic_num: int, plans: list[dict]) -> str:
+    """Insert each plan as a section right after its matching ``## Phase X.Y`` section.
+
+    Plans whose phase has no matching phase heading are appended at the end.
+    """
+    mine = {(p["maj"], p["min"]): p for p in plans if p["epic"] == epic_num}
+    out: list[str] = []
+    used: set[tuple[int, int]] = set()
+    for chunk in split_top_sections(epic_body):
+        out.append(chunk.rstrip())
+        m = re.match(r"^## Phase (\d+)\.(\d+)\b", chunk)
+        if m:
+            key = (int(m.group(1)), int(m.group(2)))
+            if key in mine:
+                out.append(plan_section_md(mine[key]))
+                used.add(key)
+    for key in sorted(mine):
+        if key not in used:
+            out.append(plan_section_md(mine[key]))
+    return "\n\n".join(c for c in out if c.strip())
 
 
 def doc_block(slug: str, title: str, sub: str, file_hint: str, md: str) -> str:
     return (
         f'<script type="text/markdown" data-slug="{attr(slug)}" data-title="{attr(title)}"'
         f' data-sub="{attr(sub)}" data-file="{attr(file_hint)}">\n'
-        f"{embed_safe(md)}\n"
+        f"{embed_safe(neutralize_fence_headings(md))}\n"
         f"</script>"
     )
 
@@ -229,7 +291,7 @@ def build_docs(epics_meta: dict[int, dict], plans: list[dict]) -> list[str]:
         )
     )
 
-    # --- One doc per epic, in number order ---
+    # --- One doc per epic, with its plans nested as sections under each phase ---
     for path in sorted(EPICS_DIR.glob("*.md")):
         prefix = re.match(r"(\d+)", path.name)
         if not prefix:
@@ -239,9 +301,14 @@ def build_docs(epics_meta: dict[int, dict], plans: list[dict]) -> list[str]:
         title = meta.get("title") or path.stem
         status = meta.get("status", "")
         phases = meta.get("phases", "")
-        sub = " · ".join(x for x in (status, f"{phases} phases" if phases else "") if x)
+        n_plans = sum(1 for p in plans if p["epic"] == num)
+        sub = " · ".join(
+            x
+            for x in (status, f"{phases} phases" if phases else "", f"{n_plans} plans" if n_plans else "")
+            if x
+        )
         body = strip_status_line(read(path)).rstrip()
-        md = body + "\n\n---\n\n" + related_plans_md(num, plans)
+        md = nest_plans_into_epic(body, num, plans)
         blocks.append(
             doc_block(
                 slug=f"e{num:02d}",
@@ -249,22 +316,6 @@ def build_docs(epics_meta: dict[int, dict], plans: list[dict]) -> list[str]:
                 sub=sub,
                 file_hint=path.name,
                 md=md,
-            )
-        )
-
-    # --- One doc per plan (active first within each epic, by phase) ---
-    for p in plans:
-        if p["archived"]:
-            sub = f"archived · {p['date']}" if p["date"] else "archived"
-        else:
-            sub = "active"
-        blocks.append(
-            doc_block(
-                slug=p["slug"],
-                title=f"Plan {p['phase']} — {p['short']}",
-                sub=sub,
-                file_hint=f"{p['dir'].name}.md",
-                md=build_plan_doc_md(p),
             )
         )
 
@@ -284,7 +335,7 @@ def main() -> None:
         "{{TITLE}}": "rag-recipes · Epics & Plans",
         "{{BRAND_KICK}}": "rag-recipes backend",
         "{{BRAND_TITLE}}": "Implementation<br>Epics &amp; Plans",
-        "{{BRAND_SUB}}": f"{len(epics_meta)} epics · {n_active} active · {n_arch} archived plans",
+        "{{BRAND_SUB}}": f"{len(epics_meta)} epics · {len(plans)} plans nested",
         "{{STORAGE_KEY}}": STORAGE_KEY,
         "{{EXPORT_SLUG}}": EXPORT_SLUG,
         "{{EXPORT_TITLE}}": EXPORT_TITLE,
@@ -303,8 +354,8 @@ def main() -> None:
     OUTPUT.write_text(template, encoding="utf-8")
 
     print(f"Wrote {OUTPUT.relative_to(ROOT)}")
-    print(f"  docs embedded : {len(blocks)} (1 overview + {len(epics_meta)} epics + {len(plans)} plans)")
-    print(f"  plans         : {n_active} active, {n_arch} archived")
+    print(f"  docs embedded : {len(blocks)} (1 overview + {len(epics_meta)} epics)")
+    print(f"  plans nested  : {len(plans)} ({n_active} active, {n_arch} archived) under their epics")
     print(f"  size          : {OUTPUT.stat().st_size / 1024:.0f} KiB")
 
 
