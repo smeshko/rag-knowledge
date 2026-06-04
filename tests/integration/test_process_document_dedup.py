@@ -24,6 +24,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from rag_recipes.config import get_settings
+from rag_recipes.ingestion import jobs as jobs_module
 from rag_recipes.ingestion.jobs import process_document
 from rag_recipes.ingestion.pipeline.extraction import (
     PROMPT_VERSION,
@@ -337,6 +338,110 @@ async def test_staging_candidates_not_visible_as_final_before_finalize(
                 select(Document.last_progress_at).where(Document.id == document_id)
             )
             assert last_progress_at is not None
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
+async def test_resume_after_interrupt_skips_done_windows_one_deduped_set(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-driven job resumes from extracting_items and dedups to one set.
+
+    Simulates an interrupted (not failed) run: the first invocation commits both
+    windows' batches, then crashes *before* finalize (patched), leaving the doc
+    in ``extracting_items`` with committed staging rows + ``ExtractionRun``s. The
+    second invocation re-enters at ``extracting_items``, skips both already-done
+    windows via the ``input_hash`` skip set (no new runs, no duplicate
+    candidates), and finalizes the previously-committed staging rows to exactly
+    one deduplicated item at ``creating_chunks`` (Phase 9.5 acceptance;
+    DECISIONS #2).
+    """
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+
+    real_finalize = jobs_module._finalize_extraction
+    calls = {"n": 0}
+
+    async def _flaky_finalize(*args: object, **kwargs: object) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("crash before finalize")
+        return await real_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs._finalize_extraction", _flaky_finalize
+    )
+
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans = _build_spans(document_id)
+        async with session_factory() as session:
+            session.add_all(spans)
+            await session.commit()
+
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+        provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low): _recipe_output(
+                    cited_span_id="span_p3", overall=0.6
+                ),
+                _request_hash_for(window_high): _recipe_output(
+                    cited_span_id="span_p3", overall=0.9
+                ),
+            }
+        )
+        ctx = _ctx(session_factory, provider, tmp_path)
+
+        # First invocation: batches commit, then finalize crashes.
+        with pytest.raises(RuntimeError, match="crash before finalize"):
+            await process_document(ctx, document_id)
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.EXTRACTING_ITEMS
+            runs_after_first = await session.scalar(
+                select(func.count())
+                .select_from(ExtractionRun)
+                .where(ExtractionRun.document_id == document_id)
+            )
+            assert runs_after_first == 2  # both windows extracted and committed
+
+        # Second invocation: resumes, skips both done windows, finalizes.
+        result = await process_document(ctx, document_id)
+        assert result == 1
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.CREATING_CHUNKS
+
+            items = (
+                await session.execute(
+                    select(KnowledgeItem).where(
+                        KnowledgeItem.document_id == document_id
+                    )
+                )
+            ).scalars().all()
+            # Exactly one deduped survivor — the higher-scored (0.9) capture.
+            assert len(items) == 1
+            assert items[0].normalized_title == "tomato soup"
+            assert items[0].confidence is not None
+            assert items[0].confidence["overall"] == pytest.approx(0.9)
+
+            # Skip set held: no duplicate ExtractionRun minted on resume.
+            run_count = await session.scalar(
+                select(func.count())
+                .select_from(ExtractionRun)
+                .where(ExtractionRun.document_id == document_id)
+            )
+            assert run_count == 2
     finally:
         await _cleanup(session_factory, document_id, asset_id)
 

@@ -30,6 +30,8 @@ from rag_recipes.ingestion.pipeline.dedup import (
     select_best,
 )
 from rag_recipes.ingestion.pipeline.extraction import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
     RecipeExtractionOutput,
     run_extraction,
 )
@@ -38,7 +40,11 @@ from rag_recipes.ingestion.pipeline.pdf_text import (
     extract_and_persist_spans,
 )
 from rag_recipes.ingestion.pipeline.persist import persist_knowledge_item
-from rag_recipes.ingestion.pipeline.windows import Window, build_windows
+from rag_recipes.ingestion.pipeline.windows import (
+    Window,
+    build_windows,
+    compute_input_hash,
+)
 from rag_recipes.ingestion.queue import _build_redis_settings
 from rag_recipes.ingestion.status import (
     InvalidTransitionError,
@@ -193,6 +199,24 @@ async def _run_extraction_batches(
     """
     async with session_factory() as session:
         spans = await _load_ordered_spans(session, document_id)
+        # Resume skip set (DECISIONS #2): the input_hashes that already have a
+        # committed ExtractionRun for this (document_id, source_version). Keyed on
+        # the committed audit fact — what survived a prior batch commit — so a
+        # re-driven job never re-extracts (and never re-persists a duplicate
+        # candidate for) a window it already finished. Robust to run_extraction
+        # minting an extra run on its cross-document SUCCESS cache hit.
+        done_hashes = set(
+            (
+                await session.execute(
+                    select(ExtractionRun.input_hash).where(
+                        ExtractionRun.document_id == document_id,
+                        ExtractionRun.source_version == 1,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
     windows = build_windows(
         spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
     )
@@ -200,6 +224,11 @@ async def _run_extraction_batches(
     for batch in _chunked(windows, settings.extraction_commit_batch_size):
         async with session_factory() as session:
             for window in batch:
+                if compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION) in done_hashes:
+                    # Already extracted in a prior (interrupted) invocation; its
+                    # staging candidates are committed and finalize reads them
+                    # from the DB, so skip the provider/DB work entirely.
+                    continue
                 run = await run_extraction(
                     session,
                     window,
@@ -350,6 +379,34 @@ async def _finalize_extraction(
         return len(chosen)
 
 
+async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
+    """Decide how to (re-)enter ``process_document`` from the document's status.
+
+    Returns ``"fresh"`` for a ``QUEUED`` doc (run text → spans → extraction),
+    ``"resume"`` for one already in ``EXTRACTING_ITEMS`` (a re-driven job after a
+    kill/timeout — skip straight to the idempotent window loop, which the
+    ``input_hash`` skip set makes safe), or ``"skip"`` for any other status (a
+    duplicate delivery of an in-flight or completed doc; the caller no-ops rather
+    than risk flipping a good row to FAILED). Raises ``LookupError`` when the
+    document does not exist.
+    """
+    status = await session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    if status is None:
+        raise LookupError(f"Document not found: {document_id}")
+    if status is DocumentStatus.QUEUED:
+        return "fresh"
+    if status is DocumentStatus.EXTRACTING_ITEMS:
+        return "resume"
+    logger.info(
+        "process_document skipping %s: status is %s, not resumable",
+        document_id,
+        status.value,
+    )
+    return "skip"
+
+
 async def process_document(
     ctx: dict[str, Any],
     document_id: str,
@@ -372,42 +429,38 @@ async def process_document(
         storage = LocalFileStorage(Path(settings.local_storage_root))
         extractor = PyMuPdfExtractor(min_text_chars=settings.pdf_min_text_chars_for_page)
         try:
+            # Idempotency / resume guard against duplicate or re-driven delivery.
+            # A QUEUED doc runs the full fresh path; one already in
+            # EXTRACTING_ITEMS is a re-driven job (kill/timeout) and resumes
+            # straight into the idempotent window loop; any other status no-ops
+            # (an in-flight or completed doc is the stuck-job cron's concern, not
+            # a re-delivery's — flipping a good row to FAILED would be worse).
             async with session_factory() as session:
-                # Idempotency guard against duplicate / manual re-enqueue. A
-                # second delivery for a document that's already past QUEUED
-                # would raise InvalidTransitionError on the first transition
-                # below, and the except block would then mark_failed — and
-                # since CREATING_SOURCE_SPANS -> FAILED is a legal edge, a
-                # *successfully processed* document would be silently flipped
-                # to FAILED. No-op instead: an in-flight or wedged doc is the
-                # stuck-job cron's responsibility, not a re-delivery's.
-                status = await session.scalar(
-                    select(Document.status).where(Document.id == document_id)
-                )
-                if status is None:
-                    raise LookupError(f"Document not found: {document_id}")
-                if status is not DocumentStatus.QUEUED:
-                    logger.info(
-                        "process_document skipping %s: status is %s, not queued",
-                        document_id,
-                        status.value,
-                    )
+                entry = await _resume_or_fresh(session, document_id)
+                if entry == "skip":
                     return 0
-                await transition_to(session, document_id, DocumentStatus.EXTRACTING_TEXT)
-                await session.commit()
-            async with session_factory() as session:
-                spans_count = await extract_and_persist_spans(
-                    session,
-                    document_id=document_id,
-                    source_version=1,
-                    extractor=extractor,
-                    storage=storage,
+                if entry == "fresh":
+                    await transition_to(
+                        session, document_id, DocumentStatus.EXTRACTING_TEXT
+                    )
+                    await session.commit()
+
+            if entry == "fresh":
+                async with session_factory() as session:
+                    spans_count = await extract_and_persist_spans(
+                        session,
+                        document_id=document_id,
+                        source_version=1,
+                        extractor=extractor,
+                        storage=storage,
+                    )
+                    await transition_to(
+                        session, document_id, DocumentStatus.CREATING_SOURCE_SPANS
+                    )
+                    await session.commit()
+                logger.debug(
+                    "process_document %s: persisted %d spans", document_id, spans_count
                 )
-                await transition_to(
-                    session, document_id, DocumentStatus.CREATING_SOURCE_SPANS
-                )
-                await session.commit()
-            logger.debug("process_document %s: persisted %d spans", document_id, spans_count)
 
             # --- LLM extraction → validate → persist → dedup → chunks signal ---
             # Provider seam (mirrors 8.1's in-job extractor/storage construction):
@@ -416,12 +469,20 @@ async def process_document(
                 settings, observability
             )
 
-            # Session #3: short-lived transition-only scope. Releases the row lock
-            # before the (slow) LLM stage and marks the doc as in extraction so the
-            # stuck-job cron sees progress.
-            async with session_factory() as session:
-                await transition_to(session, document_id, DocumentStatus.EXTRACTING_ITEMS)
-                await session.commit()
+            if entry == "fresh":
+                # Session #3: short-lived transition-only scope. Releases the row
+                # lock before the (slow) LLM stage and marks the doc as in
+                # extraction so the stuck-job cron sees progress. On resume the doc
+                # is already in EXTRACTING_ITEMS, so this transition is skipped.
+                async with session_factory() as session:
+                    await transition_to(
+                        session, document_id, DocumentStatus.EXTRACTING_ITEMS
+                    )
+                    await session.commit()
+            else:
+                logger.info(
+                    "resuming extraction for %s from extracting_items", document_id
+                )
 
             # Phase 9.5: extract every window committing per batch (durable,
             # heartbeated progress; DECISIONS #4), then promote the staged
@@ -493,7 +554,7 @@ _SETTINGS = get_settings()
 
 
 class WorkerSettings:
-    functions = [ping_job, arq_func(process_document, name="process_document", max_tries=1)]
+    functions = [ping_job, arq_func(process_document, name="process_document", max_tries=3)]
     cron_jobs = [
         cron(
             sweep_stuck_jobs,
