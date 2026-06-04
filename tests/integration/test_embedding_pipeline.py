@@ -11,11 +11,14 @@ new row per chunk.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rag_recipes.ingestion.jobs import _embed_document_chunks
 from rag_recipes.ingestion.pipeline.chunking import persist_chunks_for_ready_items
 from rag_recipes.ingestion.pipeline.embedding import embed_chunks, re_embed_for_model
 from rag_recipes.ingestion.pipeline.extraction import PROMPT_VERSION, SCHEMA_VERSION
@@ -34,6 +37,7 @@ from rag_recipes.storage.enums import (
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
+from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.repositories.documents import DocumentRepository
@@ -267,3 +271,56 @@ async def test_embed_chunks_failure_persists_nothing(
 
     # embed_chunks raises before the upsert, so no rows were written for this run.
     assert await _count_embeddings(db_session, chunk_ids) == 0
+
+
+def _single_session_factory(session: AsyncSession):  # type: ignore[no-untyped-def]
+    """Yield the savepoint ``db_session`` to the stage and suppress its commit."""
+
+    @asynccontextmanager
+    async def _factory() -> AsyncIterator[AsyncSession]:
+        original = session.commit
+        session.commit = _noop  # type: ignore[method-assign]
+        try:
+            yield session
+        finally:
+            session.commit = original  # type: ignore[method-assign]
+
+    async def _noop() -> None:
+        return None
+
+    return _factory
+
+
+async def test_embed_stage_advances_stuck_job_heartbeat(
+    db_session: AsyncSession,
+) -> None:
+    # Review #1: EMBEDDING_CHUNKS is no longer sweep-exempt, so the embedding stage
+    # must advance last_progress_at — otherwise a long-but-healthy run with a stale
+    # extraction heartbeat would be reaped. Seed a stale heartbeat, run the stage,
+    # and assert it moved forward.
+    document_id, _ = await _seed_document_with_chunks(db_session)
+    await db_session.execute(
+        text(
+            "UPDATE documents SET last_progress_at = now() - make_interval(mins => 120) "
+            "WHERE id = :id"
+        ),
+        {"id": document_id},
+    )
+    await db_session.flush()
+    stale = await db_session.scalar(
+        select(Document.last_progress_at).where(Document.id == document_id)
+    )
+
+    await _embed_document_chunks(
+        _single_session_factory(db_session),
+        document_id=document_id,
+        provider=FakeEmbeddingProvider(),
+        batch_size=100,
+    )
+
+    db_session.expire_all()
+    document = await db_session.get(Document, document_id)
+    assert document is not None
+    assert document.status == DocumentStatus.EMBEDDING_CHUNKS
+    assert document.last_progress_at is not None
+    assert document.last_progress_at > stale

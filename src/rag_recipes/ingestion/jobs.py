@@ -418,6 +418,15 @@ async def _finalize_extraction(
         chunk_count = await persist_chunks_for_ready_items(
             session, document_id=document_id, category=doc.category
         )
+        # Advance the stuck-job heartbeat: the post-extraction stages
+        # (chunking/embedding/indexing) are no longer sweep-exempt, so each must
+        # report progress or a long-but-healthy run would be reaped on the stale
+        # last_progress_at frozen at the final extraction batch (review #1).
+        await session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(last_progress_at=func.now())
+        )
         logger.info("created %d chunks for %s", chunk_count, document_id)
         await session.commit()
         return len(chosen)
@@ -456,6 +465,14 @@ async def _embed_document_chunks(
             provider=provider,
             batch_size=batch_size,
             trace_context=TraceContext(session_id=document_id),
+        )
+        # Advance the stuck-job heartbeat (see _finalize_extraction): EMBEDDING_CHUNKS
+        # is no longer sweep-exempt, so a freshly-embedded document must carry a fresh
+        # last_progress_at or the sweep would reap it on the stale extraction heartbeat.
+        await session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(last_progress_at=func.now())
         )
         await session.commit()
     logger.info("embedded %d chunks for %s", len(embeddings), document_id)
