@@ -18,30 +18,52 @@ from typing import Any
 
 from arq.cron import cron
 from arq.worker import func
-from sqlalchemy import select
+from sqlalchemy import Integer, cast, delete, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.config import Settings, get_settings
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
+from rag_recipes.ingestion.pipeline.dedup import (
+    CandidateRef,
+    compute_candidate_score,
+    select_best,
+)
+from rag_recipes.ingestion.pipeline.extraction import (
+    RecipeExtractionOutput,
+    run_extraction,
+)
 from rag_recipes.ingestion.pipeline.pdf_text import (
     EmptyPdfError,
     extract_and_persist_spans,
 )
+from rag_recipes.ingestion.pipeline.persist import persist_knowledge_item
+from rag_recipes.ingestion.pipeline.windows import build_windows
 from rag_recipes.ingestion.queue import _build_redis_settings
 from rag_recipes.ingestion.status import (
     InvalidTransitionError,
     mark_failed,
     transition_to,
 )
+from rag_recipes.ingestion.validation import HardValidationError
 from rag_recipes.providers._observability import (
     ProviderObservability,
     build_provider_observability,
 )
-from rag_recipes.providers.errors import FileStorageError, PdfExtractionError
+from rag_recipes.providers.errors import (
+    FileStorageError,
+    LLMTechnicalError,
+    PdfExtractionError,
+)
 from rag_recipes.providers.file_storage.local import LocalFileStorage
+from rag_recipes.providers.llm.base import LLMProvider
+from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
-from rag_recipes.storage.enums import DocumentStatus
+from rag_recipes.storage.enums import DocumentStatus, ExtractionRunStatus
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
+from rag_recipes.storage.models.source_span import SourceSpan
+from rag_recipes.storage.repositories.documents import DocumentRepository
 from rag_recipes.storage.session import build_engine, build_session_factory
 
 logger = logging.getLogger(__name__)
@@ -91,6 +113,7 @@ _REASON_FOR: dict[type[Exception], str] = {
     EmptyPdfError: "pdf_empty",
     PdfExtractionError: "pdf_extraction_failed",
     FileStorageError: "file_storage_error",
+    LLMTechnicalError: "llm_extraction_failed",
     IntegrityError: "duplicate_span_constraint",
     LookupError: "document_or_asset_not_found",
     InvalidTransitionError: "invalid_status_transition",
@@ -102,6 +125,39 @@ def _reason_for(exc: BaseException) -> str:
         if isinstance(exc, cls):
             return reason
     return "unknown_error"
+
+
+def _build_llm_provider(
+    settings: Settings, observability: ProviderObservability | None
+) -> LLMProvider:
+    """Construct the production LLM provider from settings.
+
+    Mirrors how 8.1 builds ``PyMuPdfExtractor`` / ``LocalFileStorage`` in-job; the
+    seam lets an integration test substitute a ``FakeLLMProvider`` via
+    ``ctx["llm_provider"]`` without a real API key.
+    """
+    return OpenAILLMProvider(
+        settings.openai_api_key,
+        default_model=settings.llm_model,
+        observability=observability,
+    )
+
+
+async def _load_ordered_spans(session: AsyncSession, document_id: str) -> list[SourceSpan]:
+    """Load a document's v1 SourceSpans ordered by page_start (build_windows' contract).
+
+    ``page_start`` lives in the JSONB ``locator``; the ``->>`` accessor returns
+    text, cast to int so the ordering is numeric (page 10 after page 9, not before).
+    """
+    result = await session.execute(
+        select(SourceSpan)
+        .where(
+            SourceSpan.document_id == document_id,
+            SourceSpan.source_version == 1,
+        )
+        .order_by(cast(SourceSpan.locator["page_start"].astext, Integer))
+    )
+    return list(result.scalars().all())
 
 
 async def process_document(
@@ -161,11 +217,126 @@ async def process_document(
                     session, document_id, DocumentStatus.CREATING_SOURCE_SPANS
                 )
                 await session.commit()
-            return spans_count
+            logger.debug("process_document %s: persisted %d spans", document_id, spans_count)
+
+            # --- LLM extraction → validate → persist → dedup → chunks signal ---
+            # Provider seam (mirrors 8.1's in-job extractor/storage construction):
+            # tests inject ctx["llm_provider"]; production builds OpenAI from settings.
+            provider: LLMProvider = ctx.get("llm_provider") or _build_llm_provider(
+                settings, observability
+            )
+
+            # Session #3: short-lived transition-only scope. Releases the row lock
+            # before the (slow) LLM stage and marks the doc as in extraction so the
+            # stuck-job cron sees progress (DECISIONS #5).
+            async with session_factory() as session:
+                await transition_to(session, document_id, DocumentStatus.EXTRACTING_ITEMS)
+                await session.commit()
+
+            # Session #4: ONE transaction (DECISIONS #5). Extract every window,
+            # persist + score each candidate, select one winner per recipe, prune
+            # the losers, run the (v1 no-op) supersede hook, then advance through
+            # validating_items to creating_chunks. Atomic so no reader ever sees a
+            # half-deduplicated document or a chunks-ready signal with losers still
+            # present.
+            async with session_factory() as session:
+                spans = await _load_ordered_spans(session, document_id)
+                windows = build_windows(
+                    spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
+                )
+                candidates: list[CandidateRef] = []
+                run_ids: set[str] = set()
+                for window in windows:
+                    run = await run_extraction(
+                        session,
+                        window,
+                        source_version=1,
+                        document_id=document_id,
+                        provider=provider,
+                        observability=observability,
+                    )
+                    run_ids.add(run.id)
+                    if (
+                        run.status is not ExtractionRunStatus.SUCCESS
+                        or run.output_json is None
+                    ):
+                        continue
+                    parsed = RecipeExtractionOutput.model_validate(run.output_json)
+                    for extracted in parsed.items:
+                        try:
+                            item = await persist_knowledge_item(
+                                session,
+                                extracted,
+                                extraction_run_id=run.id,
+                                document_id=document_id,
+                                source_version=1,
+                                window=window,
+                            )
+                        except HardValidationError as exc:
+                            # Per-candidate rejection: persist no row, never fail the
+                            # document (9.3 DECISIONS #3). Log and move on.
+                            logger.info(
+                                "dropping hard-invalid candidate for %s: %s",
+                                document_id,
+                                exc,
+                            )
+                            continue
+                        candidates.append(
+                            CandidateRef(
+                                item_id=item.id,
+                                normalized_title=item.normalized_title,
+                                candidate_score=compute_candidate_score(
+                                    extracted, window_span_ids=window.span_ids
+                                ),
+                                extraction_run_id=run.id,
+                            )
+                        )
+
+                chosen, discarded = select_best(candidates)
+                logger.info(
+                    "dedup for %s: %d candidates, %d chosen, %d discarded",
+                    document_id,
+                    len(candidates),
+                    len(chosen),
+                    len(discarded),
+                )
+                # Log each discard before pruning (observability, DECISIONS #6).
+                for ref in discarded:
+                    logger.info(
+                        "dedup discard for %s: item=%s title=%r score=%.4f",
+                        document_id,
+                        ref.item_id,
+                        ref.normalized_title,
+                        ref.candidate_score,
+                    )
+                if discarded:
+                    await session.execute(
+                        delete(KnowledgeItem).where(
+                            KnowledgeItem.id.in_([ref.item_id for ref in discarded])
+                        )
+                    )
+
+                # Supersede hook: no-op for first extraction (the keep-set covers
+                # every run from this pass, so nothing older matches). Epic 10.3 /
+                # Epic 11 are the real consumers (DECISIONS #4).
+                await DocumentRepository(session).supersede_prior_items(
+                    document_id, keep_extraction_run_ids=run_ids
+                )
+
+                await transition_to(
+                    session, document_id, DocumentStatus.VALIDATING_ITEMS
+                )
+                await transition_to(
+                    session, document_id, DocumentStatus.CREATING_CHUNKS
+                )
+                await session.commit()
+
+            return len(chosen)
         except (
             EmptyPdfError,
             PdfExtractionError,
             FileStorageError,
+            LLMTechnicalError,
             IntegrityError,
             LookupError,
             InvalidTransitionError,

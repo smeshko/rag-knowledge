@@ -27,9 +27,13 @@ from rag_recipes.api.dependencies import get_arq_redis, get_file_storage, get_se
 from rag_recipes.config import get_settings
 from rag_recipes.ingestion.jobs import process_document
 from rag_recipes.providers.file_storage.local import LocalFileStorage
+from rag_recipes.providers.llm.fake import FakeLLMProvider
+from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from rag_recipes.storage.enums import DocumentStatus
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
 from rag_recipes.storage.repositories.failures import FailuresRepository
@@ -39,6 +43,19 @@ from tests.integration.conftest import AUTH_HEADERS
 pytestmark = pytest.mark.asyncio
 
 _FIXTURE = Path("data/fixtures/pdfs/sample_recipe.pdf")
+
+# A canned "no recipe parsed" rejection (output_json=None) for every window, so
+# the burst-worker tests — which exercise span extraction + status flow, not
+# extraction quality — drive the LLM stage to zero candidates without a real
+# OpenAI call. The doc still advances through the dedup stage to CREATING_CHUNKS.
+_REJECT_RESPONSE = StructuredOutputResponse(
+    output_json=None,
+    parse_error="no recipe in fixture",
+    raw_text="",
+    usage=TokenUsage(input_tokens=0, output_tokens=0),
+    provider="fake",
+    model="fake-model",
+)
 
 
 class _EmptyExtractor:
@@ -81,6 +98,9 @@ async def _upload_and_run_worker(
     async def _startup(ctx: dict[str, Any]) -> None:
         ctx["settings"] = settings
         ctx["session_factory"] = session_factory
+        # Inject a benign fake so the extended pipeline's LLM stage makes no real
+        # OpenAI call; it rejects every window, leaving zero candidates.
+        ctx["llm_provider"] = FakeLLMProvider(default_output=_REJECT_RESPONSE)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -126,6 +146,14 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
                 IngestionFailure.document_id == ids["document_id"]
             )
         )
+        # The extended pipeline writes knowledge_items + extraction_runs that FK to
+        # the document (no ON DELETE CASCADE); drop them before the document.
+        await session.execute(
+            delete(KnowledgeItem).where(KnowledgeItem.document_id == ids["document_id"])
+        )
+        await session.execute(
+            delete(ExtractionRun).where(ExtractionRun.document_id == ids["document_id"])
+        )
         await session.execute(delete(Document).where(Document.id == ids["document_id"]))
         await session.execute(delete(SourceAsset).where(SourceAsset.id == ids["asset_id"]))
         await session.commit()
@@ -150,7 +178,9 @@ async def test_process_document_writes_three_spans_and_transitions(
             status = await session.scalar(
                 select(Document.status).where(Document.id == ids["document_id"])
             )
-            assert status == DocumentStatus.CREATING_SOURCE_SPANS
+            # The pipeline now continues past spans through extraction + dedup;
+            # with the rejecting fake it ends at CREATING_CHUNKS (zero items).
+            assert status == DocumentStatus.CREATING_CHUNKS
 
             spans = (
                 await session.execute(
@@ -183,7 +213,8 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
     tmp_path: Path,
     override_settings_with_token: None,
 ) -> None:
-    # First run: the full happy path leaves the doc in CREATING_SOURCE_SPANS.
+    # First run: the full happy path now runs through extraction + dedup and
+    # leaves the doc in CREATING_CHUNKS.
     ids = await _upload_and_run_worker(
         test_engine=test_engine,
         redis_arq_settings=redis_arq_settings,
@@ -211,8 +242,9 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
         assert len(first_spans) == 3
 
         # A duplicate / manual re-delivery for the already-processed document
-        # must no-op rather than flip the successful CREATING_SOURCE_SPANS row
-        # to FAILED via the InvalidTransitionError -> mark_failed path.
+        # must no-op rather than flip the successful CREATING_CHUNKS row to
+        # FAILED via the InvalidTransitionError -> mark_failed path. (The guard
+        # short-circuits before the LLM stage, so this ctx needs no provider.)
         result = await process_document(ctx, ids["document_id"])
         assert result == 0
 
@@ -220,7 +252,7 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
             status = await session.scalar(
                 select(Document.status).where(Document.id == ids["document_id"])
             )
-            assert status == DocumentStatus.CREATING_SOURCE_SPANS
+            assert status == DocumentStatus.CREATING_CHUNKS
 
             spans = (
                 await session.execute(
