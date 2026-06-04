@@ -81,6 +81,10 @@ class KnowledgeItem(Base):
         ),
         nullable=False,
     )
+    # Phase 9.5 (DECISIONS #3): the dedup score computed at staging time, kept
+    # so select_best can run over committed rows in the separate finalize
+    # transaction. Nullable and ignored after finalize — purely a dedup signal.
+    candidate_score: Mapped[float | None] = mapped_column(sa.Double, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,

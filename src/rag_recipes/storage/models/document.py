@@ -63,6 +63,14 @@ class Document(Base):
     )
     last_reprocess_mode: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     last_reprocess_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # Phase 9.5 extraction heartbeat. Unlike updated_at (which bumps on any row
+    # write via onupdate), this advances only when a batch commits, so the
+    # progress-aware stuck-job sweep can tell a slow-but-healthy run from a hung
+    # one. No server_default / onupdate — the batch loop sets it explicitly.
+    last_progress_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,

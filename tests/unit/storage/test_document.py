@@ -39,6 +39,7 @@ def test_table_columns_match_doc_2() -> None:
         "status",
         "last_reprocess_mode",
         "last_reprocess_reason",
+        "last_progress_at",
         "created_at",
         "updated_at",
     ]
@@ -60,12 +61,23 @@ def test_nullable_columns() -> None:
     assert cols["active_source_version"].nullable is True
     assert cols["last_reprocess_mode"].nullable is True
     assert cols["last_reprocess_reason"].nullable is True
+    assert cols["last_progress_at"].nullable is True
 
 
 def test_reprocess_columns_default_to_none() -> None:
     doc = Document()
     assert doc.last_reprocess_mode is None
     assert doc.last_reprocess_reason is None
+
+
+def test_last_progress_at_defaults_to_none_with_no_server_default() -> None:
+    # The heartbeat must move only when a batch commits, so unlike updated_at
+    # it carries no server_default and no onupdate (Phase 9.5, DECISIONS #4).
+    doc = Document()
+    assert doc.last_progress_at is None
+    col = Document.__table__.columns["last_progress_at"]
+    assert col.server_default is None
+    assert col.onupdate is None
 
 
 def test_default_id_uses_doc_prefix() -> None:
