@@ -79,18 +79,36 @@ async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
                 < threshold
             )
         )
-        stuck: list[tuple[str, DocumentStatus]] = list(result.all())
+        stuck: list[str] = [doc_id for doc_id, _ in result.all()]
 
-        for doc_id, last_status in stuck:
+        for doc_id in stuck:
             try:
                 async with session.begin_nested():
+                    # The SELECT snapshot is stale. Between it and this row lock the
+                    # worker can advance the document — the atomic finalize commits
+                    # straight into CREATING_CHUNKS — or refresh its heartbeat. Re-read
+                    # the now-locked row and skip if it has become terminal, reached a
+                    # sweep-exempt resting state, or progressed past the threshold.
+                    # Without this, mark_failed only checks the transition is *legal*,
+                    # and EXTRACTING_ITEMS -> CREATING_CHUNKS -> FAILED is legal, so a
+                    # successfully chunked document could still be failed (review #3).
+                    doc = await session.get(Document, doc_id, with_for_update=True)
+                    if doc is None:
+                        continue
+                    last_progress = doc.last_progress_at or doc.updated_at
+                    if (
+                        doc.status in TERMINAL_STATUSES
+                        or doc.status in _SWEEP_EXEMPT_STATUSES
+                        or last_progress >= threshold
+                    ):
+                        continue
                     await mark_failed(
                         session,
                         doc_id,
                         reason="stuck_job_timeout",
                         metadata_json={
                             "timeout_minutes": timeout_minutes,
-                            "last_seen_status": last_status.value,
+                            "last_seen_status": doc.status.value,
                         },
                     )
                 count += 1
