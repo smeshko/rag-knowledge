@@ -26,11 +26,13 @@ from rag_recipes.api.app import app
 from rag_recipes.api.dependencies import get_arq_redis, get_file_storage, get_session
 from rag_recipes.config import get_settings
 from rag_recipes.ingestion.jobs import process_document
+from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from rag_recipes.storage.enums import DocumentStatus
 from rag_recipes.storage.models.chunk import Chunk
+from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
@@ -99,9 +101,11 @@ async def _upload_and_run_worker(
     async def _startup(ctx: dict[str, Any]) -> None:
         ctx["settings"] = settings
         ctx["session_factory"] = session_factory
-        # Inject a benign fake so the extended pipeline's LLM stage makes no real
-        # OpenAI call; it rejects every window, leaving zero candidates.
+        # Inject benign fakes so the extended pipeline's LLM + embedding stages make
+        # no real OpenAI call; the LLM fake rejects every window, leaving zero
+        # candidates (so zero chunks reach the embedding stage).
         ctx["llm_provider"] = FakeLLMProvider(default_output=_REJECT_RESPONSE)
+        ctx["embedding_provider"] = FakeEmbeddingProvider()
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -149,7 +153,15 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
         )
         # The extended pipeline writes knowledge_items + extraction_runs that FK to
         # the document (no ON DELETE CASCADE); drop them before the document. Chunks
-        # FK to knowledge_items (Phase 10.1), so drop those first of all.
+        # FK to knowledge_items (Phase 10.1) and chunk_embeddings FK to chunks
+        # (Phase 10.2), so drop embeddings, then chunks, first of all.
+        await session.execute(
+            delete(ChunkEmbedding).where(
+                ChunkEmbedding.chunk_id.in_(
+                    select(Chunk.id).where(Chunk.document_id == ids["document_id"])
+                )
+            )
+        )
         await session.execute(
             delete(Chunk).where(Chunk.document_id == ids["document_id"])
         )
@@ -183,9 +195,11 @@ async def test_process_document_writes_three_spans_and_transitions(
             status = await session.scalar(
                 select(Document.status).where(Document.id == ids["document_id"])
             )
-            # The pipeline now continues past spans through extraction + dedup;
-            # with the rejecting fake it ends at CREATING_CHUNKS (zero items).
-            assert status == DocumentStatus.CREATING_CHUNKS
+            # The pipeline now continues past spans through extraction + dedup +
+            # chunking + embedding; with the rejecting fake there are zero items
+            # (so zero chunks), but the embedding stage still advances the empty
+            # document to EMBEDDING_CHUNKS.
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
 
             spans = (
                 await session.execute(
@@ -247,7 +261,7 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
         assert len(first_spans) == 3
 
         # A duplicate / manual re-delivery for the already-processed document
-        # must no-op rather than flip the successful CREATING_CHUNKS row to
+        # must no-op rather than flip the successful EMBEDDING_CHUNKS row to
         # FAILED via the InvalidTransitionError -> mark_failed path. (The guard
         # short-circuits before the LLM stage, so this ctx needs no provider.)
         result = await process_document(ctx, ids["document_id"])
@@ -257,7 +271,7 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
             status = await session.scalar(
                 select(Document.status).where(Document.id == ids["document_id"])
             )
-            assert status == DocumentStatus.CREATING_CHUNKS
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
 
             spans = (
                 await session.execute(

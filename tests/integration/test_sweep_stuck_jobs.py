@@ -255,17 +255,17 @@ async def test_sweep_exempts_creating_source_spans_handoff_state(
     assert failures == []
 
 
-async def test_sweep_exempts_creating_chunks_handoff_state(
+async def test_sweep_exempts_embedding_chunks_handoff_state(
     db_session: AsyncSession,
 ) -> None:
-    # Phase 10.1 lands a successful document at CREATING_CHUNKS with its chunks
-    # committed atomically, then stops (the embedding consumer arrives in 10.2).
-    # Aged well past the timeout it must NOT be swept to FAILED — a chunked
-    # document is a success, not a stuck job (review round-2 #1).
+    # Phase 10.2 lands a successful document at EMBEDDING_CHUNKS with its embeddings
+    # committed atomically, then stops (the indexing/terminal transition arrives in
+    # 10.3). Aged well past the timeout it must NOT be swept to FAILED — an embedded
+    # document is a success, not a stuck job (review round-2 #1, carried to 10.2).
     document_id = await _make_document(
         db_session,
-        content_hash="sweep-handoff-chunks",
-        status=DocumentStatus.CREATING_CHUNKS,
+        content_hash="sweep-handoff-embedding",
+        status=DocumentStatus.EMBEDDING_CHUNKS,
     )
     await _backdate_updated_at(db_session, document_id, minutes_ago=120)
 
@@ -280,9 +280,41 @@ async def test_sweep_exempts_creating_chunks_handoff_state(
     status = await db_session.scalar(
         select(Document.status).where(Document.id == document_id)
     )
-    assert status == DocumentStatus.CREATING_CHUNKS
+    assert status == DocumentStatus.EMBEDDING_CHUNKS
     failures = await FailuresRepository(db_session).list_failures(document_id)
     assert failures == []
+
+
+async def test_sweep_reaps_creating_chunks_once_embedding_consumes_it(
+    db_session: AsyncSession,
+) -> None:
+    # Phase 10.2's embedding stage now consumes CREATING_CHUNKS, so it is no longer
+    # a resting state: a document wedged there past the timeout (crashed after
+    # chunking, before embedding) is genuinely stuck and must be swept to FAILED so
+    # it is visible for reprocessing — not silently exempt forever.
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-stuck-creating-chunks",
+        status=DocumentStatus.CREATING_CHUNKS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 1
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.FAILED
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert len(failures) == 1
+    assert failures[0].reason == "stuck_job_timeout"
+    assert failures[0].last_status == DocumentStatus.CREATING_CHUNKS
 
 
 async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
@@ -290,11 +322,11 @@ async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Race (review round-3 #1): the stale SELECT snapshots a document as
-    # EXTRACTING_ITEMS, but the worker commits the atomic finalize into
-    # CREATING_CHUNKS before the sweep takes the row lock. CREATING_CHUNKS ->
-    # FAILED is a legal transition, so without a re-check under the lock the sweep
-    # would fail a successfully chunked document. Simulate the advance by hooking
-    # the sweep's first locking ``get`` to flip the row just before it reads.
+    # EXTRACTING_ITEMS, but the worker advances it into the exempt resting state
+    # (EMBEDDING_CHUNKS after Phase 10.2) before the sweep takes the row lock.
+    # EMBEDDING_CHUNKS -> FAILED is a legal transition, so without a re-check under
+    # the lock the sweep would fail a successfully embedded document. Simulate the
+    # advance by hooking the sweep's first locking ``get`` to flip the row.
     document_id = await _make_document(
         db_session,
         content_hash="sweep-race-advance",
@@ -311,7 +343,7 @@ async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
             # Raw UPDATE (no onupdate bump) so the row stays stale-dated; only its
             # status advances, isolating the exempt-status guard from the heartbeat.
             await db_session.execute(
-                text("UPDATE documents SET status = 'creating_chunks' WHERE id = :id"),
+                text("UPDATE documents SET status = 'embedding_chunks' WHERE id = :id"),
                 {"id": document_id},
             )
         return await real_get(entity, ident, **kwargs)
@@ -329,7 +361,7 @@ async def test_sweep_rechecks_status_under_lock_against_concurrent_advance(
     db_session.expire_all()
     doc = await real_get(Document, document_id)
     assert doc is not None
-    assert doc.status == DocumentStatus.CREATING_CHUNKS
+    assert doc.status == DocumentStatus.EMBEDDING_CHUNKS
     failures = await FailuresRepository(db_session).list_failures(document_id)
     assert failures == []
 

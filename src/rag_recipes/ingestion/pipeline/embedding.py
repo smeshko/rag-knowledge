@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,7 +31,7 @@ from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
 
-__all__ = ["embed_chunks"]
+__all__ = ["embed_chunks", "re_embed_for_model"]
 
 
 def _batched(items: list[Chunk], size: int) -> Iterator[list[Chunk]]:
@@ -97,3 +98,32 @@ async def embed_chunks(
     rows = list(result.scalars().all())
     await session.flush()
     return rows
+
+
+async def re_embed_for_model(
+    session: AsyncSession,
+    document_id: str,
+    *,
+    provider: EmbeddingProvider,
+    batch_size: int,
+    trace_context: TraceContext | None = None,
+) -> list[ChunkEmbedding]:
+    """Ad-hoc/admin re-embed of every chunk for ``document_id`` (no API path).
+
+    Loads the document's ``Chunk`` rows and re-runs ``embed_chunks``. Because
+    ``embed_chunks`` upserts by ``(chunk_id, provider, model)``, re-running with
+    the configured provider/model replaces those rows in place, while a newly
+    configured model inserts a fresh row per chunk — the doc-2 § 6 / doc-5 § 7
+    re-embedding rule. For manual/admin use only; not exposed via the API.
+    """
+    result = await session.execute(
+        select(Chunk).where(Chunk.document_id == document_id)
+    )
+    chunks = list(result.scalars().all())
+    return await embed_chunks(
+        session,
+        chunks,
+        provider=provider,
+        batch_size=batch_size,
+        trace_context=trace_context,
+    )

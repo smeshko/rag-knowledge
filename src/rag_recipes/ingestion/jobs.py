@@ -30,6 +30,7 @@ from rag_recipes.ingestion.pipeline.dedup import (
     compute_candidate_score,
     select_best,
 )
+from rag_recipes.ingestion.pipeline.embedding import embed_chunks
 from rag_recipes.ingestion.pipeline.extraction import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
@@ -55,9 +56,13 @@ from rag_recipes.ingestion.status import (
 from rag_recipes.ingestion.validation import HardValidationError
 from rag_recipes.providers._observability import (
     ProviderObservability,
+    TraceContext,
     build_provider_observability,
 )
+from rag_recipes.providers.embeddings.base import EmbeddingProvider
+from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
 from rag_recipes.providers.errors import (
+    EmbeddingTechnicalError,
     FileStorageError,
     LLMTechnicalError,
     PdfExtractionError,
@@ -71,6 +76,7 @@ from rag_recipes.storage.enums import (
     ExtractionRunStatus,
     KnowledgeItemStatus,
 )
+from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
@@ -126,6 +132,7 @@ _REASON_FOR: dict[type[Exception], str] = {
     PdfExtractionError: "pdf_extraction_failed",
     FileStorageError: "file_storage_error",
     LLMTechnicalError: "llm_extraction_failed",
+    EmbeddingTechnicalError: "embedding_failed",
     IntegrityError: "duplicate_span_constraint",
     LookupError: "document_or_asset_not_found",
     InvalidTransitionError: "invalid_status_transition",
@@ -154,6 +161,25 @@ def _build_llm_provider(
         observability=observability,
         max_rate_limit_retries=settings.llm_max_rate_limit_retries,
         request_timeout=settings.llm_request_timeout_seconds,
+    )
+
+
+def _build_embedding_provider(
+    settings: Settings, observability: ProviderObservability | None
+) -> EmbeddingProvider:
+    """Construct the production embedding provider from settings.
+
+    Same in-job seam as ``_build_llm_provider``: tests inject
+    ``ctx["embedding_provider"]`` (a ``FakeEmbeddingProvider``); production builds
+    ``OpenAIEmbeddingProvider`` so ``trace_embedding`` batches are attributed to
+    the document's Langfuse session.
+    """
+    return OpenAIEmbeddingProvider(
+        settings.openai_api_key,
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dimensions,
+        batch_size=settings.embedding_batch_size,
+        observability=observability,
     )
 
 
@@ -397,6 +423,45 @@ async def _finalize_extraction(
         return len(chosen)
 
 
+async def _embed_document_chunks(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    document_id: str,
+    provider: EmbeddingProvider,
+    batch_size: int,
+) -> int:
+    """Embed the document's chunks (Phase 10.2): CREATING_CHUNKS → EMBEDDING_CHUNKS.
+
+    Transitions the document into ``EMBEDDING_CHUNKS`` and upserts one
+    ``ChunkEmbedding`` per chunk **in one transaction**, so the status flip and
+    the embedding rows commit atomically. On an ``EmbeddingTechnicalError`` mid-run
+    the whole transaction rolls back — the document stays in ``CREATING_CHUNKS``
+    with no embedding rows — and ``process_document``'s handler then marks it
+    ``FAILED`` (like every other technical failure). A committed ``EMBEDDING_CHUNKS``
+    document therefore always carries its embeddings; there is no exempt
+    resting state left half-embedded for a crash to expose. Leaves the document in
+    ``EMBEDDING_CHUNKS`` (the onward ``INDEXING``/terminal transition is Phase 10.3).
+    Returns the number of embeddings written. ``embed_chunks`` upserts on
+    ``(chunk_id, provider, model)``, so a replay is idempotent.
+    """
+    async with session_factory() as session:
+        await transition_to(session, document_id, DocumentStatus.EMBEDDING_CHUNKS)
+        result = await session.execute(
+            select(Chunk).where(Chunk.document_id == document_id)
+        )
+        chunks = list(result.scalars().all())
+        embeddings = await embed_chunks(
+            session,
+            chunks,
+            provider=provider,
+            batch_size=batch_size,
+            trace_context=TraceContext(session_id=document_id),
+        )
+        await session.commit()
+    logger.info("embedded %d chunks for %s", len(embeddings), document_id)
+    return len(embeddings)
+
+
 async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
     """Decide how to (re-)enter ``process_document`` from the document's status.
 
@@ -514,12 +579,31 @@ async def process_document(
                 provider=provider,
                 observability=observability,
             )
-            return await _finalize_extraction(session_factory, document_id=document_id)
+            chosen_count = await _finalize_extraction(
+                session_factory, document_id=document_id
+            )
+
+            # Phase 10.2: embed the persisted chunks (CREATING_CHUNKS →
+            # EMBEDDING_CHUNKS), leaving the document in EMBEDDING_CHUNKS (the
+            # INDEXING/terminal transition is Phase 10.3). Provider seam mirrors the
+            # LLM one: tests inject ctx["embedding_provider"]; production builds
+            # OpenAI from settings.
+            embedding_provider: EmbeddingProvider = ctx.get(
+                "embedding_provider"
+            ) or _build_embedding_provider(settings, observability)
+            await _embed_document_chunks(
+                session_factory,
+                document_id=document_id,
+                provider=embedding_provider,
+                batch_size=settings.embedding_batch_size,
+            )
+            return chosen_count
         except (
             EmptyPdfError,
             PdfExtractionError,
             FileStorageError,
             LLMTechnicalError,
+            EmbeddingTechnicalError,
             IntegrityError,
             LookupError,
             InvalidTransitionError,

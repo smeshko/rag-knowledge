@@ -147,3 +147,12 @@ def test_embedding_values_dimensions_match_fake_default() -> None:
     values = _embedding_values(chunk, embedding)
     assert values["embedding_dimensions"] == 1536
     assert len(values["embedding_vector"]) == 1536
+
+
+def test_reason_for_maps_embedding_technical_error() -> None:
+    # An EmbeddingTechnicalError raised by the embedding stage routes through
+    # process_document's handler with the structured "embedding_failed" reason.
+    from rag_recipes.ingestion.jobs import _reason_for
+    from rag_recipes.providers.errors import EmbeddingTechnicalError
+
+    assert _reason_for(EmbeddingTechnicalError("boom")) == "embedding_failed"
