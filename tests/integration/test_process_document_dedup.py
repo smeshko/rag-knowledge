@@ -38,7 +38,8 @@ from rag_recipes.ingestion.pipeline.windows import (
     build_windows,
     format_window_for_llm,
 )
-from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
+from rag_recipes.providers.errors import EmbeddingTechnicalError, LLMTechnicalError
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
 from rag_recipes.storage.enums import (
@@ -49,6 +50,7 @@ from rag_recipes.storage.enums import (
 )
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.chunk import Chunk
+from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
@@ -167,6 +169,15 @@ async def _cleanup(
     session_factory: async_sessionmaker[AsyncSession], document_id: str, asset_id: str
 ) -> None:
     async with session_factory() as session:
+        # ChunkEmbedding FK to chunks (Phase 10.2); it has no document_id, so scope
+        # by the document's chunk ids and delete it before the chunks.
+        await session.execute(
+            delete(ChunkEmbedding).where(
+                ChunkEmbedding.chunk_id.in_(
+                    select(Chunk.id).where(Chunk.document_id == document_id)
+                )
+            )
+        )
         # Chunk first: its FK to knowledge_items would block their delete (Phase 10.1).
         for model in (Chunk, KnowledgeItem, ExtractionRun, SourceSpan, IngestionFailure):
             await session.execute(
@@ -194,6 +205,7 @@ def _ctx(
         "session_factory": session_factory,
         "observability": None,
         "llm_provider": provider,
+        "embedding_provider": FakeEmbeddingProvider(),
     }
 
 
@@ -236,7 +248,7 @@ async def test_overlapping_windows_resolve_to_one_knowledge_item(
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.CREATING_CHUNKS
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
 
             items = (
                 await session.execute(
@@ -269,15 +281,16 @@ async def test_chunks_committed_atomically_with_creating_chunks_and_exactly_once
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A document in ``creating_chunks`` always has its chunks, created once.
+    """Chunks are created atomically and exactly once across a re-delivery.
 
     Phase 10.1 builds chunks in the same transaction that lands the document in
-    ``creating_chunks`` (review round-1 #1), so the status flip and the chunk rows
-    commit atomically — there is no committed ``creating_chunks``-without-chunks
-    window for a crash to expose. This drives the real pipeline to completion,
-    asserts the ready item's five canonical chunks are present, then re-delivers
-    the same job: ``_resume_or_fresh`` no-ops a terminal-for-now ``creating_chunks``
-    document, so the chunks stay at exactly five (never duplicated, never lost).
+    ``creating_chunks`` (review round-1 #1), so the chunk rows commit atomically
+    with that status flip — no committed ``creating_chunks``-without-chunks window
+    for a crash to expose. Phase 10.2 then advances the document to
+    ``embedding_chunks``. This drives the real pipeline to completion, asserts the
+    ready item's five canonical chunks are present, then re-delivers the same job:
+    ``_resume_or_fresh`` no-ops a terminal-for-now ``embedding_chunks`` document, so
+    the chunks stay at exactly five (never duplicated, never lost).
     """
     monkeypatch.setattr(
         "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
@@ -311,7 +324,7 @@ async def test_chunks_committed_atomically_with_creating_chunks_and_exactly_once
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.CREATING_CHUNKS
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
             ready_item_id = await session.scalar(
                 select(KnowledgeItem.id).where(
                     KnowledgeItem.document_id == document_id,
@@ -506,7 +519,7 @@ async def test_resume_after_interrupt_skips_done_windows_one_deduped_set(
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.CREATING_CHUNKS
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
 
             items = (
                 await session.execute(
@@ -563,5 +576,171 @@ async def test_llm_technical_failure_marks_document_failed(
             failures = await FailuresRepository(session).list_failures(document_id)
             assert len(failures) == 1
             assert failures[0].reason == "llm_extraction_failed"
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
+class _RaisingEmbeddingProvider(FakeEmbeddingProvider):
+    """FakeEmbeddingProvider whose embed_batch always raises (failure-path scaffolding)."""
+
+    async def embed_batch(self, texts: list[Any], *, trace_context: Any = None) -> Any:
+        raise EmbeddingTechnicalError("boom")
+
+
+async def test_embedding_technical_failure_marks_document_failed(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans = _build_spans(document_id)
+        async with session_factory() as session:
+            session.add_all(spans)
+            await session.commit()
+
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+        provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low): _recipe_output(
+                    cited_span_id="span_p3", overall=0.6
+                ),
+                _request_hash_for(window_high): _recipe_output(
+                    cited_span_id="span_p3", overall=0.9
+                ),
+            }
+        )
+        ctx = _ctx(session_factory, provider, tmp_path)
+        ctx["embedding_provider"] = _RaisingEmbeddingProvider()
+
+        # The embedding stage raises; process_document re-raises after mark_failed.
+        with pytest.raises(EmbeddingTechnicalError):
+            await process_document(ctx, document_id)
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.FAILED
+            failures = await FailuresRepository(session).list_failures(document_id)
+            assert len(failures) == 1
+            assert failures[0].reason == "embedding_failed"
+
+            # The chunks finalize committed survive (5), but the failed embedding run
+            # rolled back, so no ChunkEmbedding rows were persisted.
+            chunk_count = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunk_count == 5
+            embedding_count = await session.scalar(
+                select(func.count())
+                .select_from(ChunkEmbedding)
+                .where(
+                    ChunkEmbedding.chunk_id.in_(
+                        select(Chunk.id).where(Chunk.document_id == document_id)
+                    )
+                )
+            )
+            assert embedding_count == 0
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
+async def test_resume_embedding_from_creating_chunks_after_crash(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash between the finalize commit and the embedding commit resumes.
+
+    Review round-1 #1: finalize commits the chunks at CREATING_CHUNKS atomically,
+    then the embedding stage commits separately. If the worker dies in between, the
+    document is left at CREATING_CHUNKS with chunks but no embeddings. The next
+    delivery must resume straight into the (idempotent) embedding stage rather than
+    no-op — ``_resume_or_fresh`` returns ``"embed"`` for CREATING_CHUNKS. Simulate
+    the crash by no-oping ``_embed_document_chunks`` on the first run, then restore
+    it and re-deliver.
+    """
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans = _build_spans(document_id)
+        async with session_factory() as session:
+            session.add_all(spans)
+            await session.commit()
+
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+        provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low): _recipe_output(
+                    cited_span_id="span_p3", overall=0.6
+                ),
+                _request_hash_for(window_high): _recipe_output(
+                    cited_span_id="span_p3", overall=0.9
+                ),
+            }
+        )
+
+        # First delivery: simulate a crash right after finalize by no-oping the
+        # embedding stage, leaving the document at CREATING_CHUNKS with its chunks.
+        real_embed = jobs_module._embed_document_chunks
+
+        async def _skip_embed(*args: Any, **kwargs: Any) -> int:
+            return 0
+
+        monkeypatch.setattr(jobs_module, "_embed_document_chunks", _skip_embed)
+        assert await process_document(_ctx(session_factory, provider, tmp_path), document_id) == 1
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.CREATING_CHUNKS
+            chunk_count = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunk_count == 5
+
+        # Second delivery: restore the real embedding stage; the document resumes
+        # from CREATING_CHUNKS straight into embedding (no re-extraction).
+        monkeypatch.setattr(jobs_module, "_embed_document_chunks", real_embed)
+        embedded = await process_document(
+            _ctx(session_factory, provider, tmp_path), document_id
+        )
+        assert embedded == 5  # one embedding per chunk
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            embedding_count = await session.scalar(
+                select(func.count())
+                .select_from(ChunkEmbedding)
+                .where(
+                    ChunkEmbedding.chunk_id.in_(
+                        select(Chunk.id).where(Chunk.document_id == document_id)
+                    )
+                )
+            )
+            assert embedding_count == 5
+            # Chunks were not regenerated — still exactly five.
+            chunk_count = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunk_count == 5
     finally:
         await _cleanup(session_factory, document_id, asset_id)

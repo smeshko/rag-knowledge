@@ -32,10 +32,12 @@ from rag_recipes.api.dependencies import get_arq_redis, get_file_storage, get_se
 from rag_recipes.config import get_settings
 from rag_recipes.ingestion.jobs import process_document
 from rag_recipes.providers._observability import ProviderObservability
+from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from rag_recipes.storage.models.chunk import Chunk
+from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
@@ -52,7 +54,8 @@ _FIXTURE = Path("data/fixtures/pdfs/sample_recipe.pdf")
 
 # This pathway test exercises the status-endpoint shape, not extraction quality,
 # so the LLM stage rejects every window (no real OpenAI call) — the doc still
-# advances through the dedup stage to creating_chunks with zero knowledge items.
+# advances through dedup + chunking + embedding to embedding_chunks with zero
+# knowledge items.
 _REJECT_RESPONSE = StructuredOutputResponse(
     output_json=None,
     parse_error="no recipe in fixture",
@@ -100,7 +103,15 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
         )
         # The extended pipeline writes knowledge_items + extraction_runs that FK to
         # the document (no ON DELETE CASCADE); drop them before the document. Chunks
-        # FK to knowledge_items (Phase 10.1), so drop those first of all.
+        # FK to knowledge_items (Phase 10.1) and chunk_embeddings FK to chunks
+        # (Phase 10.2), so drop embeddings, then chunks, first of all.
+        await session.execute(
+            delete(ChunkEmbedding).where(
+                ChunkEmbedding.chunk_id.in_(
+                    select(Chunk.id).where(Chunk.document_id == ids["document_id"])
+                )
+            )
+        )
         await session.execute(
             delete(Chunk).where(Chunk.document_id == ids["document_id"])
         )
@@ -115,7 +126,7 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
         await session.commit()
 
 
-async def test_full_upload_to_creating_chunks_pathway(
+async def test_full_upload_to_embedding_chunks_pathway(
     test_engine: AsyncEngine,
     redis_arq_settings: RedisSettings,
     arq_queue_cleanup: str,
@@ -147,8 +158,9 @@ async def test_full_upload_to_creating_chunks_pathway(
         ctx["observability"] = ProviderObservability(
             None, enabled=False, session_scope=recorder
         )
-        # Benign fake so the extraction stage makes no real OpenAI call.
+        # Benign fakes so the extraction + embedding stages make no real OpenAI call.
         ctx["llm_provider"] = FakeLLMProvider(default_output=_REJECT_RESPONSE)
+        ctx["embedding_provider"] = FakeEmbeddingProvider()
 
     ids: dict[str, str] | None = None
     try:
@@ -197,10 +209,10 @@ async def test_full_upload_to_creating_chunks_pathway(
                 await worker.close()
 
             # Step 4: poll status after the worker — the pipeline now runs through
-            # extraction + dedup (zero items from the rejecting fake) to
-            # creating_chunks, still non-terminal.
+            # extraction + dedup (zero items from the rejecting fake) + chunking +
+            # embedding to embedding_chunks, still non-terminal.
             after = await _get_status(client, document_id)
-            assert after["status"] == "creating_chunks"
+            assert after["status"] == "embedding_chunks"
             assert after["current_source_version"] == 1
             assert after["active_source_version"] is None
             assert after["progress"]["pages_processed"] == 3

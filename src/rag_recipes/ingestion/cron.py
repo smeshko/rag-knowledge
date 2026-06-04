@@ -38,16 +38,18 @@ logger = logging.getLogger(__name__)
 # - CREATING_SOURCE_SPANS (Phase 8.1): extraction done, spans persisted, awaiting
 #   Epic 9's process_extraction_run. (Epic 9 has since landed and advances past
 #   it, so this is now only reached transiently; kept until the handoff is retired.)
-# - CREATING_CHUNKS (Phase 10.1): the finalize transaction lands the document here
-#   *with* its chunks (atomic — see jobs._finalize_extraction) and intentionally
-#   stops; the embedding stage that consumes it arrives in Phase 10.2. Because
-#   chunk creation is atomic, any document at CREATING_CHUNKS is a *success*, never
-#   a partial crash, so exempting it never masks a genuinely stuck job.
+# - EMBEDDING_CHUNKS (Phase 10.2): the embedding stage lands the document here
+#   *with* its embeddings (atomic — see jobs._embed_document_chunks) and stops; the
+#   indexing/terminal transition arrives in Phase 10.3. Because the transition and
+#   the embeddings commit together, any document at EMBEDDING_CHUNKS is a *success*,
+#   never a partial crash, so exempting it never masks a genuinely stuck job.
+#   (CREATING_CHUNKS is no longer exempt: Phase 10.2's embedding stage now consumes
+#   it, so a document wedged there is genuinely stuck and should be swept.)
 #
 # REMOVE each entry when its downstream consumer exists — at that point a document
 # wedged in that status is genuinely stuck and should be swept again.
 _SWEEP_EXEMPT_STATUSES: frozenset[DocumentStatus] = frozenset(
-    {DocumentStatus.CREATING_SOURCE_SPANS, DocumentStatus.CREATING_CHUNKS}
+    {DocumentStatus.CREATING_SOURCE_SPANS, DocumentStatus.EMBEDDING_CHUNKS}
 )
 
 
