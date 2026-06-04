@@ -15,7 +15,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from rag_recipes.config import Settings
@@ -46,6 +46,17 @@ _SWEEP_EXEMPT_STATUSES: frozenset[DocumentStatus] = frozenset(
 
 
 async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
+    """Mark documents stalled past ``stuck_job_timeout_minutes`` as failed.
+
+    Staleness keys on real progress, not just any row write: a document
+    advancing ``last_progress_at`` (Phase 9.5 commits the heartbeat once per
+    extraction batch) is healthy and never reaped, even when ``updated_at`` is
+    old. ``coalesce(last_progress_at, updated_at)`` falls back to ``updated_at``
+    for pre-extraction stages, whose heartbeat is null, so their semantics are
+    unchanged. The timeout default stays at 30 minutes — the progress-aware
+    predicate makes a shorter value *safe*, but tuning it is a separate ops
+    decision (DECISIONS #6).
+    """
     settings: Settings = ctx["settings"]
     session_factory: async_sessionmaker[Any] = ctx["session_factory"]
     timeout_minutes = settings.stuck_job_timeout_minutes
@@ -57,7 +68,10 @@ async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
             select(Document.id, Document.status)
             .where(Document.status.notin_(TERMINAL_STATUSES))
             .where(Document.status.notin_(_SWEEP_EXEMPT_STATUSES))
-            .where(Document.updated_at < threshold)
+            .where(
+                func.coalesce(Document.last_progress_at, Document.updated_at)
+                < threshold
+            )
         )
         stuck: list[tuple[str, DocumentStatus]] = list(result.all())
 

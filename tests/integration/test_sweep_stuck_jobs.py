@@ -63,6 +63,20 @@ async def _backdate_updated_at(
     )
 
 
+async def _set_last_progress_at(
+    session: AsyncSession, document_id: str, *, minutes_ago: int
+) -> None:
+    """Set the extraction heartbeat explicitly (it has no server default)."""
+    await session.execute(
+        text(
+            "UPDATE documents "
+            "SET last_progress_at = now() - make_interval(mins => :minutes) "
+            "WHERE id = :id"
+        ),
+        {"minutes": minutes_ago, "id": document_id},
+    )
+
+
 async def _make_document(
     session: AsyncSession,
     *,
@@ -239,6 +253,66 @@ async def test_sweep_exempts_creating_source_spans_handoff_state(
     assert status == DocumentStatus.CREATING_SOURCE_SPANS
     failures = await FailuresRepository(db_session).list_failures(document_id)
     assert failures == []
+
+
+async def test_sweep_skips_extracting_items_with_fresh_heartbeat(
+    db_session: AsyncSession,
+) -> None:
+    # A healthy long extraction commits batches, advancing last_progress_at even
+    # though updated_at is old. The progress-aware sweep must NOT reap it
+    # (Phase 9.5; DECISIONS #6).
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-fresh-heartbeat",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+    await _set_last_progress_at(db_session, document_id, minutes_ago=0)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 0
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.EXTRACTING_ITEMS
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert failures == []
+
+
+async def test_sweep_reaps_extracting_items_with_stale_heartbeat(
+    db_session: AsyncSession,
+) -> None:
+    # A genuinely hung extraction stops advancing last_progress_at; once both the
+    # heartbeat and updated_at are stale it ages out as before.
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-stale-heartbeat",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+    await _set_last_progress_at(db_session, document_id, minutes_ago=120)
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 1
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.FAILED
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert len(failures) == 1
+    assert failures[0].reason == "stuck_job_timeout"
 
 
 async def test_sweep_continues_after_per_doc_error(
