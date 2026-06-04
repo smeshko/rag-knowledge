@@ -38,18 +38,19 @@ logger = logging.getLogger(__name__)
 # - CREATING_SOURCE_SPANS (Phase 8.1): extraction done, spans persisted, awaiting
 #   Epic 9's process_extraction_run. (Epic 9 has since landed and advances past
 #   it, so this is now only reached transiently; kept until the handoff is retired.)
-# - EMBEDDING_CHUNKS (Phase 10.2): the embedding stage lands the document here
-#   *with* its embeddings (atomic — see jobs._embed_document_chunks) and stops; the
-#   indexing/terminal transition arrives in Phase 10.3. Because the transition and
-#   the embeddings commit together, any document at EMBEDDING_CHUNKS is a *success*,
-#   never a partial crash, so exempting it never masks a genuinely stuck job.
-#   (CREATING_CHUNKS is no longer exempt: Phase 10.2's embedding stage now consumes
-#   it, so a document wedged there is genuinely stuck and should be swept.)
+# After Phase 10.3 the pipeline runs all the way to a terminal status
+# (READY/NEEDS_REVIEW), so its post-extraction stages (CREATING_CHUNKS,
+# EMBEDDING_CHUNKS, INDEXING) are transient: a crash in any of them rolls back to
+# the status it started from, which is a resumable entry point in
+# jobs._resume_or_fresh. A document wedged in one of those past the timeout is
+# genuinely stuck (the worker never re-delivered it) and should be swept to FAILED
+# so it is visible for reprocessing — so none of them are exempt.
 #
-# REMOVE each entry when its downstream consumer exists — at that point a document
-# wedged in that status is genuinely stuck and should be swept again.
+# CREATING_SOURCE_SPANS (Phase 8.1) remains exempt: a successful extraction can
+# still rest there with no consumer until Epic 9's handoff is fully retired.
+# REMOVE it too once that handoff no longer rests a successful document there.
 _SWEEP_EXEMPT_STATUSES: frozenset[DocumentStatus] = frozenset(
-    {DocumentStatus.CREATING_SOURCE_SPANS, DocumentStatus.EMBEDDING_CHUNKS}
+    {DocumentStatus.CREATING_SOURCE_SPANS}
 )
 
 

@@ -418,6 +418,15 @@ async def _finalize_extraction(
         chunk_count = await persist_chunks_for_ready_items(
             session, document_id=document_id, category=doc.category
         )
+        # Advance the stuck-job heartbeat: the post-extraction stages
+        # (chunking/embedding/indexing) are no longer sweep-exempt, so each must
+        # report progress or a long-but-healthy run would be reaped on the stale
+        # last_progress_at frozen at the final extraction batch (review #1).
+        await session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(last_progress_at=func.now())
+        )
         logger.info("created %d chunks for %s", chunk_count, document_id)
         await session.commit()
         return len(chosen)
@@ -457,9 +466,60 @@ async def _embed_document_chunks(
             batch_size=batch_size,
             trace_context=TraceContext(session_id=document_id),
         )
+        # Advance the stuck-job heartbeat (see _finalize_extraction): EMBEDDING_CHUNKS
+        # is no longer sweep-exempt, so a freshly-embedded document must carry a fresh
+        # last_progress_at or the sweep would reap it on the stale extraction heartbeat.
+        await session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(last_progress_at=func.now())
+        )
         await session.commit()
     logger.info("embedded %d chunks for %s", len(embeddings), document_id)
     return len(embeddings)
+
+
+async def _index_and_finalize(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    document_id: str,
+) -> DocumentStatus:
+    """Mark indexed and land the terminal status (Phase 10.3).
+
+    The FTS GIN and HNSW indexes are DB-managed (auto-updated on insert by the
+    10.3 migration), so there is no per-document indexing work — ``INDEXING`` is a
+    transient marker. Transitions ``EMBEDDING_CHUNKS → INDEXING`` then to the
+    terminal status (``READY`` when the document has at least one chunk, else
+    ``NEEDS_REVIEW`` — chunks only ever come from ready items per 10.1, so "≥ 1
+    chunk" is the searchability signal, DECISIONS #3) **in one transaction**, so a
+    pre-commit crash rolls back to the resumable ``EMBEDDING_CHUNKS`` and the
+    terminal status is reached atomically. Returns the terminal status.
+    """
+    async with session_factory() as session:
+        await transition_to(session, document_id, DocumentStatus.INDEXING)
+        chunk_count = await session.scalar(
+            select(func.count())
+            .select_from(Chunk)
+            .where(Chunk.document_id == document_id)
+        )
+        terminal = (
+            DocumentStatus.READY
+            if chunk_count and chunk_count >= 1
+            else DocumentStatus.NEEDS_REVIEW
+        )
+        doc = await transition_to(session, document_id, terminal)
+        if terminal is DocumentStatus.READY:
+            # The version that produced searchable chunks becomes the live one for
+            # retrieval (and the status endpoint reports its spans as progress).
+            # A NEEDS_REVIEW doc has nothing searchable, so it keeps active=None
+            # (consistent with the failed-doc semantics in the status endpoint).
+            doc.active_source_version = 1
+            await session.flush()
+        await session.commit()
+    logger.info(
+        "finalized %s -> %s (%d chunks)", document_id, terminal.value, chunk_count or 0
+    )
+    return terminal
 
 
 async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
@@ -487,6 +547,8 @@ async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
         return "resume"
     if status is DocumentStatus.CREATING_CHUNKS:
         return "embed"
+    if status is DocumentStatus.EMBEDDING_CHUNKS:
+        return "index"
     logger.info(
         "process_document skipping %s: status is %s, not resumable",
         document_id,
@@ -501,13 +563,18 @@ async def process_document(
     *,
     _session_id: str | None = None,
 ) -> int:
-    """Extract per-page text from a Document's PDF and persist SourceSpans.
+    """Run a Document's full ingestion lifecycle to its terminal status.
 
-    Transitions queued → extracting_text → creating_source_spans. On any
-    documented exception, calls mark_failed with a structured reason then
-    re-raises so arq's result store reflects the failure too. Langfuse session
-    defaults to ``document_id`` (the project's session_id == document_id
-    convention) when the caller didn't pass ``_session_id``.
+    Drives queued → extracting_text → creating_source_spans → extracting_items →
+    validating_items → creating_chunks → embedding_chunks → indexing → ready
+    (or needs_review when zero chunks were produced). Each stage commits its own
+    transaction; the staged flow has resumable entry points (``_resume_or_fresh``)
+    so a re-driven job after a crash continues from the last committed status
+    rather than re-running completed work. On any documented exception, calls
+    mark_failed with a structured reason then re-raises so arq's result store
+    reflects the failure too. Langfuse session defaults to ``document_id`` (the
+    project's session_id == document_id convention) when the caller didn't pass
+    ``_session_id``.
     """
     session_factory = ctx["session_factory"]
     settings = ctx["settings"]
@@ -533,93 +600,103 @@ async def process_document(
                     )
                     await session.commit()
 
-            if entry == "embed":
-                # Resume after a crash between the atomic finalize commit and the
-                # embedding commit: the chunks are persisted at CREATING_CHUNKS, so
-                # skip extraction/finalize and run only the idempotent embedding
-                # stage (embed_chunks upserts on (chunk_id, provider, model)).
-                logger.info(
-                    "resuming embedding for %s from creating_chunks", document_id
+            # Staged flow with resumable entry points: the entry selects the
+            # starting stage and all paths converge on the terminal index stage.
+            # fresh/resume -> extraction(+finalize) -> embed -> index; embed (resume
+            # from creating_chunks) -> embed -> index; index (resume from
+            # embedding_chunks) -> index. Each stage commits atomically, so a crash
+            # rolls back to the resumable status it started from.
+            chosen_count = 0
+
+            if entry in ("fresh", "resume"):
+                if entry == "fresh":
+                    async with session_factory() as session:
+                        spans_count = await extract_and_persist_spans(
+                            session,
+                            document_id=document_id,
+                            source_version=1,
+                            extractor=extractor,
+                            storage=storage,
+                        )
+                        await transition_to(
+                            session, document_id, DocumentStatus.CREATING_SOURCE_SPANS
+                        )
+                        await session.commit()
+                    logger.debug(
+                        "process_document %s: persisted %d spans",
+                        document_id,
+                        spans_count,
+                    )
+
+                # LLM extraction -> validate -> persist -> dedup -> chunks. Provider
+                # seam (mirrors 8.1's in-job extractor/storage construction): tests
+                # inject ctx["llm_provider"]; production builds OpenAI from settings.
+                provider: LLMProvider = ctx.get("llm_provider") or _build_llm_provider(
+                    settings, observability
                 )
-                embed_provider: EmbeddingProvider = ctx.get(
-                    "embedding_provider"
-                ) or _build_embedding_provider(settings, observability)
-                return await _embed_document_chunks(
+
+                if entry == "fresh":
+                    # Session #3: short-lived transition-only scope. Releases the row
+                    # lock before the (slow) LLM stage and marks the doc as in
+                    # extraction so the stuck-job cron sees progress. On resume the
+                    # doc is already in EXTRACTING_ITEMS, so this is skipped.
+                    async with session_factory() as session:
+                        await transition_to(
+                            session, document_id, DocumentStatus.EXTRACTING_ITEMS
+                        )
+                        await session.commit()
+                else:
+                    logger.info(
+                        "resuming extraction for %s from extracting_items", document_id
+                    )
+
+                # Phase 9.5: extract every window committing per batch (durable,
+                # heartbeated progress; DECISIONS #4), then promote the staged
+                # candidates in one atomic finalize transaction (dedup from persisted
+                # rows; DECISIONS #1, #3). Both run inside this try/except so a
+                # batch-level LLMTechnicalError still routes to mark_failed.
+                await _run_extraction_batches(
                     session_factory,
                     document_id=document_id,
-                    provider=embed_provider,
+                    settings=settings,
+                    provider=provider,
+                    observability=observability,
+                )
+                chosen_count = await _finalize_extraction(
+                    session_factory, document_id=document_id
+                )
+
+            if entry in ("fresh", "resume", "embed"):
+                # Phase 10.2: embed the persisted chunks (CREATING_CHUNKS ->
+                # EMBEDDING_CHUNKS). The "embed" entry resumes here after a crash
+                # between the finalize commit and the embedding commit (chunks
+                # persisted; embed_chunks upserts, so the replay is idempotent).
+                # Provider seam mirrors the LLM one.
+                if entry == "embed":
+                    logger.info(
+                        "resuming embedding for %s from creating_chunks", document_id
+                    )
+                embedding_provider: EmbeddingProvider = ctx.get(
+                    "embedding_provider"
+                ) or _build_embedding_provider(settings, observability)
+                await _embed_document_chunks(
+                    session_factory,
+                    document_id=document_id,
+                    provider=embedding_provider,
                     batch_size=settings.embedding_batch_size,
                 )
 
-            if entry == "fresh":
-                async with session_factory() as session:
-                    spans_count = await extract_and_persist_spans(
-                        session,
-                        document_id=document_id,
-                        source_version=1,
-                        extractor=extractor,
-                        storage=storage,
-                    )
-                    await transition_to(
-                        session, document_id, DocumentStatus.CREATING_SOURCE_SPANS
-                    )
-                    await session.commit()
-                logger.debug(
-                    "process_document %s: persisted %d spans", document_id, spans_count
-                )
-
-            # --- LLM extraction → validate → persist → dedup → chunks signal ---
-            # Provider seam (mirrors 8.1's in-job extractor/storage construction):
-            # tests inject ctx["llm_provider"]; production builds OpenAI from settings.
-            provider: LLMProvider = ctx.get("llm_provider") or _build_llm_provider(
-                settings, observability
-            )
-
-            if entry == "fresh":
-                # Session #3: short-lived transition-only scope. Releases the row
-                # lock before the (slow) LLM stage and marks the doc as in
-                # extraction so the stuck-job cron sees progress. On resume the doc
-                # is already in EXTRACTING_ITEMS, so this transition is skipped.
-                async with session_factory() as session:
-                    await transition_to(
-                        session, document_id, DocumentStatus.EXTRACTING_ITEMS
-                    )
-                    await session.commit()
-            else:
+            if entry == "index":
+                # Resume after a crash between the embedding commit and the terminal
+                # commit: the embeddings are persisted at EMBEDDING_CHUNKS, so run
+                # only the idempotent index + terminal stage.
                 logger.info(
-                    "resuming extraction for %s from extracting_items", document_id
+                    "resuming indexing for %s from embedding_chunks", document_id
                 )
 
-            # Phase 9.5: extract every window committing per batch (durable,
-            # heartbeated progress; DECISIONS #4), then promote the staged
-            # candidates in one atomic finalize transaction (dedup from persisted
-            # rows; DECISIONS #1, #3). Both run inside this method's try/except so a
-            # batch-level LLMTechnicalError still routes to mark_failed.
-            await _run_extraction_batches(
-                session_factory,
-                document_id=document_id,
-                settings=settings,
-                provider=provider,
-                observability=observability,
-            )
-            chosen_count = await _finalize_extraction(
-                session_factory, document_id=document_id
-            )
-
-            # Phase 10.2: embed the persisted chunks (CREATING_CHUNKS →
-            # EMBEDDING_CHUNKS), leaving the document in EMBEDDING_CHUNKS (the
-            # INDEXING/terminal transition is Phase 10.3). Provider seam mirrors the
-            # LLM one: tests inject ctx["embedding_provider"]; production builds
-            # OpenAI from settings.
-            embedding_provider: EmbeddingProvider = ctx.get(
-                "embedding_provider"
-            ) or _build_embedding_provider(settings, observability)
-            await _embed_document_chunks(
-                session_factory,
-                document_id=document_id,
-                provider=embedding_provider,
-                batch_size=settings.embedding_batch_size,
-            )
+            # Phase 10.3: mark indexed and land the terminal status (READY with
+            # >= 1 chunk, else NEEDS_REVIEW) atomically, completing the lifecycle.
+            await _index_and_finalize(session_factory, document_id=document_id)
             return chosen_count
         except (
             EmptyPdfError,

@@ -73,6 +73,11 @@ _WINDOW_SIZE = 3
 _OVERLAP = 1
 
 
+class _SimulatedCrash(Exception):
+    """Stand-in for a process crash: not in process_document's except-tuple, so it
+    propagates without mark_failed, leaving the document at its last committed status."""
+
+
 async def _noop_extract(*args: object, **kwargs: object) -> int:
     """Stand-in for extract_and_persist_spans: spans are pre-seeded, so do nothing."""
     return 5
@@ -248,7 +253,7 @@ async def test_overlapping_windows_resolve_to_one_knowledge_item(
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            assert status == DocumentStatus.READY
 
             items = (
                 await session.execute(
@@ -286,11 +291,11 @@ async def test_chunks_committed_atomically_with_creating_chunks_and_exactly_once
     Phase 10.1 builds chunks in the same transaction that lands the document in
     ``creating_chunks`` (review round-1 #1), so the chunk rows commit atomically
     with that status flip — no committed ``creating_chunks``-without-chunks window
-    for a crash to expose. Phase 10.2 then advances the document to
-    ``embedding_chunks``. This drives the real pipeline to completion, asserts the
-    ready item's five canonical chunks are present, then re-delivers the same job:
-    ``_resume_or_fresh`` no-ops a terminal-for-now ``embedding_chunks`` document, so
-    the chunks stay at exactly five (never duplicated, never lost).
+    for a crash to expose. Phases 10.2/10.3 then advance the document through
+    embedding and indexing to the terminal ``ready``. This drives the real pipeline
+    to completion, asserts the ready item's five canonical chunks are present, then
+    re-delivers the same job: ``_resume_or_fresh`` no-ops a terminal ``ready``
+    document, so the chunks stay at exactly five (never duplicated, never lost).
     """
     monkeypatch.setattr(
         "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
@@ -324,7 +329,7 @@ async def test_chunks_committed_atomically_with_creating_chunks_and_exactly_once
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            assert status == DocumentStatus.READY
             ready_item_id = await session.scalar(
                 select(KnowledgeItem.id).where(
                     KnowledgeItem.document_id == document_id,
@@ -519,7 +524,7 @@ async def test_resume_after_interrupt_skips_done_windows_one_deduped_set(
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            assert status == DocumentStatus.READY
 
             items = (
                 await session.execute(
@@ -662,10 +667,11 @@ async def test_resume_embedding_from_creating_chunks_after_crash(
     Review round-1 #1: finalize commits the chunks at CREATING_CHUNKS atomically,
     then the embedding stage commits separately. If the worker dies in between, the
     document is left at CREATING_CHUNKS with chunks but no embeddings. The next
-    delivery must resume straight into the (idempotent) embedding stage rather than
-    no-op — ``_resume_or_fresh`` returns ``"embed"`` for CREATING_CHUNKS. Simulate
-    the crash by no-oping ``_embed_document_chunks`` on the first run, then restore
-    it and re-deliver.
+    delivery must resume straight into the (idempotent) embedding + indexing stages
+    rather than no-op — ``_resume_or_fresh`` returns ``"embed"`` for CREATING_CHUNKS.
+    Simulate the crash by making ``_embed_document_chunks`` raise an unhandled error
+    on the first run (so no ``mark_failed`` fires and the document stays at
+    CREATING_CHUNKS), then restore it and re-deliver.
     """
     monkeypatch.setattr(
         "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
@@ -690,15 +696,18 @@ async def test_resume_embedding_from_creating_chunks_after_crash(
             }
         )
 
-        # First delivery: simulate a crash right after finalize by no-oping the
-        # embedding stage, leaving the document at CREATING_CHUNKS with its chunks.
+        # First delivery: simulate a process crash right after finalize. The
+        # embedding stage raises an exception that is NOT in process_document's
+        # except-tuple, so it propagates without mark_failed — leaving the document
+        # at CREATING_CHUNKS with its chunks committed and nothing downstream run.
         real_embed = jobs_module._embed_document_chunks
 
-        async def _skip_embed(*args: Any, **kwargs: Any) -> int:
-            return 0
+        async def _crash(*args: Any, **kwargs: Any) -> int:
+            raise _SimulatedCrash
 
-        monkeypatch.setattr(jobs_module, "_embed_document_chunks", _skip_embed)
-        assert await process_document(_ctx(session_factory, provider, tmp_path), document_id) == 1
+        monkeypatch.setattr(jobs_module, "_embed_document_chunks", _crash)
+        with pytest.raises(_SimulatedCrash):
+            await process_document(_ctx(session_factory, provider, tmp_path), document_id)
 
         async with session_factory() as session:
             status = await session.scalar(
@@ -713,18 +722,20 @@ async def test_resume_embedding_from_creating_chunks_after_crash(
             assert chunk_count == 5
 
         # Second delivery: restore the real embedding stage; the document resumes
-        # from CREATING_CHUNKS straight into embedding (no re-extraction).
+        # from CREATING_CHUNKS straight into embedding + indexing (no re-extraction).
+        # The resume path runs no finalize, so the return value (chosen item count)
+        # is 0 — the work it does is the embedding + terminal transition.
         monkeypatch.setattr(jobs_module, "_embed_document_chunks", real_embed)
-        embedded = await process_document(
+        resumed = await process_document(
             _ctx(session_factory, provider, tmp_path), document_id
         )
-        assert embedded == 5  # one embedding per chunk
+        assert resumed == 0
 
         async with session_factory() as session:
             status = await session.scalar(
                 select(Document.status).where(Document.id == document_id)
             )
-            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            assert status == DocumentStatus.READY
             embedding_count = await session.scalar(
                 select(func.count())
                 .select_from(ChunkEmbedding)

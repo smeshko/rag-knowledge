@@ -53,9 +53,9 @@ pytestmark = pytest.mark.asyncio
 _FIXTURE = Path("data/fixtures/pdfs/sample_recipe.pdf")
 
 # This pathway test exercises the status-endpoint shape, not extraction quality,
-# so the LLM stage rejects every window (no real OpenAI call) — the doc still
-# advances through dedup + chunking + embedding to embedding_chunks with zero
-# knowledge items.
+# so the LLM stage rejects every window (no real OpenAI call) — the doc still runs
+# the full lifecycle through dedup + chunking + embedding + indexing and lands at
+# the terminal needs_review (zero knowledge items => zero chunks).
 _REJECT_RESPONSE = StructuredOutputResponse(
     output_json=None,
     parse_error="no recipe in fixture",
@@ -126,7 +126,7 @@ async def _cleanup(test_engine: AsyncEngine, ids: dict[str, str]) -> None:
         await session.commit()
 
 
-async def test_full_upload_to_embedding_chunks_pathway(
+async def test_full_upload_to_needs_review_pathway(
     test_engine: AsyncEngine,
     redis_arq_settings: RedisSettings,
     arq_queue_cleanup: str,
@@ -208,16 +208,20 @@ async def test_full_upload_to_embedding_chunks_pathway(
             finally:
                 await worker.close()
 
-            # Step 4: poll status after the worker — the pipeline now runs through
-            # extraction + dedup (zero items from the rejecting fake) + chunking +
-            # embedding to embedding_chunks, still non-terminal.
+            # Step 4: poll status after the worker — the pipeline now runs the full
+            # lifecycle (extraction + dedup + chunking + embedding + indexing). With
+            # the rejecting fake there are zero items (so zero chunks), so it lands
+            # the terminal NEEDS_REVIEW status.
             after = await _get_status(client, document_id)
-            assert after["status"] == "embedding_chunks"
-            assert after["current_source_version"] == 1
+            assert after["status"] == "needs_review"
+            # Terminal docs report no in-flight (current) source version; a
+            # needs_review doc produced nothing searchable, so it has no active
+            # version and the status endpoint reports (0, None) progress.
+            assert after["current_source_version"] is None
             assert after["active_source_version"] is None
-            assert after["progress"]["pages_processed"] == 3
-            assert after["progress"]["pages_total"] == 3
-            assert after["terminal"] is False
+            assert after["progress"]["pages_processed"] == 0
+            assert after["progress"]["pages_total"] is None
+            assert after["terminal"] is True
 
         # Step 5: the Langfuse session_id seam was driven with document.id.
         assert document_id in recorder.session_ids
