@@ -463,8 +463,18 @@ async def _embed_document_chunks(
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.EMBEDDING_CHUNKS)
+        # Embed only chunks whose parent KnowledgeItem is still READY. On a reuse
+        # run the prior pass's items are superseded but their chunks are retained
+        # (for audit); re-embedding that stale content would waste API calls and
+        # leave superseded chunks searchable. On a fresh run every chunk is
+        # READY-parented, so this join selects the same set as before (review #1).
         result = await session.execute(
-            select(Chunk).where(Chunk.document_id == document_id)
+            select(Chunk)
+            .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
+            .where(
+                Chunk.document_id == document_id,
+                KnowledgeItem.status == KnowledgeItemStatus.READY,
+            )
         )
         chunks = list(result.scalars().all())
         embeddings = await embed_chunks(
@@ -505,10 +515,21 @@ async def _index_and_finalize(
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.INDEXING)
+        # Count only chunks whose parent KnowledgeItem is still READY. A reuse run
+        # (Epic 11.1) can supersede the prior pass's items while their chunks are
+        # retained in the table (for audit); those retained chunks must NOT make a
+        # document look searchable. Without the join, a reuse whose only winners are
+        # NEEDS_REVIEW (no new chunks) would still see the prior pass's stale chunks
+        # and finalize READY with no ready items (review #1). On a fresh run every
+        # chunk is READY-parented, so the join is a no-op there.
         chunk_count = await session.scalar(
             select(func.count())
             .select_from(Chunk)
-            .where(Chunk.document_id == document_id)
+            .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
+            .where(
+                Chunk.document_id == document_id,
+                KnowledgeItem.status == KnowledgeItemStatus.READY,
+            )
         )
         terminal = (
             DocumentStatus.READY

@@ -477,6 +477,95 @@ async def test_reuse_zero_winner_does_not_supersede_prior(
         await _cleanup(session_factory, document_id, asset_id)
 
 
+async def test_reuse_needs_review_winner_does_not_finalize_ready_off_stale_chunks(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reuse whose only winner is NEEDS_REVIEW must not finalize READY (review #1).
+
+    The prior pass's chunks are retained (parented to the now-superseded items),
+    but they must not make the document look searchable: the terminal status and
+    the embedding stage count/select only chunks of currently-READY items, so a
+    reuse with no READY winner ends NEEDS_REVIEW with nothing live."""
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans, fresh_count = await _seed_spans_and_run_fresh(
+            session_factory, document_id, tmp_path
+        )
+        assert fresh_count == 1
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+
+        async with session_factory() as session:
+            old_item_id = await session.scalar(
+                select(KnowledgeItem.id).where(
+                    KnowledgeItem.document_id == document_id,
+                    KnowledgeItem.status == KnowledgeItemStatus.READY,
+                )
+            )
+            assert old_item_id is not None
+
+        await _requeue(session_factory, document_id)
+
+        # Reuse leg: a winner with low overall confidence (< 0.5 threshold) carries
+        # a soft-validation warning, so finalize promotes it to NEEDS_REVIEW — no
+        # new chunks are written.
+        _bump_prompt_version(monkeypatch, _REUSE_PROMPT_VERSION)
+        reuse_provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low, _REUSE_PROMPT_VERSION): _recipe_output(
+                    title="Carrot Soup", cited_span_id="span_p3", overall=0.3
+                ),
+                _request_hash_for(window_high, _REUSE_PROMPT_VERSION): _recipe_output(
+                    title="Carrot Soup", cited_span_id="span_p3", overall=0.3
+                ),
+            }
+        )
+        reuse_count = await process_document(
+            _ctx(session_factory, reuse_provider, tmp_path),
+            document_id,
+            source_version=1,
+            reuse_source_spans=True,
+        )
+        assert reuse_count == 1  # one (needs_review) winner
+
+        async with session_factory() as session:
+            doc = await session.get(Document, document_id)
+            assert doc is not None
+            # The crux: stale superseded chunks must NOT finalize the doc READY.
+            assert doc.status is DocumentStatus.NEEDS_REVIEW
+            # Prior item superseded; new winner is needs_review.
+            old_item = await session.get(KnowledgeItem, old_item_id)
+            assert old_item is not None
+            assert old_item.status is KnowledgeItemStatus.SUPERSEDED
+            ready_count = await session.scalar(
+                select(func.count())
+                .select_from(KnowledgeItem)
+                .where(
+                    KnowledgeItem.document_id == document_id,
+                    KnowledgeItem.status == KnowledgeItemStatus.READY,
+                )
+            )
+            assert ready_count == 0
+            # No chunk of a currently-READY item exists, so nothing is live/embedded.
+            live_chunks = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
+                .where(
+                    Chunk.document_id == document_id,
+                    KnowledgeItem.status == KnowledgeItemStatus.READY,
+                )
+            )
+            assert live_chunks == 0
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
 async def test_reuse_technical_failure_marks_failed_and_keeps_prior_items(
     test_engine: AsyncEngine,
     tmp_path: Path,
