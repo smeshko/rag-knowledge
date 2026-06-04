@@ -468,10 +468,13 @@ async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
     Returns ``"fresh"`` for a ``QUEUED`` doc (run text → spans → extraction),
     ``"resume"`` for one already in ``EXTRACTING_ITEMS`` (a re-driven job after a
     kill/timeout — skip straight to the idempotent window loop, which the
-    ``input_hash`` skip set makes safe), or ``"skip"`` for any other status (a
-    duplicate delivery of an in-flight or completed doc; the caller no-ops rather
-    than risk flipping a good row to FAILED). Raises ``LookupError`` when the
-    document does not exist.
+    ``input_hash`` skip set makes safe), ``"embed"`` for one in ``CREATING_CHUNKS``
+    (a re-driven job after a crash between the atomic finalize commit and the
+    embedding commit — its chunks are persisted, so resume straight into the
+    idempotent embedding stage), or ``"skip"`` for any other status (a duplicate
+    delivery of an in-flight or completed doc; the caller no-ops rather than risk
+    flipping a good row to FAILED). Raises ``LookupError`` when the document does
+    not exist.
     """
     status = await session.scalar(
         select(Document.status).where(Document.id == document_id)
@@ -482,6 +485,8 @@ async def _resume_or_fresh(session: AsyncSession, document_id: str) -> str:
         return "fresh"
     if status is DocumentStatus.EXTRACTING_ITEMS:
         return "resume"
+    if status is DocumentStatus.CREATING_CHUNKS:
+        return "embed"
     logger.info(
         "process_document skipping %s: status is %s, not resumable",
         document_id,
@@ -527,6 +532,24 @@ async def process_document(
                         session, document_id, DocumentStatus.EXTRACTING_TEXT
                     )
                     await session.commit()
+
+            if entry == "embed":
+                # Resume after a crash between the atomic finalize commit and the
+                # embedding commit: the chunks are persisted at CREATING_CHUNKS, so
+                # skip extraction/finalize and run only the idempotent embedding
+                # stage (embed_chunks upserts on (chunk_id, provider, model)).
+                logger.info(
+                    "resuming embedding for %s from creating_chunks", document_id
+                )
+                embed_provider: EmbeddingProvider = ctx.get(
+                    "embedding_provider"
+                ) or _build_embedding_provider(settings, observability)
+                return await _embed_document_chunks(
+                    session_factory,
+                    document_id=document_id,
+                    provider=embed_provider,
+                    batch_size=settings.embedding_batch_size,
+                )
 
             if entry == "fresh":
                 async with session_factory() as session:

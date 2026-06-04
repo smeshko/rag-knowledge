@@ -650,3 +650,97 @@ async def test_embedding_technical_failure_marks_document_failed(
             assert embedding_count == 0
     finally:
         await _cleanup(session_factory, document_id, asset_id)
+
+
+async def test_resume_embedding_from_creating_chunks_after_crash(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash between the finalize commit and the embedding commit resumes.
+
+    Review round-1 #1: finalize commits the chunks at CREATING_CHUNKS atomically,
+    then the embedding stage commits separately. If the worker dies in between, the
+    document is left at CREATING_CHUNKS with chunks but no embeddings. The next
+    delivery must resume straight into the (idempotent) embedding stage rather than
+    no-op — ``_resume_or_fresh`` returns ``"embed"`` for CREATING_CHUNKS. Simulate
+    the crash by no-oping ``_embed_document_chunks`` on the first run, then restore
+    it and re-deliver.
+    """
+    monkeypatch.setattr(
+        "rag_recipes.ingestion.jobs.extract_and_persist_spans", _noop_extract
+    )
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        spans = _build_spans(document_id)
+        async with session_factory() as session:
+            session.add_all(spans)
+            await session.commit()
+
+        window_low, window_high = build_windows(spans, _WINDOW_SIZE, _OVERLAP)
+        provider = FakeLLMProvider(
+            responses_by_hash={
+                _request_hash_for(window_low): _recipe_output(
+                    cited_span_id="span_p3", overall=0.6
+                ),
+                _request_hash_for(window_high): _recipe_output(
+                    cited_span_id="span_p3", overall=0.9
+                ),
+            }
+        )
+
+        # First delivery: simulate a crash right after finalize by no-oping the
+        # embedding stage, leaving the document at CREATING_CHUNKS with its chunks.
+        real_embed = jobs_module._embed_document_chunks
+
+        async def _skip_embed(*args: Any, **kwargs: Any) -> int:
+            return 0
+
+        monkeypatch.setattr(jobs_module, "_embed_document_chunks", _skip_embed)
+        assert await process_document(_ctx(session_factory, provider, tmp_path), document_id) == 1
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.CREATING_CHUNKS
+            chunk_count = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunk_count == 5
+
+        # Second delivery: restore the real embedding stage; the document resumes
+        # from CREATING_CHUNKS straight into embedding (no re-extraction).
+        monkeypatch.setattr(jobs_module, "_embed_document_chunks", real_embed)
+        embedded = await process_document(
+            _ctx(session_factory, provider, tmp_path), document_id
+        )
+        assert embedded == 5  # one embedding per chunk
+
+        async with session_factory() as session:
+            status = await session.scalar(
+                select(Document.status).where(Document.id == document_id)
+            )
+            assert status == DocumentStatus.EMBEDDING_CHUNKS
+            embedding_count = await session.scalar(
+                select(func.count())
+                .select_from(ChunkEmbedding)
+                .where(
+                    ChunkEmbedding.chunk_id.in_(
+                        select(Chunk.id).where(Chunk.document_id == document_id)
+                    )
+                )
+            )
+            assert embedding_count == 5
+            # Chunks were not regenerated — still exactly five.
+            chunk_count = await session.scalar(
+                select(func.count())
+                .select_from(Chunk)
+                .where(Chunk.document_id == document_id)
+            )
+            assert chunk_count == 5
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
