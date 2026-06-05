@@ -19,6 +19,8 @@ from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
+from rag_recipes.providers.llm.base import LLMProvider
+from rag_recipes.providers.llm.openai import OpenAILLMProvider
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -63,6 +65,27 @@ def get_embedding_provider(
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,
         batch_size=settings.embedding_batch_size,
+    )
+
+
+def get_llm_provider(
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> LLMProvider:
+    """Build the production LLM provider for the query-time answer endpoint.
+
+    Tests override this with a ``FakeLLMProvider``. The default model resolves to
+    ``answer_llm_model`` when set, else ``llm_model`` (a class-level default can't
+    reference a sibling field, so the fallback lives here at the boundary). Like
+    ``get_embedding_provider``, no ``ProviderObservability`` is injected — request-
+    time providers are deliberately untraced (answers are synchronous, not a traced
+    ingestion job), so the answer layer inherits the provider's retry + parse-error
+    handling but not Langfuse tracing (request-time answer tracing is deferred).
+    """
+    return OpenAILLMProvider(
+        settings.openai_api_key,
+        default_model=settings.answer_llm_model or settings.llm_model,
+        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+        request_timeout=settings.llm_request_timeout_seconds,
     )
 
 
