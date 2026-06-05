@@ -68,10 +68,29 @@ class Settings(BaseSettings):
     search_keyword_top_k: int = 50
     search_vector_top_k: int = 50
     search_rrf_k: int = 60
+    # Per-leg RRF source weights and the grouping supporting-chunk bonus (doc 7 § 8/§ 9).
+    keyword_source_weight: float = Field(default=1.0, ge=0)
+    vector_source_weight: float = Field(default=1.0, ge=0)
+    search_supporting_chunk_bonus: float = Field(default=0.05, ge=0)
+    search_supporting_chunk_bonus_cap: float = Field(default=0.15, ge=0)
+    # The provider-name half of the (embedding_provider, embedding_model) vector-leg
+    # filter — embedding_model already exists; the EmbeddingProvider ABC carries no
+    # name, so the search facade sources both from Settings (doc 7; DECISIONS #6).
+    embedding_provider: str = "openai"
 
+    # Chunk-type boosts (doc 7 § 7) — the full per-side tables. Keyword favours
+    # title/ingredients; vector favours summary/full. Missing types default to 1.0
+    # at merge time.
     recipe_keyword_boost_title: float = 1.40
     recipe_keyword_boost_ingredients: float = 1.20
+    recipe_keyword_boost_steps: float = 1.05
+    recipe_keyword_boost_summary: float = 1.00
+    recipe_keyword_boost_full: float = 0.95
     recipe_vector_boost_summary: float = 1.20
+    recipe_vector_boost_full: float = 1.10
+    recipe_vector_boost_steps: float = 1.00
+    recipe_vector_boost_ingredients: float = 0.95
+    recipe_vector_boost_title: float = 0.90
 
     worker_max_jobs: int = Field(default=1, ge=1)
     worker_job_timeout_seconds: int = Field(default=600, ge=1)
