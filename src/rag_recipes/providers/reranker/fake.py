@@ -10,7 +10,8 @@ Scaffolding for Phase 18.2's wiring + degradation tests, mirroring
   ``chunk_id`` for determinism;
 * the ``emit`` knob forces a single documented invariant violation
   (``"duplicate"`` / ``"unknown"`` / ``"missing"`` / ``"out_of_range_rank"``) so 18.2 can
-  exercise its caller-side degradation policy;
+  exercise its caller-side degradation policy — the malformed modes assume a
+  **non-empty** candidate list (with no candidates there is nothing to corrupt);
 * ``.calls`` records each invocation (deep-copied) for assertion.
 """
 
@@ -121,6 +122,11 @@ class FakeRerankerProvider(RerankerProvider):
             # Omit all but the first candidate (the rest are "missing" from the result).
             return base[:1]
         if self._emit == "out_of_range_rank":
-            # Ranks outside the 1-based range (shifted to 0-based here).
-            return [r.model_copy(update={"rank": r.rank - 1}) for r in base]
+            # Unambiguously out of the 1-based [1, N] range: a sub-range 0 on the
+            # first result and an over-range rank (> N) on the last, so a caller's
+            # clamp/ignore policy is exercised at both bounds.
+            out = [r.model_copy(deep=True) for r in base]
+            out[0] = out[0].model_copy(update={"rank": 0})
+            out[-1] = out[-1].model_copy(update={"rank": len(base) + 5})
+            return out
         return base

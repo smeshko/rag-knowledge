@@ -134,7 +134,10 @@ async def test_emit_missing_omits_candidates() -> None:
 async def test_emit_out_of_range_rank_breaks_one_based_ranks() -> None:
     fake = FakeRerankerProvider(emit="out_of_range_rank")
     results = await fake.rerank("q", _candidates(), top_n=10)
-    assert any(r.rank < 1 for r in results)  # ranks fall outside the 1-based range
+    # Out of the valid 1-based [1, N] range at both bounds: a sub-range 0 and an
+    # over-range rank (> N), so 18.2's clamp/ignore policy is exercised at each end.
+    assert any(r.rank < 1 for r in results)
+    assert any(r.rank > len(results) for r in results)
 
 
 def test_emit_rejects_unknown_mode() -> None:
