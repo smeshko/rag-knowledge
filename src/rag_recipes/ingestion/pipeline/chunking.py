@@ -132,21 +132,27 @@ def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
 
 
 async def persist_chunks_for_ready_items(
-    session: AsyncSession, *, document_id: str, category: str
+    session: AsyncSession, *, document_id: str, source_version: int, category: str
 ) -> int:
-    """Build and persist the chunks for every ``READY`` item of a document.
+    """Build and persist the chunks for every ``READY`` item of a source_version.
 
-    Loads the document's ``READY`` ``KnowledgeItem`` rows, builds each item's
-    chunks with ``build_chunks``, adds them all, and flushes (surfacing the
-    composite FK / ``@validates`` checks at the call site). Returns the total
-    number of chunks written. The caller owns the transaction — this never
-    commits, mirroring ``extract_and_persist_spans`` / ``persist_knowledge_item``.
-    ``NEEDS_REVIEW`` / ``SUPERSEDED`` items are not loaded, so they contribute
-    no chunks.
+    Loads the document's ``READY`` ``KnowledgeItem`` rows *at ``source_version``*,
+    builds each item's chunks with ``build_chunks``, adds them all, and flushes
+    (surfacing the composite FK / ``@validates`` checks at the call site). Returns
+    the total number of chunks written. The caller owns the transaction — this
+    never commits, mirroring ``extract_and_persist_spans`` /
+    ``persist_knowledge_item``. ``NEEDS_REVIEW`` / ``SUPERSEDED`` items are not
+    loaded, so they contribute no chunks.
+
+    Scoping to ``source_version`` (Epic 11.2) keeps a new_source_version run from
+    re-chunking the prior version's still-READY items: during that run the prior
+    version's items remain active (the supersede + active-version flip happen later,
+    at the READY gate) so an unscoped query would duplicate their chunks.
     """
     result = await session.execute(
         select(KnowledgeItem).where(
             KnowledgeItem.document_id == document_id,
+            KnowledgeItem.source_version == source_version,
             KnowledgeItem.status == KnowledgeItemStatus.READY,
         )
     )

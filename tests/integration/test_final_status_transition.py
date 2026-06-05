@@ -117,7 +117,7 @@ async def _seed_document(session: AsyncSession, *, with_chunks: bool) -> str:
         session.add(item)
         await session.flush()
         await persist_chunks_for_ready_items(
-            session, document_id=document.id, category=CATEGORY
+            session, document_id=document.id, source_version=1, category=CATEGORY
         )
     await session.flush()
     return document.id
@@ -131,13 +131,11 @@ async def test_index_and_finalize_ready_with_chunks(db_session: AsyncSession) ->
     assert chunk_count == 5
 
     terminal = await _index_and_finalize(
-        _single_session_factory(db_session), document_id=document_id
+        _single_session_factory(db_session), document_id=document_id, source_version=SOURCE_VERSION
     )
 
     assert terminal == DocumentStatus.READY
-    status = await db_session.scalar(
-        select(Document.status).where(Document.id == document_id)
-    )
+    status = await db_session.scalar(select(Document.status).where(Document.id == document_id))
     assert status == DocumentStatus.READY
 
 
@@ -151,11 +149,9 @@ async def test_index_and_finalize_needs_review_without_chunks(
     assert chunk_count == 0
 
     terminal = await _index_and_finalize(
-        _single_session_factory(db_session), document_id=document_id
+        _single_session_factory(db_session), document_id=document_id, source_version=SOURCE_VERSION
     )
 
     assert terminal == DocumentStatus.NEEDS_REVIEW
-    status = await db_session.scalar(
-        select(Document.status).where(Document.id == document_id)
-    )
+    status = await db_session.scalar(select(Document.status).where(Document.id == document_id))
     assert status == DocumentStatus.NEEDS_REVIEW

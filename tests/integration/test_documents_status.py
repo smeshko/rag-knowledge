@@ -330,6 +330,37 @@ async def test_status_reprocess_in_flight_does_not_report_stale_spans(
 
 
 @pytest.mark.asyncio
+async def test_status_new_version_in_flight_reports_new_version_progress(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """A new_source_version run in flight reports the NEW version (Epic 11.2).
+
+    The doc is still active on v1, but a v2 run is in progress and has written some
+    of its spans. ``current_source_version`` is the in-flight version (2), and
+    progress reflects the v2 spans written so far — not the stale v1 counts.
+    """
+    document = await _seed_document(
+        db_session,
+        content_hash="hash-new-version-in-flight",
+        status=DocumentStatus.EXTRACTING_TEXT,
+        active_source_version=1,
+    )
+    await _seed_spans(db_session, document=document, source_version=1, pages=5)
+    # The v2 run has written 2 of its pages so far.
+    await _seed_spans(db_session, document=document, source_version=2, pages=2)
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["active_source_version"] == 1
+    assert body["current_source_version"] == 2
+    assert body["terminal"] is False
+    # Progress is the in-flight v2 spans, not the surviving v1 (5) spans.
+    assert body["progress"]["pages_processed"] == 2
+    assert body["progress"]["pages_total"] == 2
+
+
+@pytest.mark.asyncio
 async def test_status_unknown_id_returns_404_envelope(client: httpx.AsyncClient) -> None:
     async with client:
         response = await client.get("/api/v1/documents/doc_does_not_exist/status")

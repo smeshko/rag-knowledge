@@ -121,7 +121,7 @@ async def _seed_document_with_chunks(session: AsyncSession) -> tuple[str, list[s
     session.add(item)
     await session.flush()
     count = await persist_chunks_for_ready_items(
-        session, document_id=document.id, category=CATEGORY
+        session, document_id=document.id, source_version=1, category=CATEGORY
     )
     assert count == 5
     chunk_ids = list(
@@ -314,6 +314,7 @@ async def test_embed_stage_advances_stuck_job_heartbeat(
     await _embed_document_chunks(
         _single_session_factory(db_session),
         document_id=document_id,
+        source_version=1,
         provider=FakeEmbeddingProvider(),
         batch_size=100,
     )

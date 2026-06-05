@@ -22,6 +22,7 @@ from rag_recipes.storage.enums import (
 )
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
@@ -65,7 +66,11 @@ class DocumentRepository:
         return result.scalar_one_or_none()
 
     async def supersede_prior_items(
-        self, document_id: str, *, keep_extraction_run_ids: set[str]
+        self,
+        document_id: str,
+        *,
+        keep_extraction_run_ids: set[str],
+        source_version: int | None = None,
     ) -> int:
         """Supersede a document's prior KnowledgeItems, sparing the kept runs.
 
@@ -74,24 +79,31 @@ class DocumentRepository:
         ``keep_extraction_run_ids`` to ``SUPERSEDED``; returns the affected row
         count. The keep-set framing ("supersede everything *not* produced by the
         accepted run") is exact and clock-skew-proof versus a timestamp filter
-        (DECISIONS #4): Epic 10.3 calls it with the just-accepted run ids at the
-        READY transition and Epic 11 with the new source-version's runs. For first
-        extraction the keep-set covers the current pass's runs, so nothing matches
-        and 0 is returned. Already-``SUPERSEDED`` rows are excluded by the status
+        (DECISIONS #4). Already-``SUPERSEDED`` rows are excluded by the status
         guard and never re-touched.
+
+        When ``source_version`` is given, the UPDATE is scoped to items of that
+        version only — used by ``_finalize_extraction`` to retire a *same-version*
+        reuse pass's prior items without touching a different version's live set
+        (Epic 11.2: the cross-version active-version handoff is done later, at the
+        READY gate, so a post-finalize failure never retires the prior version).
+        Omitting it retires every non-kept version (the handoff use).
 
         Caller owns the transaction (consistent with the other repo writes and
         ``transition_to``); this flush-level write does not commit.
         ``synchronize_session=False`` keeps it a single round-trip — the caller
         does not rely on the in-session ORM objects reflecting the new status.
         """
+        conditions = [
+            KnowledgeItem.document_id == document_id,
+            KnowledgeItem.status != KnowledgeItemStatus.SUPERSEDED,
+            KnowledgeItem.extraction_run_id.notin_(keep_extraction_run_ids),
+        ]
+        if source_version is not None:
+            conditions.append(KnowledgeItem.source_version == source_version)
         stmt = (
             update(KnowledgeItem)
-            .where(
-                KnowledgeItem.document_id == document_id,
-                KnowledgeItem.status != KnowledgeItemStatus.SUPERSEDED,
-                KnowledgeItem.extraction_run_id.notin_(keep_extraction_run_ids),
-            )
+            .where(*conditions)
             .values(status=KnowledgeItemStatus.SUPERSEDED)
             .execution_options(synchronize_session=False)
         )
@@ -189,6 +201,44 @@ class DocumentRepository:
             )
         )
         return result.scalar_one()
+
+    async def get_latest_extraction_run(
+        self, document_id: str
+    ) -> ExtractionRun | None:
+        """Return the document's most recent ExtractionRun, or None.
+
+        Used by the Epic 11.2 ``auto`` reprocess selector to compare the last run's
+        ``prompt_version`` / ``schema_version`` against the current constants.
+        Ordered by ``created_at`` desc with an ``id`` tiebreak for stability.
+        """
+        result = await self._session.execute(
+            select(ExtractionRun)
+            .where(ExtractionRun.document_id == document_id)
+            .order_by(ExtractionRun.created_at.desc(), ExtractionRun.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_version_extractor_identity(
+        self, document_id: str, source_version: int
+    ) -> str | None:
+        """Return the extractor identity stamped on a version's spans, or None.
+
+        Reads ``locator["meta"]["extractor_identity"]`` from one span of the given
+        version (every span of a version carries the same identity). Returns None
+        when the version has no spans, or for legacy spans written before Epic 11.2
+        stamped the identity — the ``auto`` selector treats a missing identity as
+        "differs from the current extractor" and defaults to a new-version run.
+        """
+        result = await self._session.execute(
+            select(SourceSpan.locator["meta"]["extractor_identity"].astext)
+            .where(
+                SourceSpan.document_id == document_id,
+                SourceSpan.source_version == source_version,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def max_source_version(self, document_id: str) -> int | None:
         """Return the document's highest ``SourceSpan.source_version``, or None.

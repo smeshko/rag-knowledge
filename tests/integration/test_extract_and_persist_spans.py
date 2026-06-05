@@ -136,6 +136,78 @@ async def test_happy_path_three_pages_creates_three_spans(
 
 
 @pytest.mark.asyncio
+async def test_extractor_identity_is_stamped_and_read_back(
+    db_session: AsyncSession,
+    fake_extractor: FakePdfTextExtractor,
+    fake_storage: FakeFileStorageProvider,
+) -> None:
+    """The configured extractor identity is stamped on every span (excluded from
+    locator_hash) and read back by get_version_extractor_identity (Epic 11.2)."""
+    document_id = await _insert_document(db_session)
+
+    await extract_and_persist_spans(
+        db_session,
+        document_id=document_id,
+        source_version=1,
+        extractor=fake_extractor,
+        storage=fake_storage,
+        extractor_identity="pymupdf:embedded_text",
+    )
+
+    result = await db_session.execute(
+        select(SourceSpan).where(SourceSpan.document_id == document_id)
+    )
+    spans = result.scalars().all()
+    assert all(
+        s.locator["meta"]["extractor_identity"] == "pymupdf:embedded_text"
+        for s in spans
+    )
+    # The identity lives in meta, so the uniqueness hash is unaffected.
+    first = sorted(spans, key=lambda s: s.locator["page_start"])[0]
+    assert first.locator_hash == _sha256_json(
+        {"type": "pdf_page_range", "page_start": 1, "page_end": 1}
+    )
+
+    repo = DocumentRepository(db_session)
+    assert (
+        await repo.get_version_extractor_identity(document_id, 1)
+        == "pymupdf:embedded_text"
+    )
+    # An absent version resolves to None.
+    assert await repo.get_version_extractor_identity(document_id, 2) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_span_without_identity_reads_none(
+    db_session: AsyncSession,
+) -> None:
+    """A span written without the identity stamp (legacy) reads back as None, so
+    the auto selector treats it as 'extractor differs' and defaults to new-version."""
+    document_id = await _insert_document(db_session)
+    legacy = SourceSpan(
+        document_id=document_id,
+        source_version=1,
+        source_type=SourceType.PDF,
+        locator={
+            "type": "pdf_page_range",
+            "page_start": 1,
+            "page_end": 1,
+            "meta": {"confidence": None, "extraction_method": "embedded_text"},
+        },
+        locator_hash=_sha256_json(
+            {"type": "pdf_page_range", "page_start": 1, "page_end": 1}
+        ),
+        text="legacy",
+        text_hash=_sha256_text("legacy"),
+    )
+    db_session.add(legacy)
+    await db_session.flush()
+
+    repo = DocumentRepository(db_session)
+    assert await repo.get_version_extractor_identity(document_id, 1) is None
+
+
+@pytest.mark.asyncio
 async def test_duplicate_version_raises_integrity_error(
     db_session: AsyncSession,
     fake_extractor: FakePdfTextExtractor,

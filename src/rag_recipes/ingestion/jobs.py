@@ -400,25 +400,29 @@ async def _finalize_extraction(
             for ref in chosen
         )
 
-        # Supersede hook (DECISIONS #5): retire everything the document had before
-        # this pass, keeping ONLY the runs whose items survived *this* pass's dedup
-        # (the `chosen` set — both its ready and needs_review winners). On a fresh
-        # first extraction there is nothing older, so nothing matches (no-op). On a
-        # reuse reprocess at the SAME source_version (Epic 11.1) the prior pass's
-        # runs are NOT in the keep-set, so its items flip to SUPERSEDED while this
-        # pass's winners are spared. Scoping the keep-set to `chosen` (not "every run
-        # at this version") is what makes same-version reuse correct.
+        # Same-version supersede (Epic 11.1): retire the prior pass's items *at this
+        # same source_version*, keeping ONLY the runs whose items survived this
+        # pass's dedup (the `chosen` set). This is the reuse case — a same-version
+        # re-run replaces the prior same-version pass before chunks are (re)built, so
+        # persist_chunks_for_ready_items below never re-chunks the retired items.
         #
-        # Gate on an accepted READY replacement: a pass with no ready winner (every
-        # window rejected/no-item, OR only low-confidence needs_review winners) must
-        # NOT supersede — that would retire the prior live ready set with nothing
-        # searchable to replace it, making the document's content vanish. Skip the
-        # call so the prior active set survives until a pass actually produces a
-        # ready replacement.
+        # Crucially this is scoped to `source_version`: it must NOT touch a different
+        # (prior-active) version's live items. The cross-version active-version
+        # handoff — flipping active_source_version and superseding the prior version
+        # — happens later, at the READY gate in _index_and_finalize, so a
+        # post-finalize embedding/index failure can never retire the prior version
+        # while leaving the new one unsearchable (review #1).
+        #
+        # Gate on an accepted READY replacement: a pass with no ready winner must NOT
+        # supersede — that would retire the prior live ready set with nothing
+        # searchable to replace it. Skip the call so the prior set survives until a
+        # pass actually produces a ready replacement.
         if has_ready_winner:
             keep_run_ids = {ref.extraction_run_id for ref in chosen}
             await DocumentRepository(session).supersede_prior_items(
-                document_id, keep_extraction_run_ids=keep_run_ids
+                document_id,
+                keep_extraction_run_ids=keep_run_ids,
+                source_version=source_version,
             )
 
         await transition_to(session, document_id, DocumentStatus.VALIDATING_ITEMS)
@@ -444,7 +448,10 @@ async def _finalize_extraction(
         # build anyway, so the gate is a no-op there.
         if has_ready_winner:
             chunk_count = await persist_chunks_for_ready_items(
-                session, document_id=document_id, category=doc.category
+                session,
+                document_id=document_id,
+                source_version=source_version,
+                category=doc.category,
             )
         else:
             chunk_count = 0
@@ -466,6 +473,7 @@ async def _embed_document_chunks(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
     provider: EmbeddingProvider,
     batch_size: int,
 ) -> int:
@@ -485,16 +493,21 @@ async def _embed_document_chunks(
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.EMBEDDING_CHUNKS)
-        # Embed only chunks whose parent KnowledgeItem is still READY. On a reuse
-        # run the prior pass's items are superseded but their chunks are retained
-        # (for audit); re-embedding that stale content would waste API calls and
-        # leave superseded chunks searchable. On a fresh run every chunk is
-        # READY-parented, so this join selects the same set as before (review #1).
+        # Embed only chunks whose parent KnowledgeItem is READY *and at this run's
+        # source_version*. The READY filter excludes a reuse run's superseded prior
+        # items (their chunks are retained for audit, not re-embedded). The
+        # source_version filter isolates a new_source_version run to its own chunks:
+        # during that run the prior active version is still READY (its supersede +
+        # the active flip happen later, at the READY gate), so without it a v(new)
+        # run would re-embed the prior version's chunks — wasted spend, and a stray
+        # EmbeddingTechnicalError on those old chunks would falsely fail this run
+        # (review #2). On a fresh run every chunk is READY-parented at this version.
         result = await session.execute(
             select(Chunk)
             .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
             .where(
                 Chunk.document_id == document_id,
+                KnowledgeItem.source_version == source_version,
                 KnowledgeItem.status == KnowledgeItemStatus.READY,
             )
         )
@@ -523,6 +536,7 @@ async def _index_and_finalize(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
 ) -> DocumentStatus:
     """Mark indexed and land the terminal status (Phase 10.3).
 
@@ -534,22 +548,33 @@ async def _index_and_finalize(
     chunk" is the searchability signal, DECISIONS #3) **in one transaction**, so a
     pre-commit crash rolls back to the resumable ``EMBEDDING_CHUNKS`` and the
     terminal status is reached atomically. Returns the terminal status.
+
+    This is also the active-version handoff gate (Epic 11.2): reaching ``READY``
+    is the genuine "this version is live and searchable" point. The flip of
+    ``active_source_version`` to ``source_version`` and the supersede of every
+    *other* version's items happen here, atomically, only on ``READY`` — so a
+    failure anywhere before this (extraction OR embedding) never retires the prior
+    version (review #1). On ``NEEDS_REVIEW`` neither happens, so the prior active
+    version stays live.
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.INDEXING)
-        # Count only chunks whose parent KnowledgeItem is still READY. A reuse run
-        # (Epic 11.1) can supersede the prior pass's items while their chunks are
-        # retained in the table (for audit); those retained chunks must NOT make a
-        # document look searchable. Without the join, a reuse whose only winners are
-        # NEEDS_REVIEW (no new chunks) would still see the prior pass's stale chunks
-        # and finalize READY with no ready items (review #1). On a fresh run every
-        # chunk is READY-parented, so the join is a no-op there.
+        # Count only chunks whose parent KnowledgeItem is READY *and at this run's
+        # source_version*. Two reasons: (1) a reuse run (Epic 11.1) can supersede the
+        # prior pass's items while their chunks are retained for audit — those must
+        # not make the document look searchable. (2) A new_source_version run's
+        # searchability is THIS version's chunks: if its winners are all NEEDS_REVIEW
+        # (no v(new) chunks) the document must land NEEDS_REVIEW even though the prior
+        # version's chunks still exist, so the active-version handoff below does not
+        # fire and the prior version stays live (review #1). On a fresh run every
+        # chunk is READY-parented at this version, so the filter is a no-op there.
         chunk_count = await session.scalar(
             select(func.count())
             .select_from(Chunk)
             .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
             .where(
                 Chunk.document_id == document_id,
+                KnowledgeItem.source_version == source_version,
                 KnowledgeItem.status == KnowledgeItemStatus.READY,
             )
         )
@@ -560,11 +585,30 @@ async def _index_and_finalize(
         )
         doc = await transition_to(session, document_id, terminal)
         if terminal is DocumentStatus.READY:
-            # The version that produced searchable chunks becomes the live one for
-            # retrieval (and the status endpoint reports its spans as progress).
-            # A NEEDS_REVIEW doc has nothing searchable, so it keeps active=None
-            # (consistent with the failed-doc semantics in the status endpoint).
-            doc.active_source_version = 1
+            # Active-version handoff: only now that this version is searchable do we
+            # flip the active version to it and retire every *other* version's items.
+            # The keep-set is every run at THIS source_version, so a new_source_version
+            # run supersedes the prior active version's items while a fresh/reuse run
+            # (whose only items are at this version) retires nothing extra. Co-located
+            # with the flip in this one transaction so the two never diverge. (The
+            # same-version reuse supersede already ran in _finalize_extraction; this
+            # is idempotent over it.)
+            keep_run_ids = set(
+                (
+                    await session.execute(
+                        select(ExtractionRun.id).where(
+                            ExtractionRun.document_id == document_id,
+                            ExtractionRun.source_version == source_version,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await DocumentRepository(session).supersede_prior_items(
+                document_id, keep_extraction_run_ids=keep_run_ids
+            )
+            doc.active_source_version = source_version
             await session.flush()
         await session.commit()
     logger.info(
@@ -693,6 +737,7 @@ async def process_document(
                             source_version=source_version,
                             extractor=extractor,
                             storage=storage,
+                            extractor_identity=settings.pdf_text_extractor,
                         )
                         await transition_to(
                             session, document_id, DocumentStatus.CREATING_SOURCE_SPANS
@@ -769,6 +814,7 @@ async def process_document(
                 await _embed_document_chunks(
                     session_factory,
                     document_id=document_id,
+                    source_version=source_version,
                     provider=embedding_provider,
                     batch_size=settings.embedding_batch_size,
                 )
@@ -783,7 +829,11 @@ async def process_document(
 
             # Phase 10.3: mark indexed and land the terminal status (READY with
             # >= 1 chunk, else NEEDS_REVIEW) atomically, completing the lifecycle.
-            await _index_and_finalize(session_factory, document_id=document_id)
+            # Also the Epic 11.2 active-version handoff gate (flip + cross-version
+            # supersede on READY only).
+            await _index_and_finalize(
+                session_factory, document_id=document_id, source_version=source_version
+            )
             return chosen_count
         except (
             EmptyPdfError,

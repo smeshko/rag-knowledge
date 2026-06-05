@@ -21,18 +21,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.app import app
 from rag_recipes.api.dependencies import get_session
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.ingestion.pipeline.extraction import PROMPT_VERSION, SCHEMA_VERSION
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionRunStatus,
+    SourceType,
+    UploadStatus,
+)
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
 
 
 async def _seed_span(
-    session: AsyncSession, *, document_id: str, source_version: int, page: int = 1
+    session: AsyncSession,
+    *,
+    document_id: str,
+    source_version: int,
+    page: int = 1,
+    extractor_identity: str | None = None,
 ) -> SourceSpan:
-    """Seed one SourceSpan so max_source_version can resolve a version."""
-    locator = {"type": "pdf_page_range", "page_start": page, "page_end": page}
+    """Seed one SourceSpan so max_source_version can resolve a version.
+
+    ``extractor_identity`` is stamped into ``locator["meta"]`` so the auto selector
+    can read it back via get_version_extractor_identity.
+    """
+    locator: dict[str, Any] = {
+        "type": "pdf_page_range",
+        "page_start": page,
+        "page_end": page,
+    }
+    if extractor_identity is not None:
+        locator["meta"] = {"extractor_identity": extractor_identity}
     text = f"span page {page}"
     span = SourceSpan(
         id=new_id("span"),
@@ -40,13 +62,38 @@ async def _seed_span(
         source_version=source_version,
         source_type=SourceType.PDF,
         locator=locator,
-        locator_hash=hashlib.sha256(str(locator).encode()).hexdigest(),
+        locator_hash=hashlib.sha256(str(page).encode()).hexdigest(),
         text=text,
         text_hash=hashlib.sha256(text.encode()).hexdigest(),
     )
     session.add(span)
     await session.flush()
     return span
+
+
+async def _seed_extraction_run(
+    session: AsyncSession,
+    *,
+    document_id: str,
+    source_version: int = 1,
+    prompt_version: str = PROMPT_VERSION,
+    schema_version: str = SCHEMA_VERSION,
+) -> ExtractionRun:
+    """Seed a SUCCESS ExtractionRun so the auto selector has a latest run to read."""
+    run = ExtractionRun(
+        document_id=document_id,
+        source_version=source_version,
+        provider="openai",
+        model="gpt-x",
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        input_source_span_ids=[],
+        input_hash=hashlib.sha256(document_id.encode()).hexdigest(),
+        status=ExtractionRunStatus.SUCCESS,
+    )
+    session.add(run)
+    await session.flush()
+    return run
 
 
 @pytest_asyncio.fixture
@@ -160,14 +207,20 @@ async def test_reprocess_happy_path_for_each_mode_and_terminal_status(
         )
     assert response.status_code == 200, response.text
     body = response.json()
+    # These docs have no spans and no prior ExtractionRun, so `auto` resolves to
+    # new_source_version (the safe default). Both new_source_version and auto target
+    # max(spans)+1 = 1; reuse keeps the active version. current reflects the target.
+    resolves_to_new = mode in ("new_source_version", "auto")
+    expected_current = 1 if resolves_to_new else doc.active_source_version
     assert body == {
         "document_id": doc.id,
         "status": "queued",
         "previous_active_source_version": doc.active_source_version,
-        "current_source_version": doc.active_source_version,
+        "current_source_version": expected_current,
     }
 
-    # Verify the row was actually mutated in the DB.
+    # Verify the row was actually mutated in the DB. active_source_version is NOT
+    # touched by the endpoint for any mode (the new-version flip is the worker's job).
     refreshed = (
         await savepoint_session.execute(
             select(Document).where(Document.id == doc.id)
@@ -179,11 +232,13 @@ async def test_reprocess_happy_path_for_each_mode_and_terminal_status(
     assert refreshed.last_reprocess_reason == reason
     assert refreshed.active_source_version == doc.active_source_version
 
-    # Epic 11.1: only reuse_source_spans enqueues, and only when a version
-    # resolves. Here the READY doc has active_source_version=1 (resolvable); the
-    # NEEDS_REVIEW/FAILED docs have active=None and no spans (unresolvable), so
-    # reuse enqueues nothing. auto / new_source_version never enqueue.
-    if mode == "reuse_source_spans" and doc.active_source_version is not None:
+    # Dispatch: new_source_version and auto (→ new here) always enqueue (v=max+1);
+    # reuse enqueues only when a version resolves (READY has active=1;
+    # NEEDS_REVIEW/FAILED have no spans → nothing to reuse).
+    dispatched = resolves_to_new or (
+        mode == "reuse_source_spans" and doc.active_source_version is not None
+    )
+    if dispatched:
         fake_arq_redis.enqueue_job.assert_awaited_once()
     else:
         fake_arq_redis.enqueue_job.assert_not_awaited()
@@ -367,6 +422,164 @@ async def test_reuse_with_no_spans_does_not_enqueue(
     ).scalar_one()
     await savepoint_session.refresh(refreshed)
     assert refreshed.status is DocumentStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_new_source_version_enqueues_fresh_version_run(
+    client: httpx.AsyncClient,
+    savepoint_session: AsyncSession,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    """new_source_version enqueues a non-reuse run at max(spans)+1, leaves the
+    active version untouched, and reports current_source_version = the new version.
+    """
+    doc = await _seed_document(
+        savepoint_session,
+        content_hash="hash-new-version",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    await _seed_span(savepoint_session, document_id=doc.id, source_version=1)
+    async with client:
+        response = await client.post(
+            f"/api/v1/documents/{doc.id}/reprocess",
+            json={"mode": "new_source_version", "reason": "new pdf"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "document_id": doc.id,
+        "status": "queued",
+        "previous_active_source_version": 1,
+        "current_source_version": 2,
+    }
+    fake_arq_redis.enqueue_job.assert_awaited_once_with(
+        "process_document",
+        doc.id,
+        _job_id=None,
+        _queue_name=None,
+        _session_id=doc.id,
+        source_version=2,
+        reuse_source_spans=False,
+    )
+    # The endpoint does NOT flip active_source_version — the worker does on success.
+    refreshed = (
+        await savepoint_session.execute(select(Document).where(Document.id == doc.id))
+    ).scalar_one()
+    await savepoint_session.refresh(refreshed)
+    assert refreshed.active_source_version == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_dispatches_reuse_when_extractor_and_prompt_current(
+    client: httpx.AsyncClient,
+    savepoint_session: AsyncSession,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    """auto → reuse when the latest run's prompt/schema are current AND the active
+    version's extractor identity matches the configured extractor."""
+    doc = await _seed_document(
+        savepoint_session,
+        content_hash="hash-auto-reuse",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    await _seed_span(
+        savepoint_session,
+        document_id=doc.id,
+        source_version=1,
+        extractor_identity="pymupdf:embedded_text",
+    )
+    await _seed_extraction_run(savepoint_session, document_id=doc.id)
+    async with client:
+        response = await client.post(
+            f"/api/v1/documents/{doc.id}/reprocess", json={"mode": "auto"}
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["current_source_version"] == 1
+    fake_arq_redis.enqueue_job.assert_awaited_once_with(
+        "process_document",
+        doc.id,
+        _job_id=None,
+        _queue_name=None,
+        _session_id=doc.id,
+        source_version=1,
+        reuse_source_spans=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_dispatches_new_version_when_extractor_differs(
+    client: httpx.AsyncClient,
+    savepoint_session: AsyncSession,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    """auto → new_source_version when the active version's extractor identity
+    differs from the configured extractor (it must re-extract the PDF text)."""
+    doc = await _seed_document(
+        savepoint_session,
+        content_hash="hash-auto-new-extractor",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    await _seed_span(
+        savepoint_session,
+        document_id=doc.id,
+        source_version=1,
+        extractor_identity="legacy-extractor:v0",
+    )
+    await _seed_extraction_run(savepoint_session, document_id=doc.id)
+    async with client:
+        response = await client.post(
+            f"/api/v1/documents/{doc.id}/reprocess", json={"mode": "auto"}
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["current_source_version"] == 2
+    fake_arq_redis.enqueue_job.assert_awaited_once_with(
+        "process_document",
+        doc.id,
+        _job_id=None,
+        _queue_name=None,
+        _session_id=doc.id,
+        source_version=2,
+        reuse_source_spans=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_dispatches_new_version_when_no_prior_run(
+    client: httpx.AsyncClient,
+    savepoint_session: AsyncSession,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    """auto → new_source_version (safe default) when there is no prior ExtractionRun
+    to compare against, even if the active version's extractor identity matches."""
+    doc = await _seed_document(
+        savepoint_session,
+        content_hash="hash-auto-no-run",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    await _seed_span(
+        savepoint_session,
+        document_id=doc.id,
+        source_version=1,
+        extractor_identity="pymupdf:embedded_text",
+    )
+    async with client:
+        response = await client.post(
+            f"/api/v1/documents/{doc.id}/reprocess", json={"mode": "auto"}
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["current_source_version"] == 2
+    fake_arq_redis.enqueue_job.assert_awaited_once_with(
+        "process_document",
+        doc.id,
+        _job_id=None,
+        _queue_name=None,
+        _session_id=doc.id,
+        source_version=2,
+        reuse_source_spans=False,
+    )
 
 
 @pytest.mark.asyncio
