@@ -41,7 +41,7 @@ from rag_recipes.ingestion.pipeline.windows import (
 )
 from rag_recipes.ingestion.status import transition_to
 from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
-from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.errors import EmbeddingTechnicalError, LLMTechnicalError
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
 from rag_recipes.storage.enums import (
@@ -377,6 +377,74 @@ async def test_new_version_all_needs_review_does_not_flip(
             v1_item = await session.get(KnowledgeItem, v1_item_id)
             assert v1_item is not None
             assert v1_item.status is KnowledgeItemStatus.READY
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
+class _RaisingEmbeddingProvider(FakeEmbeddingProvider):
+    """A FakeEmbeddingProvider whose embed_batch always raises (failure scaffolding)."""
+
+    async def embed_batch(self, texts: list[Any], *, trace_context: Any = None) -> Any:
+        raise EmbeddingTechnicalError("boom")
+
+
+async def test_new_version_embedding_failure_keeps_prior_version_active(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A v2 run that fails AFTER finalize (during embedding) must not have flipped
+    the active version or superseded v1 (review #1).
+
+    The active-version handoff (flip + cross-version supersede) is gated on reaching
+    READY, which is after embedding. So an embedding failure leaves the document
+    FAILED with active_source_version still 1 and the v1 items still READY — the
+    rollback path is intact; the v2 artifacts exist but are inactive."""
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        v1_item_id = await _run_fresh_v1(
+            session_factory, document_id, tmp_path, monkeypatch
+        )
+
+        async with session_factory() as session:
+            await transition_to(session, document_id, DocumentStatus.QUEUED)
+            await session.commit()
+
+        # v2 extraction succeeds (a READY winner) but embedding then fails.
+        _patch_extract_seeds_v2(monkeypatch, document_id)
+        v2_spans = _build_spans(document_id, source_version=2)
+        provider = _provider_for(v2_spans, title="Carrot Soup", overall_high=0.9)
+        ctx = _ctx(session_factory, provider, tmp_path)
+        ctx["embedding_provider"] = _RaisingEmbeddingProvider()
+        with pytest.raises(EmbeddingTechnicalError):
+            await process_document(
+                ctx,
+                document_id,
+                source_version=2,
+                reuse_source_spans=False,
+            )
+
+        async with session_factory() as session:
+            doc = await session.get(Document, document_id)
+            assert doc is not None
+            assert doc.status is DocumentStatus.FAILED
+            # The handoff never reached the READY gate: no flip, no supersede.
+            assert doc.active_source_version == 1
+            v1_item = await session.get(KnowledgeItem, v1_item_id)
+            assert v1_item is not None
+            assert v1_item.status is KnowledgeItemStatus.READY
+            # The v2 winner exists (it was promoted in finalize) but is not active.
+            v2_ready = await session.scalar(
+                select(func.count())
+                .select_from(KnowledgeItem)
+                .where(
+                    KnowledgeItem.document_id == document_id,
+                    KnowledgeItem.source_version == 2,
+                    KnowledgeItem.status == KnowledgeItemStatus.READY,
+                )
+            )
+            assert v2_ready == 1
     finally:
         await _cleanup(session_factory, document_id, asset_id)
 

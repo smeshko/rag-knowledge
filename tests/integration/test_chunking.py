@@ -129,7 +129,7 @@ async def test_persist_chunks_for_ready_items_only(db_session: AsyncSession) -> 
     await db_session.flush()
 
     count = await persist_chunks_for_ready_items(
-        db_session, document_id=document_id, category=CATEGORY
+        db_session, document_id=document_id, source_version=1, category=CATEGORY
     )
     # All five canonical types for the single ready item; none for the others.
     assert count == 5
@@ -188,7 +188,7 @@ async def test_persist_chunks_no_ready_items_writes_nothing(
     await db_session.flush()
 
     count = await persist_chunks_for_ready_items(
-        db_session, document_id=document_id, category=CATEGORY
+        db_session, document_id=document_id, source_version=1, category=CATEGORY
     )
     assert count == 0
     total = await db_session.scalar(
