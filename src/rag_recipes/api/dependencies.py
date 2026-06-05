@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from arq.connections import ArqRedis
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +64,21 @@ def get_embedding_provider(
         dimensions=settings.embedding_dimensions,
         batch_size=settings.embedding_batch_size,
     )
+
+
+def require_debug_enabled(
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> None:
+    """Gate the dev-only debug endpoints on ``Settings.debug_endpoints_enabled``.
+
+    When disabled, raise a plain ``HTTPException(404)`` so the rendered body is
+    FastAPI's default ``{"detail": "Not Found"}`` — byte-for-byte identical to a
+    genuinely-unknown route (raising the project ``ApiError`` envelope would leak a
+    distinguishing fingerprint). Production therefore neither serves nor acknowledges
+    these endpoints. When enabled, pass through.
+    """
+    if not settings.debug_endpoints_enabled:
+        raise HTTPException(status_code=404)
 
 
 def require_api_token(
