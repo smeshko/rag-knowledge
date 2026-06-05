@@ -24,15 +24,14 @@ from rag_recipes.api.dependencies import (
 )
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.search import (
-    RetrievalDebugInfo,
     SearchRequestBody,
     SearchResponse,
 )
-from rag_recipes.api.search_projection import project_results
+from rag_recipes.api.search_projection import build_retrieval_debug, project_results
 from rag_recipes.config import Settings
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.retrieval.search import search
-from rag_recipes.retrieval.types import SearchRequest, SearchResult
+from rag_recipes.retrieval.types import SearchRequest
 
 router = APIRouter(tags=["search"])
 
@@ -76,7 +75,7 @@ async def search_documents(
     response = SearchResponse(
         query=result.debug.normalized_query,
         results=await project_results(session, result),
-        debug=_build_debug(result, settings)
+        debug=build_retrieval_debug(result, settings)
         if (body.include_debug and settings.debug_endpoints_enabled)
         else None,
     )
@@ -87,18 +86,3 @@ async def search_documents(
     if data.get("debug") is None:
         data.pop("debug", None)
     return data
-
-
-def _build_debug(result: SearchResult, settings: Settings) -> RetrievalDebugInfo:
-    debug = result.debug
-    return RetrievalDebugInfo(
-        retrieval_mode=debug.mode,
-        normalized_query=debug.normalized_query,
-        embedding_model=settings.embedding_model,
-        keyword_top_k=settings.search_keyword_top_k,
-        vector_top_k=settings.search_vector_top_k,
-        keyword_candidates=debug.keyword_candidates,
-        vector_candidates=debug.vector_candidates,
-        merged_candidates=debug.merged_chunks,
-        grouped_items=debug.grouped_items,
-    )

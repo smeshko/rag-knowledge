@@ -15,7 +15,11 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from rag_recipes.api.schemas.search import KnowledgeItemResult, SearchFilters
+from rag_recipes.api.schemas.search import (
+    KnowledgeItemResult,
+    RetrievalDebugInfo,
+    SearchFilters,
+)
 
 # --- Request (doc 8 § 1) ---
 
@@ -28,6 +32,7 @@ class AnswerRetrievalOptions(BaseModel):
 class AnswerOptions(BaseModel):
     style: str = "recommendation"
     include_results: bool = False
+    include_debug: bool = False
 
 
 class AnswerRequestBody(BaseModel):
@@ -62,6 +67,17 @@ class AnswerCitation(BaseModel):
     label: str
 
 
+class AnswerDebugInfo(BaseModel):
+    """Dev-only answer diagnostics (doc 8 § 11), gated like the search debug payload."""
+
+    retrieval_mode: str
+    model: str
+    prompt_version: str
+    context_item_count: int
+    citation_count: int
+    retrieval_debug: RetrievalDebugInfo | None = None
+
+
 class AnswerResponse(BaseModel):
     query: str
     answer: AnswerBody
@@ -69,3 +85,4 @@ class AnswerResponse(BaseModel):
     citations: list[AnswerCitation] = []
     results: list[KnowledgeItemResult] = []
     warnings: list[str] = []
+    debug: AnswerDebugInfo | None = None

@@ -21,9 +21,11 @@ from rag_recipes.api.schemas.search import (
     MatchedChunk,
     ResultDocument,
     ResultItem,
+    RetrievalDebugInfo,
     SourceCitation,
     StructuredPreview,
 )
+from rag_recipes.config import Settings
 from rag_recipes.retrieval.types import KnowledgeItemResult as FacadeItemResult
 from rag_recipes.retrieval.types import SearchResult
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
@@ -31,6 +33,27 @@ from rag_recipes.storage.models.source_span import SourceSpan
 
 TOP_INGREDIENTS = 5
 SNIPPET_MAX = 240
+
+
+def build_retrieval_debug(result: SearchResult, settings: Settings) -> RetrievalDebugInfo:
+    """Project the Epic-12 debug payload into the API ``RetrievalDebugInfo`` (doc 7 § 12).
+
+    Shared by ``/search`` (its top-level ``debug``) and ``/answers`` (the nested
+    ``retrieval_debug`` of its answer debug), so both report identical retrieval
+    diagnostics for the same query.
+    """
+    debug = result.debug
+    return RetrievalDebugInfo(
+        retrieval_mode=debug.mode,
+        normalized_query=debug.normalized_query,
+        embedding_model=settings.embedding_model,
+        keyword_top_k=settings.search_keyword_top_k,
+        vector_top_k=settings.search_vector_top_k,
+        keyword_candidates=debug.keyword_candidates,
+        vector_candidates=debug.vector_candidates,
+        merged_candidates=debug.merged_chunks,
+        grouped_items=debug.grouped_items,
+    )
 
 
 async def project_results(
