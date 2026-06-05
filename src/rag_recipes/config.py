@@ -64,7 +64,10 @@ class Settings(BaseSettings):
     # OpenAI spend are repeated on resume (DECISIONS #4).
     extraction_commit_batch_size: int = Field(default=5, ge=1)
 
-    search_default_limit: int = 10
+    # ge=1 so the answer route's effective-limit fallback (and search's own clamp)
+    # is guaranteed positive even with a bad env value — a ≤0 default would poison
+    # the context-pack item cap (Epic 17.2, review #3).
+    search_default_limit: int = Field(default=10, ge=1)
     search_keyword_top_k: int = 50
     search_vector_top_k: int = 50
     search_rrf_k: int = 60
