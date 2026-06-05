@@ -91,7 +91,15 @@ async def search(
     """Run the full retrieval pipeline and return the grouped, fetched result envelope."""
     nq = normalize_query(request.query)
     filters = build_filters(request)
-    limit = request.limit or settings.search_default_limit
+    # Clamp to a positive limit: a non-positive request.limit (0 is falsy; a
+    # negative would otherwise slice grouped[:-N] and silently drop ranked items)
+    # falls back to the configured default. Epic 13 validates at the HTTP boundary;
+    # this keeps the internal facade safe for any caller (review #1).
+    limit = (
+        request.limit
+        if request.limit and request.limit > 0
+        else settings.search_default_limit
+    )
     keyword_top_k = max(limit * 5, settings.search_keyword_top_k)
     vector_top_k = max(limit * 5, settings.search_vector_top_k)
 

@@ -262,6 +262,22 @@ async def test_hybrid_search_groups_items_with_both_signals(
     assert any(c.label == "page 42" for c in top.source_citations)
 
 
+async def test_non_positive_limit_falls_back_to_default(
+    db_session: AsyncSession,
+) -> None:
+    """A non-positive limit must not slice off ranked items (review #1)."""
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    seeded = await _seed_corpus(db_session, provider)
+    # limit=-1 would otherwise slice grouped[:-1] and drop the only result.
+    result = await search(
+        db_session,
+        SearchRequest(query=_QUERY, mode="hybrid", category="recipes", limit=-1),
+        provider=provider,
+        settings=_settings(),
+    )
+    assert [r.item.knowledge_item_id for r in result.items] == [seeded["target_item"]]
+
+
 async def test_keyword_and_vector_modes_return_item_results(
     db_session: AsyncSession,
 ) -> None:
