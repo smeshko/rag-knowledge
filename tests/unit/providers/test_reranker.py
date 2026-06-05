@@ -143,3 +143,13 @@ async def test_emit_out_of_range_rank_breaks_one_based_ranks() -> None:
 def test_emit_rejects_unknown_mode() -> None:
     with pytest.raises(ValueError, match="unknown emit mode"):
         FakeRerankerProvider(emit="nonsense")
+
+
+@pytest.mark.parametrize("mode", ["duplicate", "unknown", "missing", "out_of_range_rank"])
+async def test_emit_modes_are_safe_on_empty_candidates(mode: str) -> None:
+    # The malformed modes must not crash on an empty candidate list (no IndexError).
+    fake = FakeRerankerProvider(emit=mode)
+    results = await fake.rerank("q", [], top_n=10)
+    assert isinstance(results, list)
+    # Nothing to corrupt → at most the synthetic "unknown" entry, never an input id.
+    assert all(r.chunk_id == "__unknown__" for r in results)

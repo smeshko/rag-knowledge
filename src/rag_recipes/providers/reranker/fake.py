@@ -121,10 +121,11 @@ class FakeRerankerProvider(RerankerProvider):
         if self._emit == "missing":
             # Omit all but the first candidate (the rest are "missing" from the result).
             return base[:1]
-        if self._emit == "out_of_range_rank":
+        if self._emit == "out_of_range_rank" and base:
             # Unambiguously out of the 1-based [1, N] range: a sub-range 0 on the
             # first result and an over-range rank (> N) on the last, so a caller's
-            # clamp/ignore policy is exercised at both bounds.
+            # clamp/ignore policy is exercised at both bounds. Guarded on a non-empty
+            # base so an empty candidate list is a safe no-op (not an IndexError).
             out = [r.model_copy(deep=True) for r in base]
             out[0] = out[0].model_copy(update={"rank": 0})
             out[-1] = out[-1].model_copy(update={"rank": len(base) + 5})
