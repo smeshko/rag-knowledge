@@ -217,3 +217,20 @@ async def test_maybe_rerank_reorders_via_fake_score_map(monkeypatch: pytest.Monk
     out, applied = await _maybe_rerank(None, "q", merged, reranker=fake, settings=_settings())
     assert applied is True
     assert _ordered_items(out, rerank_applied=True) == ["item_b", "item_a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["unknown", "duplicate", "missing", "out_of_range_rank"])
+async def test_maybe_rerank_emit_modes_drop_no_input_chunk(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # Each malformed reranker-output mode degrades safely: no input chunk is dropped.
+    _patch_texts(monkeypatch, {"a1": "ta", "b1": "tb", "c1": "tc"})
+    fake = FakeRerankerProvider(emit=mode)
+    merged = [
+        _chunk("a1", item="item_a", score=0.9),
+        _chunk("b1", item="item_b", score=0.5),
+        _chunk("c1", item="item_c", score=0.1),
+    ]
+    out, _applied = await _maybe_rerank(None, "q", merged, reranker=fake, settings=_settings())
+    assert {c.chunk_id for c in out} == {"a1", "b1", "c1"}  # every input chunk survives
