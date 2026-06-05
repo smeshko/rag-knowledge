@@ -209,7 +209,9 @@ async def generate_answer(
         )
     except (ValidationError, TypeError):
         results = await project_results(session, result, structured=structured)
-        return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
+        return _fallback(
+            request.query, style, results=results, warning=FALLBACK_WARNING, debug=debug
+        )
 
     results = (
         await project_results(session, result, structured=structured)

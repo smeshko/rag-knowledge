@@ -594,6 +594,10 @@ async def test_generate_answer_unhashable_citation_ids_falls_back_no_crash(
     assert out.is_fallback is True
     assert out.warnings == [FALLBACK_WARNING]
     assert out.results == ["RESULT"]
+    # The malformed-output fallback must still carry debug like every other path
+    # (review #1, 17.3) — the route's T/T gate depends on it being non-None.
+    assert out.debug is not None
+    assert out.debug.prompt_version == "answer-recommendation-v1"
 
 
 @pytest.mark.asyncio
