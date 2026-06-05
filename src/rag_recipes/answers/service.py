@@ -154,23 +154,25 @@ async def generate_answer(
         results = await project_results(session, result, structured=structured)
         return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
 
-    # Success: reconstruct citations + recommendation titles from the pack.
-    answer_block = answer_json["answer"]
-    recommendations_json = answer_json.get("recommendations", [])
+    # Success: reconstruct citations + recommendation titles from the pack. Accessors
+    # stay defensive (validation passed, but never trust the wire's shape — review #1).
+    answer_block = answer_json.get("answer") or {}
+    recommendations_json = _as_list(answer_json.get("recommendations"))
     title_by_item = {item.knowledge_item_id: item.title for item in pack.items}
 
-    used_cite_ids: list[str] = list(answer_block.get("citations", []))
+    answer_citation_ids = [c for c in _as_list(answer_block.get("citations")) if isinstance(c, str)]
+    used_cite_ids: list[str] = list(answer_citation_ids)
     for rec in recommendations_json:
-        for cid in rec.get("citation_ids", []):
+        for cid in _as_list(rec.get("citation_ids")):
             if cid not in used_cite_ids:
                 used_cite_ids.append(cid)
 
     recommendations = [
         Recommendation(
-            knowledge_item_id=rec["knowledge_item_id"],
-            title=title_by_item.get(rec["knowledge_item_id"], ""),
-            reason=rec.get("reason", ""),
-            citation_ids=list(rec.get("citation_ids", [])),
+            knowledge_item_id=rec.get("knowledge_item_id", ""),
+            title=title_by_item.get(rec.get("knowledge_item_id"), ""),
+            reason=rec.get("reason") or "",
+            citation_ids=list(_as_list(rec.get("citation_ids"))),
         )
         for rec in recommendations_json
     ]
@@ -184,8 +186,8 @@ async def generate_answer(
         query=request.query,
         answer=AnswerBody(
             style=style,
-            text=answer_block.get("text", ""),
-            citations=list(answer_block.get("citations", [])),
+            text=answer_block.get("text") or "",
+            citations=answer_citation_ids,
         ),
         recommendations=recommendations,
         citations=build_response_citations(used_cite_ids, pack),
@@ -195,6 +197,17 @@ async def generate_answer(
     )
 
 
+def _as_list(value: Any) -> list[Any]:
+    """Coerce a model-supplied field to a list (``[]`` for anything non-list).
+
+    ``parse_error is None`` only guarantees a JSON *object*, not a schema-conforming
+    one — the provider does no post-parse JSON-Schema validation. So a wrong-typed
+    field (``null``, a string, …) must degrade to a validation failure, never an
+    ``AttributeError``/``TypeError`` that would escape ``generate_answer`` as a 500.
+    """
+    return value if isinstance(value, list) else []
+
+
 def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[str]:
     """Return citation-validation errors (empty ⇒ valid). Membership **and** binding.
 
@@ -202,6 +215,11 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
     pack; (b) every recommendation has ≥1 citation; (c) every recommended
     ``knowledge_item_id`` is a pack item; (d) each of a recommendation's
     ``citation_ids`` belongs to *that* recommendation's item.
+
+    Structurally malformed (but parseable) output — a missing/non-object ``answer``,
+    a non-list ``recommendations``, a non-object recommendation — is itself a
+    validation error, so a non-conforming model response funnels to the safe
+    fallback rather than crashing (review #1, finding 1).
     """
     cite_owner: dict[str, str] = {}
     for item in pack.items:
@@ -211,14 +229,24 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
 
     errors: list[str] = []
 
-    answer_block = answer_json.get("answer", {})
-    for cid in answer_block.get("citations", []):
+    answer_block = answer_json.get("answer")
+    if not isinstance(answer_block, dict):
+        errors.append("answer block is missing or not an object")
+        answer_block = {}
+    for cid in _as_list(answer_block.get("citations")):
         if cid not in cite_owner:
             errors.append(f"answer cites unknown citation_id {cid!r}")
 
-    for index, rec in enumerate(answer_json.get("recommendations", [])):
+    recommendations = answer_json.get("recommendations")
+    if not isinstance(recommendations, list):
+        errors.append("recommendations is missing or not a list")
+        recommendations = []
+    for index, rec in enumerate(recommendations):
+        if not isinstance(rec, dict):
+            errors.append(f"recommendation[{index}] is not an object")
+            continue
         rec_item = rec.get("knowledge_item_id")
-        citation_ids = rec.get("citation_ids", [])
+        citation_ids = _as_list(rec.get("citation_ids"))
         if rec_item not in pack_item_ids:
             errors.append(
                 f"recommendation[{index}] cites unknown knowledge_item_id {rec_item!r}"
