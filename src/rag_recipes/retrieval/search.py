@@ -147,6 +147,7 @@ async def search(
             vector_candidates=len(vector_candidates),
             merged_chunks=len(merged),
             grouped_items=len(grouped),
+            rerank_applied=False,  # Epic 18.2 wires the rerank step; 18.1 is always False.
         ),
     )
 

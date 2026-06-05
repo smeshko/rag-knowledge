@@ -53,6 +53,7 @@ def build_retrieval_debug(result: SearchResult, settings: Settings) -> Retrieval
         vector_candidates=debug.vector_candidates,
         merged_candidates=debug.merged_chunks,
         grouped_items=debug.grouped_items,
+        rerank_applied=debug.rerank_applied,
     )
 
 

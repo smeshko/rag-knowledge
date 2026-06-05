@@ -107,6 +107,7 @@ class RetrievalDebugInfo(BaseModel):
     vector_candidates: int | None = None
     merged_candidates: int | None = None
     grouped_items: int | None = None
+    rerank_applied: bool | None = None
 
 
 class SearchResponse(BaseModel):

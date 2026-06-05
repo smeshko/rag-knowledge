@@ -123,6 +123,14 @@ class Settings(BaseSettings):
     answer_context_item_limit: int = Field(default=6, ge=1)
     answer_matched_chunks_per_item: int = Field(default=3, ge=1)
 
+    # Reranking (Epic 18). Off by default; the rerank step is wired into search() in
+    # Phase 18.2. rerank_top_n is bounded (ge=1, le=200) so a ≤0 value can't silently
+    # disable reranking and a huge value can't feed an LLM reranker a costly fan-out.
+    reranking_enabled: bool = False
+    rerank_provider: str = "openai"
+    rerank_model: str = "gpt-4.1"
+    rerank_top_n: int = Field(default=50, ge=1, le=200)
+
     @field_validator("redis_url")
     @classmethod
     def _redis_url_requires_credentials(cls, value: str) -> str:

@@ -304,6 +304,8 @@ async def test_debug_gated_by_both_flags(db_session: AsyncSession) -> None:
     assert "debug" in body
     assert body["debug"]["retrieval_mode"] == "hybrid"
     assert body["debug"]["embedding_model"] == _FAKE_MODEL
+    # Epic 18.1: the rerank_applied flag now surfaces, defaulting False (no rerank wired).
+    assert body["debug"]["rerank_applied"] is False
 
     # include_debug=true but debug_endpoints_enabled=false → debug absent.
     async with _client(db_session, debug_enabled=False) as client:
