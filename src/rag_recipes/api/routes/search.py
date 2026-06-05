@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.dependencies import (
     get_embedding_provider,
+    get_reranker_provider,
     get_session,
     get_settings,
 )
@@ -30,6 +31,7 @@ from rag_recipes.api.schemas.search import (
 from rag_recipes.api.search_projection import build_retrieval_debug, project_results
 from rag_recipes.config import Settings
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
+from rag_recipes.providers.reranker.base import RerankerProvider
 from rag_recipes.retrieval.search import search
 from rag_recipes.retrieval.types import SearchRequest
 
@@ -44,6 +46,7 @@ async def search_documents(
     session: AsyncSession = Depends(get_session),  # noqa: B008
     settings: Settings = Depends(get_settings),  # noqa: B008
     provider: EmbeddingProvider = Depends(get_embedding_provider),  # noqa: B008
+    reranker: RerankerProvider | None = Depends(get_reranker_provider),  # noqa: B008
 ) -> Any:
     if not body.query.strip():
         raise ApiError(
@@ -70,7 +73,9 @@ async def search_documents(
         limit=body.limit if body.limit is not None else settings.search_default_limit,
         exclude_needs_review=body.filters.exclude_needs_review,
     )
-    result = await search(session, request, provider=provider, settings=settings)
+    result = await search(
+        session, request, provider=provider, settings=settings, reranker=reranker
+    )
 
     response = SearchResponse(
         query=result.debug.normalized_query,

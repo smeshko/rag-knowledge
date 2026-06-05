@@ -8,11 +8,16 @@ wiring + degradation tests depend on (deterministic identity / score ordering, t
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from rag_recipes.providers.errors import ProviderError, RerankerTechnicalError
+from rag_recipes.providers.llm.fake import FakeLLMProvider
+from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from rag_recipes.providers.reranker.base import RerankerProvider
 from rag_recipes.providers.reranker.fake import FakeRerankerProvider
+from rag_recipes.providers.reranker.openai import OpenAIRerankerProvider
 from rag_recipes.providers.reranker.types import RerankCandidate, RerankResult
 from rag_recipes.storage.enums import ChunkType
 
@@ -153,3 +158,117 @@ async def test_emit_modes_are_safe_on_empty_candidates(mode: str) -> None:
     assert isinstance(results, list)
     # Nothing to corrupt → at most the synthetic "unknown" entry, never an input id.
     assert all(r.chunk_id == "__unknown__" for r in results)
+
+
+# --- OpenAIRerankerProvider (real provider; FakeLLMProvider injected) ------------
+
+
+async def test_openai_reranker_orders_by_model_ranking() -> None:
+    canned = {
+        "ranking": [
+            {"chunk_id": "c3", "relevance_score": 0.9},
+            {"chunk_id": "c1", "relevance_score": 0.5},
+            {"chunk_id": "c2", "relevance_score": 0.2},
+        ]
+    }
+    reranker = OpenAIRerankerProvider(
+        "sk-test", model="gpt-4.1", llm_provider=FakeLLMProvider(default_output=canned)
+    )
+    results = await reranker.rerank("q", _candidates(), top_n=10)
+    assert [r.chunk_id for r in results] == ["c3", "c1", "c2"]
+    assert [r.rank for r in results] == [1, 2, 3]  # rank = list position
+    assert results[0].relevance_score == 0.9
+
+
+async def test_openai_reranker_parse_error_raises_technical() -> None:
+    rejected = StructuredOutputResponse(
+        output_json=None,
+        parse_error="model output is not valid JSON",
+        raw_text="{bad",
+        usage=TokenUsage(input_tokens=1, output_tokens=0),
+        provider="openai",
+        model="gpt-4.1",
+    )
+    reranker = OpenAIRerankerProvider(
+        "sk-test", model="gpt-4.1", llm_provider=FakeLLMProvider(default_output=rejected)
+    )
+    with pytest.raises(RerankerTechnicalError):
+        await reranker.rerank("q", _candidates(), top_n=10)
+
+
+async def test_openai_reranker_technical_failure_raises_technical() -> None:
+    reranker = OpenAIRerankerProvider(
+        "sk-test", model="gpt-4.1", llm_provider=FakeLLMProvider(fail_technically=True)
+    )
+    with pytest.raises(RerankerTechnicalError):
+        await reranker.rerank("q", _candidates(), top_n=10)
+
+
+async def test_openai_reranker_skips_malformed_entries() -> None:
+    # A clean-parsed object whose entries are partly malformed: only well-formed
+    # entries become results (the facade further validates ids).
+    canned = {
+        "ranking": [
+            {"chunk_id": "c2", "relevance_score": 0.9},
+            {"chunk_id": 123, "relevance_score": 0.5},  # non-string id → skipped
+            "not-an-object",  # → skipped
+            {"chunk_id": "c1"},  # missing score → skipped
+        ]
+    }
+    reranker = OpenAIRerankerProvider(
+        "sk-test", model="gpt-4.1", llm_provider=FakeLLMProvider(default_output=canned)
+    )
+    results = await reranker.rerank("q", _candidates(), top_n=10)
+    assert [r.chunk_id for r in results] == ["c2"]
+
+
+async def test_openai_reranker_logs_success(caplog: pytest.LogCaptureFixture) -> None:
+    canned = {"ranking": [{"chunk_id": "c1", "relevance_score": 0.9}]}
+    reranker = OpenAIRerankerProvider(
+        "sk-test", model="gpt-4.1", llm_provider=FakeLLMProvider(default_output=canned)
+    )
+    with caplog.at_level("INFO", logger="rag_recipes.providers.reranker.openai"):
+        await reranker.rerank("q", _candidates(), top_n=7)
+    assert any(
+        "rerank ok" in r.message and "model=gpt-4.1" in r.message and "top_n=7" in r.message
+        for r in caplog.records
+    )
+
+
+# --- get_reranker_provider dependency -------------------------------------------
+
+
+def _settings(*, enabled: bool, provider: str = "openai") -> Any:
+    class _S:
+        openai_api_key = "sk-test"
+        rerank_model = "gpt-4.1"
+        rerank_request_timeout_seconds = 8.0
+
+        def __init__(self) -> None:
+            self.reranking_enabled = enabled
+            self.rerank_provider = provider
+
+    return _S()
+
+
+def test_get_reranker_provider_returns_none_when_disabled() -> None:
+    from rag_recipes.api.dependencies import get_reranker_provider
+
+    assert get_reranker_provider(settings=_settings(enabled=False)) is None
+
+
+def test_get_reranker_provider_builds_openai_when_enabled() -> None:
+    from rag_recipes.api.dependencies import get_reranker_provider
+
+    provider = get_reranker_provider(settings=_settings(enabled=True, provider="openai"))
+    assert isinstance(provider, OpenAIRerankerProvider)
+    assert provider.provider == "openai"
+
+
+def test_get_reranker_provider_rejects_unsupported_provider() -> None:
+    # Defensive backstop (a Settings validator also rejects this at load): an
+    # unsupported provider raises and constructs no OpenAI client.
+    from rag_recipes.api.dependencies import get_reranker_provider
+
+    with pytest.raises(ValueError, match="unsupported rerank_provider"):
+        get_reranker_provider(settings=_settings(enabled=True, provider="cohere"))
