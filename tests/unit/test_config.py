@@ -24,6 +24,32 @@ def test_pdf_min_text_chars_for_page_defaults_to_20(monkeypatch: pytest.MonkeyPa
     assert settings.pdf_min_text_chars_for_page == 20
 
 
+def test_search_boost_and_weight_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://test/test")
+    monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
+    monkeypatch.setenv("REDIS_PASSWORD", "redis")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    s = Settings(_env_file=None)
+    # Keyword-side boost table (doc 7 § 7).
+    assert s.recipe_keyword_boost_title == 1.40
+    assert s.recipe_keyword_boost_ingredients == 1.20
+    assert s.recipe_keyword_boost_steps == 1.05
+    assert s.recipe_keyword_boost_summary == 1.00
+    assert s.recipe_keyword_boost_full == 0.95
+    # Vector-side boost table.
+    assert s.recipe_vector_boost_summary == 1.20
+    assert s.recipe_vector_boost_full == 1.10
+    assert s.recipe_vector_boost_steps == 1.00
+    assert s.recipe_vector_boost_ingredients == 0.95
+    assert s.recipe_vector_boost_title == 0.90
+    # Source weights, supporting bonus + cap, and the embedding provider name.
+    assert s.keyword_source_weight == 1.0
+    assert s.vector_source_weight == 1.0
+    assert s.search_supporting_chunk_bonus == 0.05
+    assert s.search_supporting_chunk_bonus_cap == 0.15
+    assert s.embedding_provider == "openai"
+
+
 def test_settings_fails_when_database_url_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("REDIS_URL", "redis://:redis@localhost:6379/0")
