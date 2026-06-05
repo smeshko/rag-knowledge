@@ -21,11 +21,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_recipes.api.app import app
 from rag_recipes.api.dependencies import (
     get_embedding_provider,
+    get_reranker_provider,
     get_session,
     get_settings,
 )
 from rag_recipes.ingestion.pipeline.extraction import PROMPT_VERSION, SCHEMA_VERSION
 from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
+from rag_recipes.providers.errors import RerankerTechnicalError
+from rag_recipes.providers.reranker.base import RerankerProvider
+from rag_recipes.providers.reranker.fake import FakeRerankerProvider
+from rag_recipes.providers.reranker.types import RerankCandidate, RerankResult
 from rag_recipes.storage.enums import (
     ChunkParentType,
     ChunkType,
@@ -53,7 +58,12 @@ _QUERY = "white beans soup"
 
 @asynccontextmanager
 async def _client(
-    db_session: AsyncSession, *, debug_enabled: bool = False, with_auth: bool = True
+    db_session: AsyncSession,
+    *,
+    debug_enabled: bool = False,
+    with_auth: bool = True,
+    reranking_enabled: bool = False,
+    reranker: RerankerProvider | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
     settings = get_settings().model_copy(
         update={
@@ -61,6 +71,7 @@ async def _client(
             "embedding_provider": _FAKE_PROVIDER,
             "embedding_model": _FAKE_MODEL,
             "debug_endpoints_enabled": debug_enabled,
+            "reranking_enabled": reranking_enabled,
         }
     )
     fake = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
@@ -71,6 +82,7 @@ async def _client(
     app.dependency_overrides[get_session] = _override_session
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_embedding_provider] = lambda: fake
+    app.dependency_overrides[get_reranker_provider] = lambda: reranker
     transport = httpx.ASGITransport(app=app)
     headers = AUTH_HEADERS if with_auth else {}
     try:
@@ -79,7 +91,7 @@ async def _client(
         ) as client:
             yield client
     finally:
-        for dep in (get_session, get_settings, get_embedding_provider):
+        for dep in (get_session, get_settings, get_embedding_provider, get_reranker_provider):
             app.dependency_overrides.pop(dep, None)
 
 
@@ -334,3 +346,137 @@ async def test_missing_token_returns_401(db_session: AsyncSession) -> None:
         resp = await client.post("/api/v1/search", json={"query": _QUERY})
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "unauthorized"
+
+
+# --- Epic 18.2: optional rerank end-to-end --------------------------------------
+
+
+class _BoomReranker(RerankerProvider):
+    """A reranker that records whether it was called and always fails technically."""
+
+    provider = "boom"
+
+    def __init__(self) -> None:
+        self.called = False
+
+    async def rerank(
+        self,
+        query: str,
+        candidates: list[RerankCandidate],
+        *,
+        top_n: int,
+        trace_context: object = None,
+    ) -> list[RerankResult]:
+        self.called = True
+        raise RerankerTechnicalError("boom")
+
+
+async def _seed_two_recipes(
+    session: AsyncSession, provider: FakeEmbeddingProvider
+) -> tuple[str, str]:
+    """Seed two recipes where hybrid RRF ranks the on-vector one (A) first."""
+    doc = await _make_document(session)
+    span = await _make_span(session, doc, page=42)
+    a_id = await _make_recipe(
+        session,
+        doc,
+        title="A White Bean Soup",
+        chunk_text="a cozy soup with creamy white beans",
+        embed_text=_QUERY,  # on-vector → ranks first
+        provider=provider,
+        span_ids=[span],
+        structured_data=_RECIPE_STRUCTURED,
+    )
+    b_id = await _make_recipe(
+        session,
+        doc,
+        title="B Bean Side",
+        chunk_text="white beans",
+        embed_text="completely unrelated machinery",  # off-vector → ranks second
+        provider=provider,
+        span_ids=[span],
+        structured_data=_RECIPE_STRUCTURED,
+    )
+    return a_id, b_id
+
+
+async def test_rerank_enabled_changes_final_ordering(db_session: AsyncSession) -> None:
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    await _seed_two_recipes(db_session, provider)
+
+    # Baseline (disabled) to read the order + the chunk ids per item.
+    async with _client(db_session) as client:
+        baseline = (
+            await client.post("/api/v1/search", json={"query": _QUERY, "mode": "hybrid"})
+        ).json()
+    base_order = [r["item"]["id"] for r in baseline["results"]]
+    assert len(base_order) == 2
+    first_chunk = baseline["results"][0]["matched_chunks"][0]["chunk_id"]
+    second_chunk = baseline["results"][1]["matched_chunks"][0]["chunk_id"]
+
+    # The reranker promotes the previously-second item's chunk to the top.
+    fake = FakeRerankerProvider(scores_by_chunk_id={second_chunk: 100.0, first_chunk: 0.0})
+    async with _client(
+        db_session, reranking_enabled=True, reranker=fake, debug_enabled=True
+    ) as client:
+        body = (
+            await client.post(
+                "/api/v1/search",
+                json={"query": _QUERY, "mode": "hybrid", "include_debug": True},
+            )
+        ).json()
+    new_order = [r["item"]["id"] for r in body["results"]]
+    assert new_order[0] == base_order[1]  # the previously-second item is now first
+    assert new_order != base_order
+    assert body["debug"]["rerank_applied"] is True
+
+
+async def test_rerank_disabled_is_baseline_and_reranker_never_called(
+    db_session: AsyncSession,
+) -> None:
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    await _seed_two_recipes(db_session, provider)
+
+    async with _client(db_session) as client:
+        baseline = (
+            await client.post("/api/v1/search", json={"query": _QUERY, "mode": "hybrid"})
+        ).json()
+
+    # Disabled, but inject a reranker that explodes if called — search must skip it.
+    boom = _BoomReranker()
+    async with _client(
+        db_session, reranking_enabled=False, reranker=boom, debug_enabled=True
+    ) as client:
+        body = (
+            await client.post(
+                "/api/v1/search",
+                json={"query": _QUERY, "mode": "hybrid", "include_debug": True},
+            )
+        ).json()
+    assert body["results"] == baseline["results"]  # byte-identical to baseline
+    assert body["debug"]["rerank_applied"] is False
+    assert boom.called is False  # never constructed-into-use when disabled
+
+
+async def test_rerank_technical_error_degrades_to_baseline(db_session: AsyncSession) -> None:
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    await _seed_two_recipes(db_session, provider)
+
+    async with _client(db_session) as client:
+        baseline = (
+            await client.post("/api/v1/search", json={"query": _QUERY, "mode": "hybrid"})
+        ).json()
+
+    boom = _BoomReranker()
+    async with _client(
+        db_session, reranking_enabled=True, reranker=boom, debug_enabled=True
+    ) as client:
+        resp = await client.post(
+            "/api/v1/search",
+            json={"query": _QUERY, "mode": "hybrid", "include_debug": True},
+        )
+    assert resp.status_code == 200  # degrades, never 500
+    body = resp.json()
+    assert body["results"] == baseline["results"]  # RRF baseline order intact
+    assert body["debug"]["rerank_applied"] is False
+    assert boom.called is True  # it was called and raised

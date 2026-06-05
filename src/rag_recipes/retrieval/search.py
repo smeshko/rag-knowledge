@@ -10,6 +10,7 @@ owns the dev-only gating of the debug payload (DECISIONS #4).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -18,6 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.config import Settings
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
+from rag_recipes.providers.errors import RerankerTechnicalError
+from rag_recipes.providers.reranker.base import RerankerProvider
+from rag_recipes.providers.reranker.types import RerankCandidate, RerankResult
 from rag_recipes.retrieval.filters import build_filters
 from rag_recipes.retrieval.group import group_by_item
 from rag_recipes.retrieval.keyword import keyword_search
@@ -28,6 +32,7 @@ from rag_recipes.retrieval.types import (
     ItemResult,
     KnowledgeItemResult,
     MatchedChunkRef,
+    MergedChunk,
     ResultDocument,
     ResultItem,
     SearchDebug,
@@ -43,6 +48,8 @@ from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_span import SourceSpan
 
 _EN_DASH = "–"
+
+logger = logging.getLogger(__name__)
 
 
 def _keyword_boost_table(settings: Settings) -> Mapping[ChunkType, float]:
@@ -87,8 +94,17 @@ async def search(
     *,
     provider: EmbeddingProvider,
     settings: Settings,
+    reranker: RerankerProvider | None = None,
 ) -> SearchResult:
-    """Run the full retrieval pipeline and return the grouped, fetched result envelope."""
+    """Run the full retrieval pipeline and return the grouped, fetched result envelope.
+
+    When ``settings.reranking_enabled`` and a ``reranker`` is injected, an optional
+    rerank step sits between candidate merge and grouping (Epic 18.2): it re-scores the
+    top ``rerank_top_n`` merged chunks so the reranker — not RRF + the supporting bonus
+    — decides final item order. The step is a no-op (RRF order intact) when disabled,
+    when no reranker is injected, when the reranker returns nothing usable, or when it
+    fails — reranking can never break or stall search.
+    """
     nq = normalize_query(request.query)
     filters = build_filters(request)
     # Clamp to a positive limit: a non-positive request.limit (0 is falsy; a
@@ -130,11 +146,24 @@ async def search(
         keyword_source_weight=settings.keyword_source_weight,
         vector_source_weight=settings.vector_source_weight,
     )
-    grouped = group_by_item(
-        merged,
-        supporting_bonus=settings.search_supporting_chunk_bonus,
-        supporting_bonus_cap=settings.search_supporting_chunk_bonus_cap,
-    )
+    # Optional rerank (Epic 18.2): when applied, the reranker overwrites the top
+    # chunks' scores so it — not RRF + the supporting bonus — drives item order, so
+    # grouping runs with the bonus suppressed. Disabled / no reranker / no-op / failure
+    # all leave the RRF order intact with the normal bonus.
+    rerank_applied = False
+    if settings.reranking_enabled and reranker is not None:
+        merged, rerank_applied = await _maybe_rerank(
+            session, nq.keyword, merged, reranker=reranker, settings=settings
+        )
+
+    if rerank_applied:
+        grouped = group_by_item(merged, supporting_bonus=0.0, supporting_bonus_cap=0.0)
+    else:
+        grouped = group_by_item(
+            merged,
+            supporting_bonus=settings.search_supporting_chunk_bonus,
+            supporting_bonus_cap=settings.search_supporting_chunk_bonus_cap,
+        )
     top_items = grouped[:limit]
 
     items = await _fetch_and_build(session, top_items)
@@ -147,9 +176,128 @@ async def search(
             vector_candidates=len(vector_candidates),
             merged_chunks=len(merged),
             grouped_items=len(grouped),
-            rerank_applied=False,  # Epic 18.2 wires the rerank step; 18.1 is always False.
+            rerank_applied=rerank_applied,
         ),
     )
+
+
+async def _maybe_rerank(
+    session: AsyncSession,
+    query: str,
+    merged: list[MergedChunk],
+    *,
+    reranker: RerankerProvider,
+    settings: Settings,
+) -> tuple[list[MergedChunk], bool]:
+    """Rerank the top ``rerank_top_n`` merged chunks; return ``(merged, applied)``.
+
+    Builds ``RerankCandidate``s for the top chunks (text fetched + truncated to
+    ``rerank_max_chars_per_candidate``), calls the reranker, and on success overwrites
+    the reranked chunks' ``score`` so the reranker drives item order (see
+    ``_apply_rerank``). A ``RerankerTechnicalError`` (incl. timeout) or an empty/all-
+    invalid result is a no-op: the original RRF scores stay intact and ``applied`` is
+    ``False`` — reranking never breaks or stalls search.
+    """
+    if not merged:
+        return merged, False
+
+    top = merged[: settings.rerank_top_n]
+    text_by_id = await _fetch_chunk_texts(session, [c.chunk_id for c in top])
+    max_chars = settings.rerank_max_chars_per_candidate
+    candidates = [
+        RerankCandidate(
+            chunk_id=chunk.chunk_id,
+            text=text_by_id.get(chunk.chunk_id, "")[:max_chars],
+            knowledge_item_id=chunk.knowledge_item_id,
+            chunk_type=chunk.chunk_type,
+            score=chunk.score,
+            sources=list(chunk.sources),
+        )
+        for chunk in top
+    ]
+
+    try:
+        results = await reranker.rerank(query, candidates, top_n=settings.rerank_top_n)
+    except RerankerTechnicalError as exc:
+        logger.warning(
+            "rerank failed; falling back to RRF order provider=%s candidates=%d reason=%s",
+            reranker.provider,
+            len(candidates),
+            exc,
+        )
+        return merged, False
+
+    return _apply_rerank(merged, top, results)
+
+
+def _apply_rerank(
+    merged: list[MergedChunk],
+    top: list[MergedChunk],
+    results: list[RerankResult],
+) -> tuple[list[MergedChunk], bool]:
+    """Overwrite reranked chunks' scores with a rank-dominating effective score.
+
+    Degradation is total (never drops an input chunk): unknown ids are ignored, the
+    first occurrence of a duplicate id wins, the result's ``rank`` field is ignored in
+    favor of list position, and chunks the reranker omitted (plus the tail beyond
+    ``rerank_top_n``) keep their RRF score — so they fall behind the reranked head.
+
+    The effective score is ``rerank_base + (N − position)`` where ``rerank_base =
+    max(RRF score over all merged) + 1.0`` is computed **at request time** (RRF scores
+    depend on configurable, unbounded source weights / chunk-type boosts, so a fixed
+    constant could be overtaken by config drift). Every reranked chunk therefore
+    strictly dominates every RRF score, and the unique, monotonic ranks encode order
+    with no ties. If zero valid input ids come back, this is a no-op (RRF intact).
+    """
+    top_by_id = {chunk.chunk_id: chunk for chunk in top}
+    valid_ordered: list[str] = []
+    seen: set[str] = set()
+    unknown = duplicates = 0
+    for result in results:
+        chunk_id = result.chunk_id
+        if chunk_id not in top_by_id:
+            unknown += 1
+            continue
+        if chunk_id in seen:
+            duplicates += 1
+            continue
+        seen.add(chunk_id)
+        valid_ordered.append(chunk_id)
+
+    omitted = len(top) - len(valid_ordered)
+    if unknown or duplicates or omitted:
+        logger.warning(
+            "rerank output degraded; keeping all input chunks "
+            "unknown=%d duplicate=%d omitted=%d valid=%d",
+            unknown,
+            duplicates,
+            omitted,
+            len(valid_ordered),
+        )
+
+    n = len(valid_ordered)
+    if n == 0:
+        # Nothing usable came back — leave RRF scores untouched, do not reorder.
+        return merged, False
+
+    rerank_base = max(chunk.score for chunk in merged) + 1.0
+    for position, chunk_id in enumerate(valid_ordered):
+        top_by_id[chunk_id].score = rerank_base + (n - (position + 1))
+    return merged, True
+
+
+async def _fetch_chunk_texts(
+    session: AsyncSession, chunk_ids: list[str]
+) -> dict[str, str]:
+    """Batch-fetch ``Chunk.text`` for ``chunk_ids`` (the rerank candidate payload)."""
+    if not chunk_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Chunk.id, Chunk.text).where(Chunk.id.in_(chunk_ids))
+        )
+    ).all()
+    return {row.id: row.text for row in rows}
 
 
 async def _fetch_and_build(
