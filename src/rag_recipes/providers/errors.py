@@ -8,6 +8,7 @@ __all__ = [
     "LLMTechnicalError",
     "PdfExtractionError",
     "ProviderError",
+    "RerankerTechnicalError",
 ]
 
 
@@ -29,3 +30,7 @@ class LLMTechnicalError(ProviderError):
 
 class EmbeddingTechnicalError(ProviderError):
     """An embedding call failed for a technical reason."""
+
+
+class RerankerTechnicalError(ProviderError):
+    """A reranker call failed for a technical reason (transport, timeout, provider error)."""

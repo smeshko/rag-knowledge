@@ -387,3 +387,28 @@ def test_search_default_limit_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
     assert "search_default_limit" in str(excinfo.value).lower()
+
+
+def test_reranker_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Epic 18 reranker config; off by default (the rerank step is wired in 18.2).
+    _required_env(monkeypatch)
+    for var in ("RERANKING_ENABLED", "RERANK_PROVIDER", "RERANK_MODEL", "RERANK_TOP_N"):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.reranking_enabled is False
+    assert settings.rerank_provider == "openai"
+    assert settings.rerank_model == "gpt-4.1"
+    assert settings.rerank_top_n == 50
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "201"])
+def test_rerank_top_n_out_of_bounds_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # rerank_top_n is Field(ge=1, le=200): ≤0 would silently disable reranking and a
+    # huge value would feed an LLM reranker a costly fan-out (Epic 18.1).
+    _required_env(monkeypatch)
+    monkeypatch.setenv("RERANK_TOP_N", value)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "rerank_top_n" in str(excinfo.value).lower()

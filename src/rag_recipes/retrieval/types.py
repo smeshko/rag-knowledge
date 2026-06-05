@@ -165,6 +165,9 @@ class SearchDebug:
     vector_candidates: int
     merged_chunks: int
     grouped_items: int
+    # Epic 18: whether a reranker actually reordered the candidates. Defaulted False
+    # and additive; 18.2 sets it True only when a rerank is applied.
+    rerank_applied: bool = False
 
 
 @dataclass
