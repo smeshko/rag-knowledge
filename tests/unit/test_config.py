@@ -344,3 +344,37 @@ def test_llm_request_timeout_seconds_rejects_below_one(monkeypatch: pytest.Monke
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
     assert "llm_request_timeout_seconds" in str(excinfo.value).lower()
+
+
+def test_answer_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Epic 17 answer-layer defaults (doc 8 § 3). answer_llm_model defaults to None
+    # (resolved to llm_model at the dependency boundary, not here).
+    _required_env(monkeypatch)
+    for var in (
+        "ANSWER_LLM_MODEL",
+        "ANSWER_PROMPT_VERSION",
+        "ANSWER_SCHEMA_VERSION",
+        "ANSWER_CONTEXT_ITEM_LIMIT",
+        "ANSWER_MATCHED_CHUNKS_PER_ITEM",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.answer_llm_model is None
+    assert settings.answer_prompt_version == "answer-recommendation-v1"
+    assert settings.answer_schema_version == "answer.v1"
+    assert settings.answer_context_item_limit == 6
+    assert settings.answer_matched_chunks_per_item == 3
+
+
+@pytest.mark.parametrize(
+    "var",
+    ["ANSWER_CONTEXT_ITEM_LIMIT", "ANSWER_MATCHED_CHUNKS_PER_ITEM"],
+)
+def test_answer_cap_fields_reject_zero(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
+    # The two caps are Field(ge=1): a ≤0 value would silently include nearly all
+    # results or force an empty context, so it is rejected at Settings load.
+    _required_env(monkeypatch)
+    monkeypatch.setenv(var, "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert var.lower() in str(excinfo.value).lower()

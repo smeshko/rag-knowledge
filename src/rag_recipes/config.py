@@ -109,6 +109,17 @@ class Settings(BaseSettings):
     extraction_min_recipe_chars: int = Field(default=200, ge=0)
     extraction_max_recipe_chars: int = Field(default=20000, ge=1)
 
+    # Query-time answer layer (Epic 17, doc 8 § 3). answer_llm_model is left None
+    # and resolved to llm_model at the dependency boundary (a class default can't
+    # reference a sibling field). The two cap fields are Field(ge=1) so a ≤0 env
+    # value is rejected at Settings load rather than silently including nearly all
+    # results (negative) or forcing an empty context (zero).
+    answer_llm_model: str | None = None
+    answer_prompt_version: str = "answer-recommendation-v1"
+    answer_schema_version: str = "answer.v1"
+    answer_context_item_limit: int = Field(default=6, ge=1)
+    answer_matched_chunks_per_item: int = Field(default=3, ge=1)
+
     @field_validator("redis_url")
     @classmethod
     def _redis_url_requires_credentials(cls, value: str) -> str:
