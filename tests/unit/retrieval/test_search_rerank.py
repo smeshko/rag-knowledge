@@ -200,6 +200,33 @@ async def test_maybe_rerank_technical_error_falls_back_to_rrf(
 
 
 @pytest.mark.asyncio
+async def test_maybe_rerank_unexpected_error_falls_back_to_rrf(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Defense-in-depth: a reranker raising something OTHER than RerankerTechnicalError
+    # (a provider bug) must still degrade to RRF order, never break search (review #1).
+    _patch_texts(monkeypatch, {"a1": "t"})
+
+    class _Buggy(RerankerProvider):
+        provider = "buggy"
+
+        async def rerank(
+            self, query: str, candidates: Any, *, top_n: int, trace_context: Any = None
+        ) -> Any:
+            raise ValueError("a bug, not a RerankerTechnicalError")
+
+    merged = [_chunk("a1", item="item_a", score=0.5)]
+    original = [(c.chunk_id, c.score) for c in merged]
+    with caplog.at_level("WARNING", logger="rag_recipes.retrieval.search"):
+        out, applied = await _maybe_rerank(
+            None, "q", merged, reranker=_Buggy(), settings=_settings()
+        )
+    assert applied is False
+    assert [(c.chunk_id, c.score) for c in out] == original  # RRF intact
+    assert any("unexpected error" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_maybe_rerank_empty_merged_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRerankerProvider()
     out, applied = await _maybe_rerank(None, "q", [], reranker=fake, settings=_settings())

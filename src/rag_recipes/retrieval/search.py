@@ -226,6 +226,20 @@ async def _maybe_rerank(
             exc,
         )
         return merged, False
+    except Exception:
+        # "Reranking can never break search": a reranker raising anything unexpected
+        # (a provider bug, not the documented RerankerTechnicalError) must still degrade
+        # to the un-reranked RRF order, not 500 the request. Logged with the traceback
+        # so the bug is still visible. The facade's own _apply_rerank stays outside this
+        # guard, so a bug *there* surfaces normally rather than being silently masked.
+        logger.warning(
+            "rerank raised an unexpected error; falling back to RRF order "
+            "provider=%s candidates=%d",
+            reranker.provider,
+            len(candidates),
+            exc_info=True,
+        )
+        return merged, False
 
     return _apply_rerank(merged, top, results)
 
@@ -244,10 +258,13 @@ def _apply_rerank(
 
     The effective score is ``rerank_base + (N − position)`` where ``rerank_base =
     max(RRF score over all merged) + 1.0`` is computed **at request time** (RRF scores
-    depend on configurable, unbounded source weights / chunk-type boosts, so a fixed
-    constant could be overtaken by config drift). Every reranked chunk therefore
-    strictly dominates every RRF score, and the unique, monotonic ranks encode order
-    with no ties. If zero valid input ids come back, this is a no-op (RRF intact).
+    depend on configurable source weights / chunk-type boosts, so a fixed constant
+    could be overtaken by config drift). Every reranked chunk therefore strictly
+    dominates every RRF score for any RRF magnitude within normal float precision (i.e.
+    any realistic weight/boost config; the ``+ 1.0`` offset only loses its gap at
+    astronomically large, non-physical RRF scores ≳ 1e15), and the unique, monotonic
+    ranks encode order with no ties. If zero valid input ids come back, this is a no-op
+    (RRF intact).
     """
     top_by_id = {chunk.chunk_id: chunk for chunk in top}
     valid_ordered: list[str] = []
