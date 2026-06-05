@@ -160,14 +160,18 @@ async def test_reprocess_happy_path_for_each_mode_and_terminal_status(
         )
     assert response.status_code == 200, response.text
     body = response.json()
+    # new_source_version targets max(spans)+1 = 1 here (these docs have no spans);
+    # reuse/auto keep the active version. current_source_version reflects the target.
+    expected_current = 1 if mode == "new_source_version" else doc.active_source_version
     assert body == {
         "document_id": doc.id,
         "status": "queued",
         "previous_active_source_version": doc.active_source_version,
-        "current_source_version": doc.active_source_version,
+        "current_source_version": expected_current,
     }
 
-    # Verify the row was actually mutated in the DB.
+    # Verify the row was actually mutated in the DB. active_source_version is NOT
+    # touched by the endpoint for any mode (the new-version flip is the worker's job).
     refreshed = (
         await savepoint_session.execute(
             select(Document).where(Document.id == doc.id)
@@ -179,11 +183,13 @@ async def test_reprocess_happy_path_for_each_mode_and_terminal_status(
     assert refreshed.last_reprocess_reason == reason
     assert refreshed.active_source_version == doc.active_source_version
 
-    # Epic 11.1: only reuse_source_spans enqueues, and only when a version
-    # resolves. Here the READY doc has active_source_version=1 (resolvable); the
-    # NEEDS_REVIEW/FAILED docs have active=None and no spans (unresolvable), so
-    # reuse enqueues nothing. auto / new_source_version never enqueue.
-    if mode == "reuse_source_spans" and doc.active_source_version is not None:
+    # Dispatch: new_source_version always enqueues (v=max+1); reuse enqueues only
+    # when a version resolves (READY has active=1; NEEDS_REVIEW/FAILED have no
+    # spans → nothing to reuse); auto is not dispatched until TASK-004.
+    dispatched = mode == "new_source_version" or (
+        mode == "reuse_source_spans" and doc.active_source_version is not None
+    )
+    if dispatched:
         fake_arq_redis.enqueue_job.assert_awaited_once()
     else:
         fake_arq_redis.enqueue_job.assert_not_awaited()
@@ -367,6 +373,51 @@ async def test_reuse_with_no_spans_does_not_enqueue(
     ).scalar_one()
     await savepoint_session.refresh(refreshed)
     assert refreshed.status is DocumentStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_new_source_version_enqueues_fresh_version_run(
+    client: httpx.AsyncClient,
+    savepoint_session: AsyncSession,
+    fake_arq_redis: AsyncMock,
+) -> None:
+    """new_source_version enqueues a non-reuse run at max(spans)+1, leaves the
+    active version untouched, and reports current_source_version = the new version.
+    """
+    doc = await _seed_document(
+        savepoint_session,
+        content_hash="hash-new-version",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    await _seed_span(savepoint_session, document_id=doc.id, source_version=1)
+    async with client:
+        response = await client.post(
+            f"/api/v1/documents/{doc.id}/reprocess",
+            json={"mode": "new_source_version", "reason": "new pdf"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "document_id": doc.id,
+        "status": "queued",
+        "previous_active_source_version": 1,
+        "current_source_version": 2,
+    }
+    fake_arq_redis.enqueue_job.assert_awaited_once_with(
+        "process_document",
+        doc.id,
+        _job_id=None,
+        _queue_name=None,
+        _session_id=doc.id,
+        source_version=2,
+        reuse_source_spans=False,
+    )
+    # The endpoint does NOT flip active_source_version — the worker does on success.
+    refreshed = (
+        await savepoint_session.execute(select(Document).where(Document.id == doc.id))
+    ).scalar_one()
+    await savepoint_session.refresh(refreshed)
+    assert refreshed.active_source_version == 1
 
 
 @pytest.mark.asyncio

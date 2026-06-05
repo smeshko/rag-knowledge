@@ -473,6 +473,35 @@ async def get_document_status(
     )
 
 
+async def _enqueue_reprocess(
+    arq_redis: ArqRedis,
+    document_id: str,
+    *,
+    source_version: int,
+    reuse_source_spans: bool,
+) -> None:
+    """Best-effort enqueue of a reprocess run (mirrors upload_document).
+
+    The row is already committed and QUEUED, so a failed enqueue is logged — not
+    fatal — and the stuck-job cron is the backstop for the un-picked-up doc. Called
+    AFTER the commit so a rolled-back guard (the 409 path) never leaves a job queued.
+    """
+    try:
+        await enqueue_job(
+            arq_redis,
+            "process_document",
+            document_id,
+            session_id=document_id,
+            source_version=source_version,
+            reuse_source_spans=reuse_source_spans,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to enqueue process_document for %s; stuck-job cron will catch it",
+            document_id,
+        )
+
+
 @router.post("/documents/{document_id}/reprocess")
 async def reprocess_document(
     document_id: str,
@@ -534,52 +563,53 @@ async def reprocess_document(
         )
     await session.commit()
 
-    # Epic 11.1: only `reuse_source_spans` actually starts work here. `auto` /
-    # `new_source_version` are accepted (row flipped to QUEUED, mode/reason
-    # recorded above) but enqueue NO job — dispatching the reuse pipeline for them
-    # would run the wrong work (reuse skips PDF re-extraction and would supersede
-    # live items against stale source text while last_reprocess_mode records a
-    # different mode). The stuck-job cron is the existing backstop for any
-    # un-picked-up QUEUED doc.
-    # TODO(11.2): add the auto selector + new_source_version re-extraction enqueue.
+    # Dispatch the resolved run after the commit. `current_source_version` reflects
+    # the version the run targets: the active version for reuse (unchanged), or the
+    # new version for a new-source-version run.
+    current_source_version = previous
     if mode is ReprocessMode.REUSE_SOURCE_SPANS:
-        # Resolve the version to reuse: the active version if the doc has one,
-        # else the highest existing span version. Do NOT fabricate
-        # source_version=1 — a terminal doc with no spans (active and max both
-        # None, e.g. an early FAILED whose first extraction never persisted spans)
-        # has no source text to reuse, so a reuse job would be a queued no-op.
-        # Skip the enqueue entirely in that case.
+        # Reuse the existing version: the active version if the doc has one, else
+        # the highest existing span version. Do NOT fabricate source_version=1 — a
+        # terminal doc with no spans (active and max both None, e.g. an early FAILED
+        # whose first extraction never persisted spans) has no source text to reuse,
+        # so skip the enqueue (the row still sits QUEUED for the cron backstop).
         resolved_version = (
             previous
             if previous is not None
             else await repo.max_source_version(document_id)
         )
         if resolved_version is not None:
-            # Best-effort, mirroring upload_document: the row is committed and
-            # QUEUED, so a failed enqueue is logged (not fatal) and the stuck-job
-            # cron will catch the un-picked-up doc. Enqueue AFTER the commit so a
-            # rolled-back guard (the 409 path above) never leaves a job queued.
-            try:
-                await enqueue_job(
-                    arq_redis,
-                    "process_document",
-                    document_id,
-                    session_id=document_id,
-                    source_version=resolved_version,
-                    reuse_source_spans=True,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to enqueue reuse process_document for %s; "
-                    "stuck-job cron will catch it",
-                    document_id,
-                )
+            await _enqueue_reprocess(
+                arq_redis,
+                document_id,
+                source_version=resolved_version,
+                reuse_source_spans=True,
+            )
+    elif mode is ReprocessMode.NEW_SOURCE_VERSION:
+        # Re-extract the PDF text into a fresh version = max(existing) + 1 (v1 when
+        # the doc has no spans). `active_source_version` stays on the OLD version
+        # during the run; the worker flips it to the new version on success (Epic
+        # 11.2 TASK-003). Concurrency: the terminal->QUEUED guarded UPDATE above
+        # already serialises reprocess starts, so two near-simultaneous requests
+        # can't both compute the same max+1 (the loser 409s before reaching here);
+        # the SourceSpan (document_id, source_version, locator_hash) unique key is
+        # the backstop.
+        new_version = (await repo.max_source_version(document_id) or 0) + 1
+        current_source_version = new_version
+        await _enqueue_reprocess(
+            arq_redis,
+            document_id,
+            source_version=new_version,
+            reuse_source_spans=False,
+        )
+    # else: ReprocessMode.AUTO — the selector resolves to a concrete reuse/new run
+    # and dispatches through the same paths in TASK-004. Until then `auto` flips the
+    # row to QUEUED with no job (the cron backstop), as in 11.1.
+    # TODO(11.2 TASK-004): add the auto selector dispatch.
 
-    # `current_source_version` mirrors `active_source_version`: a reuse reprocess
-    # re-runs the existing version, so the active version is unchanged.
     return ReprocessResponse(
         document_id=document_id,
         status=DocumentStatus.QUEUED.value,
         previous_active_source_version=previous,
-        current_source_version=previous,
+        current_source_version=current_source_version,
     )
