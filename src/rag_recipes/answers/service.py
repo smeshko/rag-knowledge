@@ -195,8 +195,11 @@ def _build_success_payload(
     ``ValidationError``/``TypeError`` during model construction so the caller routes
     to the safe fallback rather than letting it escape as a 500.
     """
-    answer_block = answer_json.get("answer") or {}
-    recommendations_json = _as_list(answer_json.get("recommendations"))
+    raw_answer = answer_json.get("answer")
+    answer_block = raw_answer if isinstance(raw_answer, dict) else {}
+    recommendations_json = [
+        rec for rec in _as_list(answer_json.get("recommendations")) if isinstance(rec, dict)
+    ]
     title_by_item = {item.knowledge_item_id: item.title for item in pack.items}
 
     answer_citation_ids = [
@@ -205,18 +208,22 @@ def _build_success_payload(
     used_cite_ids: list[str] = list(answer_citation_ids)
     for rec in recommendations_json:
         for cid in _as_list(rec.get("citation_ids")):
-            if cid not in used_cite_ids:
+            if isinstance(cid, str) and cid not in used_cite_ids:
                 used_cite_ids.append(cid)
 
-    recommendations = [
-        Recommendation(
-            knowledge_item_id=rec.get("knowledge_item_id", ""),
-            title=title_by_item.get(rec.get("knowledge_item_id"), ""),
-            reason=rec.get("reason") or "",
-            citation_ids=list(_as_list(rec.get("citation_ids"))),
+    recommendations: list[Recommendation] = []
+    for rec in recommendations_json:
+        item_id = rec.get("knowledge_item_id", "")
+        recommendations.append(
+            Recommendation(
+                knowledge_item_id=item_id,
+                title=title_by_item.get(item_id, "") if isinstance(item_id, str) else "",
+                reason=rec.get("reason") or "",
+                citation_ids=[
+                    c for c in _as_list(rec.get("citation_ids")) if isinstance(c, str)
+                ],
+            )
         )
-        for rec in recommendations_json
-    ]
     answer_body = AnswerBody(
         style=style,
         text=answer_block.get("text") or "",
@@ -261,8 +268,11 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
     if not isinstance(answer_block, dict):
         errors.append("answer block is missing or not an object")
         answer_block = {}
+    # `isinstance(cid, str)` is checked *before* the membership lookup so an
+    # unhashable nested value (e.g. a list) can never reach `cid in cite_owner` and
+    # raise `TypeError` — it is reported as an invalid citation instead (review #3).
     for cid in _as_list(answer_block.get("citations")):
-        if cid not in cite_owner:
+        if not isinstance(cid, str) or cid not in cite_owner:
             errors.append(f"answer cites unknown citation_id {cid!r}")
 
     recommendations = answer_json.get("recommendations")
@@ -275,14 +285,14 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
             continue
         rec_item = rec.get("knowledge_item_id")
         citation_ids = _as_list(rec.get("citation_ids"))
-        if rec_item not in pack_item_ids:
+        if not isinstance(rec_item, str) or rec_item not in pack_item_ids:
             errors.append(
                 f"recommendation[{index}] cites unknown knowledge_item_id {rec_item!r}"
             )
         if not citation_ids:
             errors.append(f"recommendation[{index}] has no citations")
         for cid in citation_ids:
-            if cid not in cite_owner:
+            if not isinstance(cid, str) or cid not in cite_owner:
                 errors.append(
                     f"recommendation[{index}] cites unknown citation_id {cid!r}"
                 )
