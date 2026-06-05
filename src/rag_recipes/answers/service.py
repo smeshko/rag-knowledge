@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -154,13 +155,53 @@ async def generate_answer(
         results = await project_results(session, result, structured=structured)
         return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
 
-    # Success: reconstruct citations + recommendation titles from the pack. Accessors
-    # stay defensive (validation passed, but never trust the wire's shape — review #1).
+    # Success: reconstruct the answer body / recommendations / citations from the
+    # pack. validate_citations checks citation membership/binding and the structural
+    # shape, but not every scalar type (a truthy non-string `text`/`reason` would
+    # trip Pydantic) — so guard model construction and degrade any residual surprise
+    # to the safe fallback, never a 500 (review #1, finding 1 / round 2). The DB
+    # projection stays OUTSIDE the guard so a genuine DB failure still surfaces.
+    try:
+        answer_body, recommendations, response_citations = _build_success_payload(
+            answer_json, pack, style=style
+        )
+    except (ValidationError, TypeError):
+        results = await project_results(session, result, structured=structured)
+        return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
+
+    results = (
+        await project_results(session, result, structured=structured)
+        if include_results
+        else []
+    )
+    return AnswerResult(
+        query=request.query,
+        answer=answer_body,
+        recommendations=recommendations,
+        citations=response_citations,
+        results=results,
+        warnings=[],
+        is_fallback=False,
+    )
+
+
+def _build_success_payload(
+    answer_json: dict[str, Any], pack: ContextPack, *, style: str
+) -> tuple[AnswerBody, list[Recommendation], list[AnswerCitation]]:
+    """Reconstruct the answer body, recommendations, and response citations from the pack.
+
+    Pure (no I/O). Accessors stay defensive, but a residual non-conforming scalar
+    (e.g. a truthy non-string ``text``/``reason``) is allowed to raise
+    ``ValidationError``/``TypeError`` during model construction so the caller routes
+    to the safe fallback rather than letting it escape as a 500.
+    """
     answer_block = answer_json.get("answer") or {}
     recommendations_json = _as_list(answer_json.get("recommendations"))
     title_by_item = {item.knowledge_item_id: item.title for item in pack.items}
 
-    answer_citation_ids = [c for c in _as_list(answer_block.get("citations")) if isinstance(c, str)]
+    answer_citation_ids = [
+        c for c in _as_list(answer_block.get("citations")) if isinstance(c, str)
+    ]
     used_cite_ids: list[str] = list(answer_citation_ids)
     for rec in recommendations_json:
         for cid in _as_list(rec.get("citation_ids")):
@@ -176,25 +217,12 @@ async def generate_answer(
         )
         for rec in recommendations_json
     ]
-
-    results = (
-        await project_results(session, result, structured=structured)
-        if include_results
-        else []
+    answer_body = AnswerBody(
+        style=style,
+        text=answer_block.get("text") or "",
+        citations=answer_citation_ids,
     )
-    return AnswerResult(
-        query=request.query,
-        answer=AnswerBody(
-            style=style,
-            text=answer_block.get("text") or "",
-            citations=answer_citation_ids,
-        ),
-        recommendations=recommendations,
-        citations=build_response_citations(used_cite_ids, pack),
-        results=results,
-        warnings=[],
-        is_fallback=False,
-    )
+    return answer_body, recommendations, build_response_citations(used_cite_ids, pack)
 
 
 def _as_list(value: Any) -> list[Any]:

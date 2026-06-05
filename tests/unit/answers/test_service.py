@@ -545,3 +545,53 @@ async def test_generate_answer_null_citations_succeeds_without_crash(
     assert out.is_fallback is False
     assert out.answer.citations == []  # null coerced to empty, no crash
     assert out.citations[0].citation_id == "cite_1"  # picked up from the recommendation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda c: c["answer"].__setitem__("text", 42), id="text-int"),
+        pytest.param(lambda c: c["answer"].__setitem__("text", {"n": "x"}), id="text-object"),
+        pytest.param(
+            lambda c: c["recommendations"][0].__setitem__("reason", 7), id="reason-int"
+        ),
+        pytest.param(
+            lambda c: c["recommendations"][0].__setitem__("reason", ["a"]), id="reason-list"
+        ),
+    ],
+)
+async def test_generate_answer_truthy_nonstring_scalar_falls_back(
+    monkeypatch: pytest.MonkeyPatch, mutate: Any
+) -> None:
+    # A truthy non-string text/reason passes citation validation but would trip
+    # Pydantic model construction — it must degrade to the safe fallback, not a 500
+    # (review #1, finding 1 / round 2).
+    result = _make_search_result(
+        items=[_retrieval_item(item_id="item_1", chunk_id="c1", span_id="span_1")]
+    )
+    _patch_db_seams(
+        monkeypatch,
+        result=result,
+        chunk_inputs={"c1": ChunkInput(text="beans", source_span_ids=["span_1"])},
+    )
+    canned: dict[str, Any] = {
+        "answer": {"style": "recommendation", "text": "ok", "citations": ["cite_1"]},
+        "recommendations": [
+            {"knowledge_item_id": "item_1", "reason": "r", "citation_ids": ["cite_1"]}
+        ],
+        "citations": [],
+    }
+    mutate(canned)
+    out = await generate_answer(
+        None,
+        _request(),
+        style="recommendation",
+        include_results=True,
+        llm_provider=FakeLLMProvider(default_output=canned),
+        embedding_provider=object(),
+        settings=_settings(),
+    )
+    assert out.is_fallback is True
+    assert out.warnings == [FALLBACK_WARNING]
+    assert out.results == ["RESULT"]
