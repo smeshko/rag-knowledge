@@ -102,3 +102,74 @@ class ItemResult:
     knowledge_item_id: str
     item_score: float
     matched_chunks: list[MergedChunk]
+
+
+# --- Result envelope (doc 7 § 11) — the internal shape Epic 13 maps to the API ---
+
+
+@dataclass
+class ResultItem:
+    """The KnowledgeItem projection in a search result."""
+
+    knowledge_item_id: str
+    item_type: str
+    title: str
+    summary: str | None
+    status: str
+
+
+@dataclass
+class ResultDocument:
+    """The parent Document projection in a search result."""
+
+    document_id: str
+    title: str
+    author: str
+
+
+@dataclass
+class MatchedChunkRef:
+    """A matched chunk reference with its fused score."""
+
+    chunk_id: str
+    chunk_type: ChunkType
+    score: float
+
+
+@dataclass
+class SourceCitation:
+    """A source-span citation with a human-readable page label (doc 7 § 10)."""
+
+    source_span_id: str
+    label: str
+
+
+@dataclass
+class KnowledgeItemResult:
+    """One grouped, fetched item-level result."""
+
+    item: ResultItem
+    document: ResultDocument
+    item_score: float
+    matched_chunks: list[MatchedChunkRef]
+    source_citations: list[SourceCitation]
+
+
+@dataclass
+class SearchDebug:
+    """Diagnostic counts for a search run (Epic 13 gates its dev-only exposure)."""
+
+    mode: str
+    normalized_query: str
+    keyword_candidates: int
+    vector_candidates: int
+    merged_chunks: int
+    grouped_items: int
+
+
+@dataclass
+class SearchResult:
+    """The internal search envelope: ranked item results + a debug payload."""
+
+    items: list[KnowledgeItemResult]
+    debug: SearchDebug
