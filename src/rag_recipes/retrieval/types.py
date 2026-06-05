@@ -72,3 +72,33 @@ class ChunkCandidate:
     raw_score: float
     distance: float | None = None
     similarity: float | None = None
+
+
+@dataclass
+class MergedChunk:
+    """A chunk after reciprocal-rank-fusion of the two legs (doc 7 § 8).
+
+    ``score`` is the boosted, weighted RRF score; for a chunk matched by both legs
+    it is the SUM of the two contributions. ``sources`` lists the legs that
+    contributed (``["keyword", "vector"]`` for a both-legs chunk, keyword-first).
+    """
+
+    chunk_id: str
+    knowledge_item_id: str
+    chunk_type: ChunkType
+    score: float
+    sources: list[str]
+
+
+@dataclass
+class ItemResult:
+    """Merged chunks grouped under their parent KnowledgeItem (doc 7 § 9).
+
+    ``item_score`` is the best matched chunk's score plus a capped supporting-chunk
+    bonus for matching across multiple distinct chunk types. ``matched_chunks`` are
+    the item's contributing ``MergedChunk``s.
+    """
+
+    knowledge_item_id: str
+    item_score: float
+    matched_chunks: list[MergedChunk]
