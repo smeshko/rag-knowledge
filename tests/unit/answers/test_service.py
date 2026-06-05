@@ -204,6 +204,27 @@ def test_validate_citations_tolerates_unhashable_knowledge_item_id() -> None:
     assert any("unknown knowledge_item_id" in e for e in errors)
 
 
+def test_validate_citations_allows_empty_recommendations_with_answer_citation() -> None:
+    # summary/direct_answer may omit recommendations, but the answer must still cite.
+    ok: dict[str, Any] = {
+        "answer": {"style": "summary", "text": "x", "citations": ["cite_1"]},
+        "recommendations": [],
+        "citations": [],
+    }
+    assert validate_citations(ok, _pack_one_item()) == []
+
+
+def test_validate_citations_rejects_zero_citation_generated_answer() -> None:
+    # An answer with no recommendations AND no answer.citations is ungrounded.
+    bad: dict[str, Any] = {
+        "answer": {"style": "summary", "text": "x", "citations": []},
+        "recommendations": [],
+        "citations": [],
+    }
+    errors = validate_citations(bad, _pack_one_item())
+    assert any("no valid citations" in e for e in errors)
+
+
 def test_build_response_citations_reconstructs_from_pack() -> None:
     cites = build_response_citations(["cite_1"], _pack_one_item())
     assert len(cites) == 1
@@ -607,6 +628,115 @@ async def test_generate_answer_null_citations_succeeds_without_crash(
     assert out.is_fallback is False
     assert out.answer.citations == []  # null coerced to empty, no crash
     assert out.citations[0].citation_id == "cite_1"  # picked up from the recommendation
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_summary_empty_recommendations_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # summary may return empty recommendations as long as the answer cites ≥1 id;
+    # the resolved per-style prompt_version flows into the debug payload.
+    result = _make_search_result(
+        items=[_retrieval_item(item_id="item_1", chunk_id="c1", span_id="span_1")]
+    )
+    _patch_db_seams(
+        monkeypatch,
+        result=result,
+        chunk_inputs={"c1": ChunkInput(text="beans", source_span_ids=["span_1"])},
+    )
+    canned: dict[str, Any] = {
+        "answer": {"style": "summary", "text": "A summary.", "citations": ["cite_1"]},
+        "recommendations": [],
+        "citations": [],
+    }
+    out = await generate_answer(
+        None,
+        _request(),
+        style="summary",
+        include_results=False,
+        llm_provider=FakeLLMProvider(default_output=canned),
+        embedding_provider=object(),
+        settings=_settings(),
+    )
+    assert out.is_fallback is False
+    assert out.answer.style == "summary"
+    assert out.recommendations == []
+    assert out.citations[0].citation_id == "cite_1"
+    assert out.debug is not None
+    assert out.debug.prompt_version == "answer-summary-v1"
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_summary_zero_citations_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A generated summary with no recommendations AND no answer.citations is
+    # ungrounded → safe fallback, not a citation-free answer.
+    result = _make_search_result(
+        items=[_retrieval_item(item_id="item_1", chunk_id="c1", span_id="span_1")]
+    )
+    _patch_db_seams(
+        monkeypatch,
+        result=result,
+        chunk_inputs={"c1": ChunkInput(text="beans", source_span_ids=["span_1"])},
+    )
+    canned: dict[str, Any] = {
+        "answer": {"style": "summary", "text": "ungrounded", "citations": []},
+        "recommendations": [],
+        "citations": [],
+    }
+    out = await generate_answer(
+        None,
+        _request(),
+        style="summary",
+        include_results=True,
+        llm_provider=FakeLLMProvider(default_output=canned),
+        embedding_provider=object(),
+        settings=_settings(),
+    )
+    assert out.is_fallback is True
+    assert out.warnings == [FALLBACK_WARNING]
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_summary_cross_item_binding_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Binding is NOT relaxed for the new styles: a present recommendation citing a
+    # cite from another item still fails → fallback.
+    result = _make_search_result(
+        items=[
+            _retrieval_item(item_id="item_1", chunk_id="c1", span_id="span_1"),
+            _retrieval_item(item_id="item_2", chunk_id="c2", span_id="span_2"),
+        ]
+    )
+    _patch_db_seams(
+        monkeypatch,
+        result=result,
+        chunk_inputs={
+            "c1": ChunkInput(text="a", source_span_ids=["span_1"]),
+            "c2": ChunkInput(text="b", source_span_ids=["span_2"]),
+        },
+    )
+    canned: dict[str, Any] = {
+        "answer": {"style": "summary", "text": "x", "citations": ["cite_1"]},
+        # item_1 recommendation citing cite_2 (belongs to item_2) — misattribution.
+        "recommendations": [
+            {"knowledge_item_id": "item_1", "reason": "r", "citation_ids": ["cite_2"]}
+        ],
+        "citations": [],
+    }
+    out = await generate_answer(
+        None,
+        _request(),
+        style="summary",
+        include_results=True,
+        llm_provider=FakeLLMProvider(default_output=canned),
+        embedding_provider=object(),
+        settings=_settings(),
+    )
+    assert out.is_fallback is True
+    assert out.warnings == [FALLBACK_WARNING]
 
 
 @pytest.mark.asyncio

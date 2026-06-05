@@ -29,7 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.answers.context_pack import ChunkInput, ContextPack, build_context_pack
-from rag_recipes.answers.prompt import render_answer_input
+from rag_recipes.answers.prompt import render_answer_input, resolve_prompt_version
 from rag_recipes.answers.schema import build_answer_v1_json_schema
 from rag_recipes.api.schemas.answers import (
     AnswerBody,
@@ -117,7 +117,7 @@ async def generate_answer(
 
     # The resolved per-style prompt + version drive both the LLM request and the
     # debug payload, so traces and the debug `prompt_version` match the style used.
-    prompt_version = settings.answer_prompt_version
+    prompt_version = resolve_prompt_version(style)
     debug = AnswerDebugFields(
         retrieval_mode=request.mode,
         model=llm_provider.default_model,
@@ -171,7 +171,7 @@ async def generate_answer(
                 model=llm_provider.default_model,
                 prompt_version=prompt_version,
                 schema_version=settings.answer_schema_version,
-                input=render_answer_input(request.query, pack),
+                input=render_answer_input(request.query, pack, style=style),
                 json_schema=build_answer_v1_json_schema(),
             )
         )
@@ -289,10 +289,18 @@ def _as_list(value: Any) -> list[Any]:
 def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[str]:
     """Return citation-validation errors (empty ⇒ valid). Membership **and** binding.
 
-    Rules (doc 8 § 7, plus binding): (a) every cited ``citation_id`` exists in the
-    pack; (b) every recommendation has ≥1 citation; (c) every recommended
+    Rules (doc 8 §§ 7, 9, plus binding): (a) every cited ``citation_id`` exists in the
+    pack; (b) every **present** recommendation has ≥1 citation; (c) every recommended
     ``knowledge_item_id`` is a pack item; (d) each of a recommendation's
-    ``citation_ids`` belongs to *that* recommendation's item.
+    ``citation_ids`` belongs to *that* recommendation's item; (e) the answer carries
+    ≥1 valid citation overall (across ``answer.citations`` and recommendation
+    ``citation_ids``) — a generated answer with zero citations is ungrounded.
+
+    ``recommendations[]`` may be **empty** (``summary``/``direct_answer`` styles) — the
+    per-recommendation rules (b)/(c)/(d) are vacuous for an empty list, but rule (e)
+    still requires the answer itself to cite ≥1 valid id, so empty-recommendation
+    styles must populate ``answer.citations``. Membership + binding are NOT relaxed
+    for any present recommendation in any style (review #1, finding 1).
 
     Structurally malformed (but parseable) output — a missing/non-object ``answer``,
     a non-list ``recommendations``, a non-object recommendation — is itself a
@@ -306,6 +314,7 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
     pack_item_ids = {item.knowledge_item_id for item in pack.items}
 
     errors: list[str] = []
+    valid_cited: set[str] = set()
 
     answer_block = answer_json.get("answer")
     if not isinstance(answer_block, dict):
@@ -317,6 +326,8 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
     for cid in _as_list(answer_block.get("citations")):
         if not isinstance(cid, str) or cid not in cite_owner:
             errors.append(f"answer cites unknown citation_id {cid!r}")
+        else:
+            valid_cited.add(cid)
 
     recommendations = answer_json.get("recommendations")
     if not isinstance(recommendations, list):
@@ -344,6 +355,11 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
                     f"recommendation[{index}] cites {cid!r} which belongs to a "
                     f"different item ({cite_owner[cid]!r}, not {rec_item!r})"
                 )
+            else:
+                valid_cited.add(cid)
+
+    if not valid_cited:
+        errors.append("answer has no valid citations")
 
     return errors
 

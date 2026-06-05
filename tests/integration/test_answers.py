@@ -222,7 +222,7 @@ async def test_answers_unsupported_style_returns_400(db_session: AsyncSession) -
     async with _client(db_session, llm_response={}) as client:
         resp = await client.post(
             "/api/v1/answers",
-            json={"query": _QUERY, "answer": {"style": "summary"}},
+            json={"query": _QUERY, "answer": {"style": "bogus_style"}},
         )
     assert resp.status_code == 400
     body = resp.json()
@@ -252,6 +252,60 @@ async def test_answers_missing_token_returns_401(db_session: AsyncSession) -> No
         resp = await client.post("/api/v1/answers", json={"query": _QUERY})
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    ("style", "version"),
+    [
+        ("recommendation", "answer-recommendation-v1"),
+        ("summary", "answer-summary-v1"),
+        ("comparison", "answer-comparison-v1"),
+        ("direct_answer", "answer-direct-answer-v1"),
+    ],
+)
+async def test_answers_each_style_routes_with_versioned_prompt(
+    db_session: AsyncSession, style: str, version: str
+) -> None:
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    item_id = await _seed_one_recipe(db_session, provider)
+    async with _client(
+        db_session, llm_response=_valid_payload(item_id), debug_enabled=True
+    ) as client:
+        resp = await client.post(
+            "/api/v1/answers",
+            json={
+                "query": _QUERY,
+                "answer": {"style": style, "include_debug": True, "include_results": True},
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"]["style"] == style  # response style is the requested style
+    assert len(body["results"]) == 1
+    # The per-style versioned prompt flows into the debug payload.
+    assert body["debug"]["prompt_version"] == version
+
+
+async def test_answers_summary_empty_recommendations(db_session: AsyncSession) -> None:
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    await _seed_one_recipe(db_session, provider)
+    # summary may omit recommendations as long as the answer cites ≥1 valid id.
+    canned: dict[str, Any] = {
+        "answer": {"style": "summary", "text": "A summary of the soup.", "citations": ["cite_1"]},
+        "recommendations": [],
+        "citations": [],
+    }
+    async with _client(db_session, llm_response=canned) as client:
+        resp = await client.post(
+            "/api/v1/answers",
+            json={"query": _QUERY, "answer": {"style": "summary"}},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["answer"]["style"] == "summary"
+    assert body["recommendations"] == []
+    assert body["citations"][0]["citation_id"] == "cite_1"
+    assert body["warnings"] == []
 
 
 @pytest.mark.parametrize(

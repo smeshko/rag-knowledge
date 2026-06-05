@@ -40,8 +40,8 @@ from rag_recipes.retrieval.types import SearchRequest
 router = APIRouter(tags=["answers"])
 
 _VALID_MODES = frozenset({"hybrid", "keyword", "vector"})
-# Phase 17.2 ships `recommendation` only; 17.3 adds summary/comparison/direct_answer.
-_SUPPORTED_STYLES = frozenset({"recommendation"})
+# All four doc 8 § 9 styles share the same pipeline; only the prompt variant differs.
+_SUPPORTED_STYLES = frozenset({"recommendation", "summary", "comparison", "direct_answer"})
 
 
 @router.post("/answers")
