@@ -378,3 +378,12 @@ def test_answer_cap_fields_reject_zero(monkeypatch: pytest.MonkeyPatch, var: str
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
     assert var.lower() in str(excinfo.value).lower()
+
+
+def test_search_default_limit_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ge=1 so the answers route's effective-limit fallback stays positive (Epic 17.2).
+    _required_env(monkeypatch)
+    monkeypatch.setenv("SEARCH_DEFAULT_LIMIT", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "search_default_limit" in str(excinfo.value).lower()
