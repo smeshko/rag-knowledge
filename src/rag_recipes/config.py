@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     rerank_provider: str = "openai"
     rerank_model: str = "gpt-4.1"
     rerank_top_n: int = Field(default=50, ge=1, le=200)
+    # Hot-path budget (Epic 18.2): reranking is on the synchronous search path and
+    # Chunk.text is unbounded, so cap the per-candidate payload and run the reranker
+    # under a short timeout (not the 60s ingestion default) — a slow rerank times out
+    # to RerankerTechnicalError → baseline fallback rather than stalling search.
+    rerank_max_chars_per_candidate: int = Field(default=2000, ge=1)
+    rerank_request_timeout_seconds: float = Field(default=8.0, gt=0)
 
     @field_validator("redis_url")
     @classmethod
@@ -161,6 +167,19 @@ class Settings(BaseSettings):
         if url_password != self.redis_password:
             raise ValueError(
                 "REDIS_URL password does not match REDIS_PASSWORD; update both in .env"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _rerank_provider_supported_when_enabled(self) -> Settings:
+        # Only the OpenAI reranker exists in Epic 18.2. Reject an unsupported
+        # rerank_provider at load *when reranking is enabled* so chunk text is never
+        # silently routed to an unintended/unimplemented vendor (data-egress trust
+        # boundary). Disabled config keeps any rerank_provider value (it's inert).
+        if self.reranking_enabled and self.rerank_provider != "openai":
+            raise ValueError(
+                "rerank_provider must be 'openai' when reranking_enabled is true "
+                f"(only the OpenAI reranker is supported); got {self.rerank_provider!r}"
             )
         return self
 

@@ -412,3 +412,50 @@ def test_rerank_top_n_out_of_bounds_rejected(
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
     assert "rerank_top_n" in str(excinfo.value).lower()
+
+
+def test_rerank_hot_path_budget_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Epic 18.2 hot-path budget: per-candidate text cap + short reranker timeout.
+    _required_env(monkeypatch)
+    for var in ("RERANK_MAX_CHARS_PER_CANDIDATE", "RERANK_REQUEST_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.rerank_max_chars_per_candidate == 2000
+    assert settings.rerank_request_timeout_seconds == 8.0
+
+
+def test_rerank_max_chars_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("RERANK_MAX_CHARS_PER_CANDIDATE", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "rerank_max_chars_per_candidate" in str(excinfo.value).lower()
+
+
+def test_rerank_request_timeout_rejects_non_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("RERANK_REQUEST_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "rerank_request_timeout_seconds" in str(excinfo.value).lower()
+
+
+def test_rerank_provider_must_be_openai_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The data-egress backstop: an unsupported rerank_provider is rejected at load
+    # when reranking is enabled (Epic 18.2).
+    _required_env(monkeypatch)
+    monkeypatch.setenv("RERANKING_ENABLED", "true")
+    monkeypatch.setenv("RERANK_PROVIDER", "cohere")
+    with pytest.raises(ValidationError, match="rerank_provider must be 'openai'"):
+        Settings(_env_file=None)
+
+
+def test_rerank_provider_unsupported_allowed_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A disabled reranker is inert, so any rerank_provider value loads fine.
+    _required_env(monkeypatch)
+    monkeypatch.setenv("RERANKING_ENABLED", "false")
+    monkeypatch.setenv("RERANK_PROVIDER", "cohere")
+    settings = Settings(_env_file=None)
+    assert settings.rerank_provider == "cohere"

@@ -21,6 +21,8 @@ from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
+from rag_recipes.providers.reranker.base import RerankerProvider
+from rag_recipes.providers.reranker.openai import OpenAIRerankerProvider
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -86,6 +88,32 @@ def get_llm_provider(
         default_model=settings.answer_llm_model or settings.llm_model,
         max_rate_limit_retries=settings.llm_max_rate_limit_retries,
         request_timeout=settings.llm_request_timeout_seconds,
+    )
+
+
+def get_reranker_provider(
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> RerankerProvider | None:
+    """Build the reranker for the search endpoint, or ``None`` when reranking is off.
+
+    Returns ``None`` (and constructs nothing) when ``reranking_enabled`` is false, so a
+    disabled search pays zero added cost. When enabled, dispatches on
+    ``rerank_provider`` — only ``"openai"`` is supported in Epic 18.2; any other value
+    raises rather than silently routing chunk text to an unintended vendor (a
+    ``Settings`` validator already rejects this at load, so this is a defensive
+    backstop). Tests override it with ``FakeRerankerProvider``.
+    """
+    if not settings.reranking_enabled:
+        return None
+    if settings.rerank_provider == "openai":
+        return OpenAIRerankerProvider(
+            settings.openai_api_key,
+            model=settings.rerank_model,
+            request_timeout=settings.rerank_request_timeout_seconds,
+        )
+    raise ValueError(
+        f"unsupported rerank_provider {settings.rerank_provider!r}; only 'openai' "
+        "is supported"
     )
 
 
