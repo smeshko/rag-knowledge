@@ -19,7 +19,7 @@ from redis.asyncio import from_url as redis_from_url
 
 from rag_recipes.api.dependencies import require_api_token
 from rag_recipes.api.errors import ApiError, ErrorCode, error_body
-from rag_recipes.api.routes import documents, health, search
+from rag_recipes.api.routes import documents, health, knowledge_items, search
 from rag_recipes.config import get_settings
 from rag_recipes.ingestion.queue import create_arq_pool
 from rag_recipes.storage.session import build_engine, build_session_factory
@@ -89,3 +89,4 @@ app.add_exception_handler(Exception, _handle_unexpected_error)
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(search.router, prefix="/api/v1")
+app.include_router(knowledge_items.router, prefix="/api/v1")
