@@ -388,6 +388,60 @@ class _RaisingEmbeddingProvider(FakeEmbeddingProvider):
         raise EmbeddingTechnicalError("boom")
 
 
+class _RejectsTextEmbeddingProvider(FakeEmbeddingProvider):
+    """Raises if asked to embed any text containing ``reject`` — lets a test prove
+    the embedding stage only receives the current version's chunk texts."""
+
+    def __init__(self, *, reject: str) -> None:
+        super().__init__()
+        self._reject = reject
+
+    async def embed_batch(self, texts: list[Any], *, trace_context: Any = None) -> Any:
+        if any(self._reject in text for text in texts):
+            raise EmbeddingTechnicalError(f"refused text containing {self._reject!r}")
+        return await super().embed_batch(texts, trace_context=trace_context)
+
+
+async def test_new_version_embedding_is_scoped_to_its_own_version(
+    test_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A v2 run's embedding stage must receive only v2 chunk texts (review #2).
+
+    The prior v1 items stay READY until the handoff at the READY gate, so an
+    unscoped embed would feed the v1 ("Tomato") chunks to the provider too. Here the
+    provider rejects any "Tomato" text; the v2 run must still reach READY and flip
+    active to 2, proving it never touched the prior version's chunks."""
+    session_factory = build_session_factory(test_engine)
+    document_id, asset_id = await _seed_document(session_factory)
+    try:
+        await _run_fresh_v1(session_factory, document_id, tmp_path, monkeypatch)
+
+        async with session_factory() as session:
+            await transition_to(session, document_id, DocumentStatus.QUEUED)
+            await session.commit()
+
+        _patch_extract_seeds_v2(monkeypatch, document_id)
+        v2_spans = _build_spans(document_id, source_version=2)
+        provider = _provider_for(v2_spans, title="Carrot Soup", overall_high=0.9)
+        ctx = _ctx(session_factory, provider, tmp_path)
+        # Would raise if the v2 run ever embedded a v1 ("Tomato") chunk.
+        ctx["embedding_provider"] = _RejectsTextEmbeddingProvider(reject="Tomato")
+        count = await process_document(
+            ctx, document_id, source_version=2, reuse_source_spans=False
+        )
+        assert count == 1
+
+        async with session_factory() as session:
+            doc = await session.get(Document, document_id)
+            assert doc is not None
+            assert doc.status is DocumentStatus.READY
+            assert doc.active_source_version == 2
+    finally:
+        await _cleanup(session_factory, document_id, asset_id)
+
+
 async def test_new_version_embedding_failure_keeps_prior_version_active(
     test_engine: AsyncEngine,
     tmp_path: Path,

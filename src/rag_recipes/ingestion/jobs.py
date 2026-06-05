@@ -473,6 +473,7 @@ async def _embed_document_chunks(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     document_id: str,
+    source_version: int,
     provider: EmbeddingProvider,
     batch_size: int,
 ) -> int:
@@ -492,16 +493,21 @@ async def _embed_document_chunks(
     """
     async with session_factory() as session:
         await transition_to(session, document_id, DocumentStatus.EMBEDDING_CHUNKS)
-        # Embed only chunks whose parent KnowledgeItem is still READY. On a reuse
-        # run the prior pass's items are superseded but their chunks are retained
-        # (for audit); re-embedding that stale content would waste API calls and
-        # leave superseded chunks searchable. On a fresh run every chunk is
-        # READY-parented, so this join selects the same set as before (review #1).
+        # Embed only chunks whose parent KnowledgeItem is READY *and at this run's
+        # source_version*. The READY filter excludes a reuse run's superseded prior
+        # items (their chunks are retained for audit, not re-embedded). The
+        # source_version filter isolates a new_source_version run to its own chunks:
+        # during that run the prior active version is still READY (its supersede +
+        # the active flip happen later, at the READY gate), so without it a v(new)
+        # run would re-embed the prior version's chunks — wasted spend, and a stray
+        # EmbeddingTechnicalError on those old chunks would falsely fail this run
+        # (review #2). On a fresh run every chunk is READY-parented at this version.
         result = await session.execute(
             select(Chunk)
             .join(KnowledgeItem, Chunk.parent_id == KnowledgeItem.id)
             .where(
                 Chunk.document_id == document_id,
+                KnowledgeItem.source_version == source_version,
                 KnowledgeItem.status == KnowledgeItemStatus.READY,
             )
         )
@@ -808,6 +814,7 @@ async def process_document(
                 await _embed_document_chunks(
                     session_factory,
                     document_id=document_id,
+                    source_version=source_version,
                     provider=embedding_provider,
                     batch_size=settings.embedding_batch_size,
                 )

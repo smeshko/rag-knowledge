@@ -314,6 +314,7 @@ async def test_embed_stage_advances_stuck_job_heartbeat(
     await _embed_document_chunks(
         _single_session_factory(db_session),
         document_id=document_id,
+        source_version=1,
         provider=FakeEmbeddingProvider(),
         batch_size=100,
     )
