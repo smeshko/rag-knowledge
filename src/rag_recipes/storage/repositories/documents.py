@@ -22,6 +22,7 @@ from rag_recipes.storage.enums import (
 )
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
@@ -189,6 +190,23 @@ class DocumentRepository:
             )
         )
         return result.scalar_one()
+
+    async def get_latest_extraction_run(
+        self, document_id: str
+    ) -> ExtractionRun | None:
+        """Return the document's most recent ExtractionRun, or None.
+
+        Used by the Epic 11.2 ``auto`` reprocess selector to compare the last run's
+        ``prompt_version`` / ``schema_version`` against the current constants.
+        Ordered by ``created_at`` desc with an ``id`` tiebreak for stability.
+        """
+        result = await self._session.execute(
+            select(ExtractionRun)
+            .where(ExtractionRun.document_id == document_id)
+            .order_by(ExtractionRun.created_at.desc(), ExtractionRun.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def get_version_extractor_identity(
         self, document_id: str, source_version: int

@@ -28,7 +28,12 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.api.dependencies import get_arq_redis, get_file_storage, get_session
+from rag_recipes.api.dependencies import (
+    get_arq_redis,
+    get_file_storage,
+    get_session,
+    get_settings,
+)
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.documents import (
     DocumentCounts,
@@ -43,6 +48,8 @@ from rag_recipes.api.schemas.documents import (
     UploadIngestion,
     UploadResponse,
 )
+from rag_recipes.config import Settings
+from rag_recipes.ingestion.pipeline.extraction import PROMPT_VERSION, SCHEMA_VERSION
 from rag_recipes.ingestion.queue import enqueue_job
 from rag_recipes.ingestion.status import is_terminal
 from rag_recipes.providers.errors import FileStorageError
@@ -50,6 +57,7 @@ from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.storage.enums import DocumentStatus, ReprocessMode, SourceType, UploadStatus
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
 
@@ -429,29 +437,35 @@ async def get_document_status(
 ) -> Any:
     """Report ingestion progress for a document.
 
-    8.2 covers initial ingestion only: ``current_source_version`` is ``1``
-    for any non-terminal status and ``None`` for terminal ones. Epic 11 must
-    revisit this logic for reprocess scenarios where ``active`` != ``current``
-    (a ready doc at v1 with v2 in flight).
+    For a non-terminal doc the in-flight version is the highest existing span
+    version (Epic 11.2, DECISIONS #5) — ``max + 1`` work for a new_source_version
+    run already shows up as v(new) spans, while initial ingestion / a reuse run
+    stays on the current version; it defaults to ``1`` before any span exists.
+    Progress is suppressed only when the in-flight version equals the *already
+    active* version — a reuse reprocess re-runs over existing spans without
+    creating new ones, so the surviving spans are not this run's progress. A
+    new_source_version run (in-flight > active) and initial ingestion (no active
+    version) both report the in-flight version's spans. Terminal docs report their
+    active version's final counts (a failed doc with active=null gets (0, None)).
     """
     repo = DocumentRepository(session)
     document = await _require_document(repo, document_id)
     is_doc_terminal = is_terminal(document.status)
-    current_source_version = None if is_doc_terminal else 1
     if is_doc_terminal:
-        # Report final counts for terminal docs that have an active version (a
-        # ready doc at v1 shows its spans); failed docs with active=null
-        # legitimately get (0, None).
+        current_source_version = None
         version_for_progress = document.active_source_version
-    elif document.active_source_version is not None:
-        # Reprocess in flight: the doc is non-terminal but already has an active
-        # version from a prior run, so the new run's spans don't exist yet.
-        # Suppress progress (the surviving old-version spans are NOT this run's
-        # work). Epic 11 will compute the real in-flight version here.
-        version_for_progress = None
     else:
-        # Initial ingestion: in-flight version is 1.
-        version_for_progress = 1
+        in_flight = await repo.max_source_version(document_id) or 1
+        current_source_version = in_flight
+        if (
+            document.active_source_version is not None
+            and in_flight == document.active_source_version
+        ):
+            # Reprocess of the active version (reuse) in flight: the surviving
+            # active-version spans are NOT this run's progress yet.
+            version_for_progress = None
+        else:
+            version_for_progress = in_flight
     if version_for_progress is None:
         pages_processed, pages_total = 0, None
     else:
@@ -471,6 +485,33 @@ async def get_document_status(
         ),
         terminal=is_doc_terminal,
     )
+
+
+def _resolve_auto_mode(
+    *,
+    latest_run: ExtractionRun | None,
+    active_identity: str | None,
+    settings: Settings,
+) -> ReprocessMode:
+    """Resolve `mode="auto"` to a concrete reuse/new-version mode (DECISIONS #4).
+
+    Reuse the existing spans (re-run only the downstream extraction) when the
+    document is fully current: the latest run's prompt/schema match today's
+    constants AND the same extractor produced the active version. Otherwise —
+    a changed or unknown (legacy, None) extractor identity, a drifted
+    prompt/schema, or no prior run — re-extract into a new source version. The
+    new-version default is the safe side: a needless re-extraction is merely
+    costly, whereas a missed one would skip required work (the dangerous miss).
+    """
+    if (
+        latest_run is not None
+        and latest_run.prompt_version == PROMPT_VERSION
+        and latest_run.schema_version == SCHEMA_VERSION
+        and active_identity is not None
+        and active_identity == settings.pdf_text_extractor
+    ):
+        return ReprocessMode.REUSE_SOURCE_SPANS
+    return ReprocessMode.NEW_SOURCE_VERSION
 
 
 async def _enqueue_reprocess(
@@ -508,6 +549,7 @@ async def reprocess_document(
     body: ReprocessRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
     arq_redis: ArqRedis = Depends(get_arq_redis),  # noqa: B008
+    settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> Any:
     try:
         mode = ReprocessMode(body.mode)
@@ -563,11 +605,31 @@ async def reprocess_document(
         )
     await session.commit()
 
+    # Resolve `auto` to a concrete mode (DECISIONS #4). `last_reprocess_mode` keeps
+    # the *requested* mode ("auto", recorded in the UPDATE above) — the audit stays
+    # honest about what the user asked; the resolved decision goes to the log.
+    effective_mode = mode
+    if mode is ReprocessMode.AUTO:
+        latest_run = await repo.get_latest_extraction_run(document_id)
+        active_identity = (
+            await repo.get_version_extractor_identity(document_id, previous)
+            if previous is not None
+            else None
+        )
+        effective_mode = _resolve_auto_mode(
+            latest_run=latest_run,
+            active_identity=active_identity,
+            settings=settings,
+        )
+        logger.info(
+            "auto reprocess for %s resolved to %s", document_id, effective_mode.value
+        )
+
     # Dispatch the resolved run after the commit. `current_source_version` reflects
     # the version the run targets: the active version for reuse (unchanged), or the
     # new version for a new-source-version run.
     current_source_version = previous
-    if mode is ReprocessMode.REUSE_SOURCE_SPANS:
+    if effective_mode is ReprocessMode.REUSE_SOURCE_SPANS:
         # Reuse the existing version: the active version if the doc has one, else
         # the highest existing span version. Do NOT fabricate source_version=1 — a
         # terminal doc with no spans (active and max both None, e.g. an early FAILED
@@ -585,7 +647,7 @@ async def reprocess_document(
                 source_version=resolved_version,
                 reuse_source_spans=True,
             )
-    elif mode is ReprocessMode.NEW_SOURCE_VERSION:
+    elif effective_mode is ReprocessMode.NEW_SOURCE_VERSION:
         # Re-extract the PDF text into a fresh version = max(existing) + 1 (v1 when
         # the doc has no spans). `active_source_version` stays on the OLD version
         # during the run; the worker flips it to the new version on success (Epic
@@ -602,10 +664,6 @@ async def reprocess_document(
             source_version=new_version,
             reuse_source_spans=False,
         )
-    # else: ReprocessMode.AUTO — the selector resolves to a concrete reuse/new run
-    # and dispatches through the same paths in TASK-004. Until then `auto` flips the
-    # row to QUEUED with no job (the cron backstop), as in 11.1.
-    # TODO(11.2 TASK-004): add the auto selector dispatch.
 
     return ReprocessResponse(
         document_id=document_id,
