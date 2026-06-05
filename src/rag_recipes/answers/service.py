@@ -36,8 +36,9 @@ from rag_recipes.api.schemas.answers import (
     AnswerCitation,
     Recommendation,
 )
-from rag_recipes.api.schemas.search import KnowledgeItemResult
+from rag_recipes.api.schemas.search import KnowledgeItemResult, RetrievalDebugInfo
 from rag_recipes.api.search_projection import (
+    build_retrieval_debug,
     build_structured_preview,
     fetch_item_structured_data,
     project_results,
@@ -61,6 +62,24 @@ NO_RESULTS_WARNING = "No relevant results were found for this query."
 
 
 @dataclass
+class AnswerDebugFields:
+    """The dev-only answer diagnostics the service computes; the route gates them.
+
+    Carried on every ``AnswerResult`` (cheap to compute); the route builds an
+    ``AnswerDebugInfo`` from these only when ``include_debug AND
+    debug_endpoints_enabled``. ``prompt_version`` is the *resolved per-style*
+    version actually sent to the LLM, not the bare ``answer_prompt_version`` setting.
+    """
+
+    retrieval_mode: str
+    model: str
+    prompt_version: str
+    retrieval_debug: RetrievalDebugInfo | None = None
+    context_item_count: int = 0
+    citation_count: int = 0
+
+
+@dataclass
 class AnswerResult:
     """Internal result the answers route projects into ``AnswerResponse``.
 
@@ -76,6 +95,7 @@ class AnswerResult:
     results: list[KnowledgeItemResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     is_fallback: bool = False
+    debug: AnswerDebugFields | None = None
 
 
 async def generate_answer(
@@ -95,9 +115,21 @@ async def generate_answer(
     """
     result = await search(session, request, provider=embedding_provider, settings=settings)
 
+    # The resolved per-style prompt + version drive both the LLM request and the
+    # debug payload, so traces and the debug `prompt_version` match the style used.
+    prompt_version = settings.answer_prompt_version
+    debug = AnswerDebugFields(
+        retrieval_mode=request.mode,
+        model=llm_provider.default_model,
+        prompt_version=prompt_version,
+        retrieval_debug=build_retrieval_debug(result, settings),
+    )
+
     if not result.items:
         # Nothing to ground an answer on — fallback without an LLM call.
-        return _fallback(request.query, style, results=[], warning=NO_RESULTS_WARNING)
+        return _fallback(
+            request.query, style, results=[], warning=NO_RESULTS_WARNING, debug=debug
+        )
 
     item_limit = min(request.limit, settings.answer_context_item_limit)
     chunks_per_item = settings.answer_matched_chunks_per_item
@@ -121,19 +153,23 @@ async def generate_answer(
         chunks_per_item=chunks_per_item,
         structured_preview_by_item_id=preview_by_item,
     )
+    debug.context_item_count = len(pack.items)
+    debug.citation_count = sum(len(item.citations) for item in pack.items)
 
     # The pack drops uncitable chunks and items with no citable emitted chunk — if
     # nothing citable survives, there's no grounded answer to make.
     if not pack.items:
         results = await project_results(session, result, structured=structured)
-        return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
+        return _fallback(
+            request.query, style, results=results, warning=FALLBACK_WARNING, debug=debug
+        )
 
     try:
         response = await llm_provider.generate_structured_output(
             StructuredOutputRequest(
                 provider=llm_provider.provider,
                 model=llm_provider.default_model,
-                prompt_version=settings.answer_prompt_version,
+                prompt_version=prompt_version,
                 schema_version=settings.answer_schema_version,
                 input=render_answer_input(request.query, pack),
                 json_schema=build_answer_v1_json_schema(),
@@ -143,17 +179,23 @@ async def generate_answer(
         # Unified safe-fallback path: a technical LLM failure is treated like a
         # parse/citation failure — never a 502, always show what we found.
         results = await project_results(session, result, structured=structured)
-        return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
+        return _fallback(
+            request.query, style, results=results, warning=FALLBACK_WARNING, debug=debug
+        )
 
     answer_json = response.output_json
     if response.parse_error is not None or answer_json is None:
         results = await project_results(session, result, structured=structured)
-        return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
+        return _fallback(
+            request.query, style, results=results, warning=FALLBACK_WARNING, debug=debug
+        )
 
     errors = validate_citations(answer_json, pack)
     if errors:
         results = await project_results(session, result, structured=structured)
-        return _fallback(request.query, style, results=results, warning=FALLBACK_WARNING)
+        return _fallback(
+            request.query, style, results=results, warning=FALLBACK_WARNING, debug=debug
+        )
 
     # Success: reconstruct the answer body / recommendations / citations from the
     # pack. validate_citations checks citation membership/binding and the structural
@@ -182,6 +224,7 @@ async def generate_answer(
         results=results,
         warnings=[],
         is_fallback=False,
+        debug=debug,
     )
 
 
@@ -359,6 +402,7 @@ def _fallback(
     *,
     results: list[KnowledgeItemResult],
     warning: str,
+    debug: AnswerDebugFields | None = None,
 ) -> AnswerResult:
     return AnswerResult(
         query=query,
@@ -368,4 +412,5 @@ def _fallback(
         results=results,
         warnings=[warning],
         is_fallback=True,
+        debug=debug,
     )

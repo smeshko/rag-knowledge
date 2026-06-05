@@ -43,12 +43,14 @@ async def _client(
     llm_response: dict[str, Any] | None = None,
     fail_technically: bool = False,
     with_auth: bool = True,
+    debug_enabled: bool = False,
 ) -> AsyncIterator[httpx.AsyncClient]:
     settings = get_settings().model_copy(
         update={
             "personal_api_token": TEST_API_TOKEN,
             "embedding_provider": _FAKE_PROVIDER,
             "embedding_model": _FAKE_MODEL,
+            "debug_endpoints_enabled": debug_enabled,
         }
     )
     fake_embed = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
@@ -250,3 +252,39 @@ async def test_answers_missing_token_returns_401(db_session: AsyncSession) -> No
         resp = await client.post("/api/v1/answers", json={"query": _QUERY})
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    ("include_debug", "debug_enabled", "present"),
+    [
+        (True, True, True),  # only T/T exposes debug
+        (True, False, False),
+        (False, True, False),  # guards a route gated only on debug_endpoints_enabled
+        (False, False, False),
+    ],
+)
+async def test_answers_debug_gate_matrix(
+    db_session: AsyncSession, include_debug: bool, debug_enabled: bool, present: bool
+) -> None:
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    item_id = await _seed_one_recipe(db_session, provider)
+    async with _client(
+        db_session, llm_response=_valid_payload(item_id), debug_enabled=debug_enabled
+    ) as client:
+        resp = await client.post(
+            "/api/v1/answers",
+            json={"query": _QUERY, "answer": {"include_debug": include_debug}},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if present:
+        assert "debug" in body
+        debug = body["debug"]
+        assert debug["retrieval_mode"] == "hybrid"
+        assert debug["model"] == "fake-model"
+        assert debug["prompt_version"] == "answer-recommendation-v1"
+        assert debug["context_item_count"] == 1
+        assert debug["citation_count"] == 1
+        assert debug["retrieval_debug"]["retrieval_mode"] == "hybrid"
+    else:
+        assert "debug" not in body  # key absent, not null

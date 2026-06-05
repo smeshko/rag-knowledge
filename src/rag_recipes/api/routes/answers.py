@@ -27,7 +27,11 @@ from rag_recipes.api.dependencies import (
     get_settings,
 )
 from rag_recipes.api.errors import ApiError, ErrorCode
-from rag_recipes.api.schemas.answers import AnswerRequestBody, AnswerResponse
+from rag_recipes.api.schemas.answers import (
+    AnswerDebugInfo,
+    AnswerRequestBody,
+    AnswerResponse,
+)
 from rag_recipes.config import Settings
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.llm.base import LLMProvider
@@ -96,6 +100,21 @@ async def answer(
         settings=settings,
     )
 
+    # Dev-only answer debug, gated exactly like the search debug (doc 8 § 11): present
+    # only when BOTH opted-in AND enabled; the key is dropped (absent, not null)
+    # otherwise. The service always computes the fields; the route decides inclusion.
+    debug = None
+    if body.answer.include_debug and settings.debug_endpoints_enabled and result.debug is not None:
+        d = result.debug
+        debug = AnswerDebugInfo(
+            retrieval_mode=d.retrieval_mode,
+            model=d.model,
+            prompt_version=d.prompt_version,
+            context_item_count=d.context_item_count,
+            citation_count=d.citation_count,
+            retrieval_debug=d.retrieval_debug,
+        )
+
     # The service already applies the success-path `include_results` drop and keeps
     # `results` on a fallback, so the route maps the AnswerResult straight through.
     response = AnswerResponse(
@@ -105,5 +124,9 @@ async def answer(
         citations=result.citations,
         results=result.results,
         warnings=result.warnings,
+        debug=debug,
     )
-    return response.model_dump(by_alias=True)
+    data = response.model_dump(by_alias=True)
+    if data.get("debug") is None:
+        data.pop("debug", None)
+    return data
