@@ -190,6 +190,27 @@ class DocumentRepository:
         )
         return result.scalar_one()
 
+    async def get_version_extractor_identity(
+        self, document_id: str, source_version: int
+    ) -> str | None:
+        """Return the extractor identity stamped on a version's spans, or None.
+
+        Reads ``locator["meta"]["extractor_identity"]`` from one span of the given
+        version (every span of a version carries the same identity). Returns None
+        when the version has no spans, or for legacy spans written before Epic 11.2
+        stamped the identity — the ``auto`` selector treats a missing identity as
+        "differs from the current extractor" and defaults to a new-version run.
+        """
+        result = await self._session.execute(
+            select(SourceSpan.locator["meta"]["extractor_identity"].astext)
+            .where(
+                SourceSpan.document_id == document_id,
+                SourceSpan.source_version == source_version,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def max_source_version(self, document_id: str) -> int | None:
         """Return the document's highest ``SourceSpan.source_version``, or None.
 

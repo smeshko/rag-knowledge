@@ -43,6 +43,7 @@ async def extract_and_persist_spans(
     source_version: int,
     extractor: PdfTextExtractor,
     storage: FileStorageProvider,
+    extractor_identity: str | None = None,
 ) -> int:
     """Extract per-page text for a document and persist one SourceSpan per page.
 
@@ -50,6 +51,11 @@ async def extract_and_persist_spans(
     or its asset is missing, ``EmptyPdfError`` if the PDF has no pages, and
     ``sqlalchemy.exc.IntegrityError`` if spans for this
     ``(document_id, source_version)`` already exist (the uniqueness contract).
+
+    ``extractor_identity`` (e.g. ``"pymupdf:embedded_text"``) is stamped into each
+    span's ``locator["meta"]`` so the Epic 11.2 ``auto`` reprocess selector can tell
+    whether the extractor changed since this version was produced. It is excluded
+    from ``locator_hash`` (meta is), so it never affects span uniqueness.
     """
     repo = DocumentRepository(session)
     document = await repo.get_document(document_id)
@@ -80,6 +86,7 @@ async def extract_and_persist_spans(
                 "confidence": page.confidence,
                 "extraction_method": page.extraction_method,
                 "suspicious": page.confidence == 0.0,
+                "extractor_identity": extractor_identity,
             },
         }
         spans.append(

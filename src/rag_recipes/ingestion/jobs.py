@@ -693,6 +693,7 @@ async def process_document(
                             source_version=source_version,
                             extractor=extractor,
                             storage=storage,
+                            extractor_identity=settings.pdf_text_extractor,
                         )
                         await transition_to(
                             session, document_id, DocumentStatus.CREATING_SOURCE_SPANS

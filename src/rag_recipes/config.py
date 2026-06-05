@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     pdf_overlap_pages: int = 1
     pdf_min_text_chars_for_page: int = 20
 
+    # Identity of the production PDF text extractor (method + build), stamped onto
+    # every SourceSpan a run writes so the `auto` reprocess selector (Epic 11.2) can
+    # detect whether the extractor changed since a version was produced. Two PyMuPDF
+    # builds both stamp extraction_method="embedded_text" but should differ here if
+    # the build changed.
+    pdf_text_extractor: str = "pymupdf:embedded_text"
+
     # Phase 9.5: windows per per-batch commit in the extraction loop. A crash
     # rolls back the in-flight batch, so at most batch_size − 1 windows of
     # OpenAI spend are repeated on resume (DECISIONS #4).
