@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.config import Settings
 from rag_recipes.config import get_settings as _get_settings
+from rag_recipes.providers.embeddings.base import EmbeddingProvider
+from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 
@@ -45,6 +47,23 @@ def get_file_storage(
     settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> FileStorageProvider:
     return LocalFileStorage(Path(settings.local_storage_root))
+
+
+def get_embedding_provider(
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> EmbeddingProvider:
+    """Build the production embedding provider for the search endpoint's vector leg.
+
+    Tests override this with a ``FakeEmbeddingProvider``. The provider is built from
+    settings (no Langfuse session at request time — search is synchronous and not a
+    traced ingestion job).
+    """
+    return OpenAIEmbeddingProvider(
+        settings.openai_api_key,
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dimensions,
+        batch_size=settings.embedding_batch_size,
+    )
 
 
 def require_api_token(
