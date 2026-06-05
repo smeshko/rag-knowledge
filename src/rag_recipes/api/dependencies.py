@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from arq.connections import ArqRedis
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +64,27 @@ def get_embedding_provider(
         dimensions=settings.embedding_dimensions,
         batch_size=settings.embedding_batch_size,
     )
+
+
+def require_debug_enabled(
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> None:
+    """Gate the dev-only debug endpoints on ``Settings.debug_endpoints_enabled``.
+
+    When disabled, raise a plain ``HTTPException(404)`` so the rendered body is
+    FastAPI's default ``{"detail": "Not Found"}`` — byte-for-byte identical to a
+    genuinely-unknown route for an **authenticated GET** (raising the project
+    ``ApiError`` envelope would leak a distinguishing fingerprint). When enabled,
+    pass through.
+
+    As a per-request gate (the project relies on runtime toggling, including the
+    test harness), this fires after Starlette's route match and the app-level token
+    check, so a wrong HTTP method still yields ``405 + Allow`` and a missing token
+    still yields ``401`` — exactly as for every other real ``/api/v1`` route, so the
+    debug routes carry no debug-specific tell and serve no data either way (review #1).
+    """
+    if not settings.debug_endpoints_enabled:
+        raise HTTPException(status_code=404)
 
 
 def require_api_token(
