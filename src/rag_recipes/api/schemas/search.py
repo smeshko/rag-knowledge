@@ -42,7 +42,7 @@ class ResultItem(BaseModel):
 
     id: str
     item_type: str
-    schema_: str = Field(alias="schema", serialization_alias="schema")
+    schema_: str = Field(alias="schema")
     title: str
     summary: str | None
     status: str
@@ -59,8 +59,8 @@ class DisplayProjection(BaseModel):
 class StructuredPreview(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    schema_: str = Field(alias="schema", serialization_alias="schema")
-    yield_: str | None = Field(alias="yield", serialization_alias="yield")
+    schema_: str = Field(alias="schema")
+    yield_: str | None = Field(alias="yield")
     top_ingredients: list[str]
 
 
