@@ -259,6 +259,26 @@ async def test_metadata_filters_and_top_k_apply(db_session: AsyncSession) -> Non
     assert capped[0].rank == 1
 
 
+async def test_filter_labels_must_match_query_embedding_space(
+    db_session: AsyncSession,
+) -> None:
+    """A filter targeting a different (provider, model) than the query embedding's
+    own space is rejected — comparing across spaces would corrupt ranking (review #1).
+    """
+    # The provider produces model-a vectors, but the caller asks to filter model-b.
+    provider = FakeEmbeddingProvider(provider=_PROVIDER, model=_MODEL_A)
+    with pytest.raises(ValueError, match="does not match the query embedding"):
+        await vector_search(
+            db_session,
+            normalize_query("alpha recipe"),
+            build_filters(SearchRequest(query="alpha recipe")),
+            provider=provider,
+            embedding_provider=_PROVIDER,
+            embedding_model=_MODEL_B,
+            top_k=50,
+        )
+
+
 async def test_empty_query_returns_no_candidates_without_embedding(
     db_session: AsyncSession,
 ) -> None:

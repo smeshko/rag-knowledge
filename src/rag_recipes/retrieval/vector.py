@@ -43,6 +43,19 @@ async def vector_search(
         return []
 
     embedding = await provider.embed_text(query.keyword)
+    # The query vector and the stored rows must come from the SAME embedding space,
+    # or cosine distance compares incomparable vectors and returns plausible-but-
+    # meaningless neighbours (the embedding-model rule, doc 7). The injected provider
+    # carries the space that actually produced the query vector; fail fast if the
+    # caller's filter labels disagree rather than silently ranking the wrong space
+    # (review #1).
+    if embedding.provider != embedding_provider or embedding.model != embedding_model:
+        raise ValueError(
+            "vector_search filter "
+            f"({embedding_provider!r}, {embedding_model!r}) does not match the query "
+            f"embedding's space ({embedding.provider!r}, {embedding.model!r}); the "
+            "filter must target the space that produced the query vector."
+        )
     distance = ChunkEmbedding.embedding_vector.cosine_distance(embedding.vector).label(
         "distance"
     )
