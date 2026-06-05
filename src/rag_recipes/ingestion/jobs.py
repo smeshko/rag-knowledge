@@ -423,6 +423,20 @@ async def _finalize_extraction(
 
         await transition_to(session, document_id, DocumentStatus.VALIDATING_ITEMS)
         doc = await transition_to(session, document_id, DocumentStatus.CREATING_CHUNKS)
+
+        # Active-version handoff (Epic 11.2): the version that produced an accepted
+        # READY replacement becomes the document's live version, in the SAME
+        # transaction as the supersede above so the two never diverge — a fresh
+        # upload sets active=1; a successful new_source_version run flips active to
+        # the new version while the prior version's items were just superseded; a
+        # reuse run rewrites the same value (no-op). A pass with no ready winner
+        # (all-needs_review / zero-winner) leaves `active_source_version` untouched,
+        # so a failed or unaccepted re-extraction keeps the prior version active.
+        # `doc` is the row transition_to just locked, so this is a flush-level write.
+        # Epic 10.3: when the real INDEXING -> READY gate exists, move this flip
+        # (and the supersede) behind it — see _index_and_finalize.
+        if has_ready_winner:
+            doc.active_source_version = source_version
         # Phase 10.1: build + persist the chunks for the surviving ready items in
         # the SAME transaction that lands the document in CREATING_CHUNKS, so the
         # status flip and the chunks commit atomically. This makes the stage
@@ -558,14 +572,13 @@ async def _index_and_finalize(
             if chunk_count and chunk_count >= 1
             else DocumentStatus.NEEDS_REVIEW
         )
-        doc = await transition_to(session, document_id, terminal)
-        if terminal is DocumentStatus.READY:
-            # The version that produced searchable chunks becomes the live one for
-            # retrieval (and the status endpoint reports its spans as progress).
-            # A NEEDS_REVIEW doc has nothing searchable, so it keeps active=None
-            # (consistent with the failed-doc semantics in the status endpoint).
-            doc.active_source_version = 1
-            await session.flush()
+        await transition_to(session, document_id, terminal)
+        # `active_source_version` is no longer set here: the active-version handoff
+        # moved to _finalize_extraction (Epic 11.2), where it commits atomically with
+        # the supersede behind the same accepted-READY predicate. By the time a
+        # document reaches indexing, finalize has already set its active version (a
+        # fresh upload → 1; a successful new_source_version run → the new version);
+        # a resume into this stage inherits that committed value.
         await session.commit()
     logger.info(
         "finalized %s -> %s (%d chunks)", document_id, terminal.value, chunk_count or 0
