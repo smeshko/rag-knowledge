@@ -28,6 +28,20 @@ class Settings(BaseSettings):
     redis_password: str = ""
     openai_api_key: str
 
+    # Provider switch for the extraction + answer LLM (Epic 19.1). Default
+    # "openai" keeps unset config byte-for-byte today's behaviour; "anthropic"
+    # routes both factories to Claude. Validated against the supported set, and a
+    # model_validator requires anthropic_api_key when "anthropic" is selected.
+    llm_provider: str = "openai"
+    # Anthropic credentials/model/token cap. anthropic_api_key is genuinely
+    # optional (only required when llm_provider == "anthropic"); the rate-limit
+    # retry / request-timeout knobs are shared with OpenAI (llm_*). max_tokens is
+    # required by Anthropic's Messages API and bounds extraction output (ge=1);
+    # the 8192 default stays under the SDK's ~16K non-streaming timeout guard.
+    anthropic_api_key: str | None = None
+    anthropic_llm_model: str = "claude-sonnet-4-6"
+    anthropic_max_tokens: int = Field(default=8192, ge=1)
+
     llm_model: str = "gpt-4.1"
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request
     # timeout. retries=0 disables retries (raise on the first 429); the timeout
@@ -167,6 +181,31 @@ class Settings(BaseSettings):
         if url_password != self.redis_password:
             raise ValueError(
                 "REDIS_URL password does not match REDIS_PASSWORD; update both in .env"
+            )
+        return self
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _llm_provider_supported(cls, value: str) -> str:
+        # Reject an unsupported provider at load so a typo (e.g. "gemini") fails
+        # fast rather than falling through to the OpenAI branch at runtime.
+        supported = {"openai", "anthropic"}
+        if value not in supported:
+            raise ValueError(
+                f"llm_provider must be one of {sorted(supported)}; got {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _anthropic_api_key_required_when_selected(self) -> Settings:
+        # A class default can't reference a sibling field, so the cross-field rule
+        # (key required when Anthropic is selected) lives here. Fails at Settings
+        # load with a message naming the missing field rather than at the first
+        # call. Note this does NOT narrow anthropic_api_key to str for mypy, so
+        # the factories (TASK-003) still narrow str | None → str before use.
+        if self.llm_provider == "anthropic" and not self.anthropic_api_key:
+            raise ValueError(
+                "anthropic_api_key is required when llm_provider == 'anthropic'"
             )
         return self
 

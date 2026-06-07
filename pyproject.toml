@@ -20,6 +20,7 @@ dependencies = [
     "langfuse>=4.6",
     "python-ulid>=2.2",
     "python-multipart>=0.0.29",
+    "anthropic>=0.107.0",
 ]
 
 [project.optional-dependencies]
