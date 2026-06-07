@@ -14,8 +14,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import anthropic
 import httpx
 import pytest
+from anthropic._exceptions import OverloadedError
 from openai import (
     APIConnectionError,
     APIError,
@@ -24,8 +26,15 @@ from openai import (
     RateLimitError,
 )
 
+from rag_recipes.answers.schema import build_answer_v1_json_schema
+from rag_recipes.ingestion.pipeline.extraction import build_recipe_v1_json_schema
 from rag_recipes.providers._observability import ProviderObservability, TraceContext
 from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.llm.anthropic import (
+    _UNSUPPORTED_SCHEMA_KEYWORDS,
+    AnthropicLLMProvider,
+    _sanitize_schema,
+)
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider, _backoff_delay
 from rag_recipes.providers.llm.types import StructuredOutputRequest
@@ -660,3 +669,517 @@ async def test_disabled_observability_never_touches_client() -> None:
 
     assert fake.start_calls == []
     assert fake.observations == []
+
+
+# === AnthropicLLMProvider ===================================================
+
+
+_ANTHROPIC_REQUEST = StructuredOutputRequest(
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    prompt_version="recipe-v1",
+    schema_version="recipe.v1",
+    input="Return ok=true",
+    json_schema=_STRICT_SCHEMA,
+)
+
+_ANTHROPIC_REQUEST_OBJ = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+# --- typed fake async Anthropic client --------------------------------------
+
+
+@dataclass
+class _FakeTextBlock:
+    text: str
+    type: str = "text"
+
+
+@dataclass
+class _FakeAnthropicUsage:
+    input_tokens: int = 11
+    output_tokens: int = 7
+
+
+@dataclass
+class _FakeStopDetails:
+    explanation: str | None = None
+    category: str | None = None
+
+
+@dataclass
+class _FakeAnthropicMessage:
+    content: list[_FakeTextBlock]
+    usage: _FakeAnthropicUsage = field(default_factory=_FakeAnthropicUsage)
+    stop_reason: str = "end_turn"
+    stop_details: _FakeStopDetails | None = None
+
+
+def _anthropic_message(
+    *,
+    text: str = "{}",
+    stop_reason: str = "end_turn",
+    stop_details: _FakeStopDetails | None = None,
+    usage: _FakeAnthropicUsage | None = None,
+) -> _FakeAnthropicMessage:
+    return _FakeAnthropicMessage(
+        content=[_FakeTextBlock(text=text)],
+        usage=usage or _FakeAnthropicUsage(),
+        stop_reason=stop_reason,
+        stop_details=stop_details,
+    )
+
+
+class _FakeAnthropicMessages:
+    def __init__(
+        self,
+        response: _FakeAnthropicMessage | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._response = response
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeAnthropicMessage:
+        self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+
+class _FakeAnthropicClient:
+    """Duck-typed stand-in for ``AsyncAnthropic`` exposing ``messages.create``.
+
+    ``with_options(...)`` returns ``self`` (the real client returns a configured
+    copy), so the provider's ``with_options(timeout=…).messages.create(…)`` chain
+    records both the option kwargs and the create kwargs on one object.
+    """
+
+    def __init__(
+        self,
+        response: _FakeAnthropicMessage | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.messages = _FakeAnthropicMessages(response, error)
+        self.option_calls: list[dict[str, Any]] = []
+
+    def with_options(self, **kwargs: Any) -> Any:
+        self.option_calls.append(kwargs)
+        return self
+
+
+def _anthropic_provider_with(response: _FakeAnthropicMessage) -> AnthropicLLMProvider:
+    return AnthropicLLMProvider(
+        api_key="sk-ant-test",
+        default_model="claude-sonnet-4-6",
+        client=_FakeAnthropicClient(response=response),
+    )
+
+
+# --- contract binding -------------------------------------------------------
+
+
+class TestAnthropicLLM(LLMContract):
+    @pytest.fixture
+    def provider(self) -> AnthropicLLMProvider:
+        return _anthropic_provider_with(_anthropic_message(text='{"ok": true}'))
+
+    @pytest.fixture
+    def sample_request(self) -> StructuredOutputRequest:
+        return _ANTHROPIC_REQUEST
+
+    @pytest.fixture
+    def failure_provider(self) -> AnthropicLLMProvider:
+        return AnthropicLLMProvider(
+            api_key="sk-ant-test",
+            default_model="claude-sonnet-4-6",
+            client=_FakeAnthropicClient(
+                error=anthropic.APITimeoutError(request=_ANTHROPIC_REQUEST_OBJ)
+            ),
+        )
+
+
+# --- bespoke AnthropicLLMProvider tests -------------------------------------
+
+
+def test_anthropic_default_client_disables_sdk_retries() -> None:
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test", default_model="claude-sonnet-4-6"
+    )
+    assert provider._client.max_retries == 0
+
+
+async def test_anthropic_clean_parse_sets_output_json() -> None:
+    provider = _anthropic_provider_with(
+        _anthropic_message(text='{"ok": true}', usage=_FakeAnthropicUsage(13, 5))
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json == {"ok": True}
+    assert response.parse_error is None
+    assert response.raw_text == '{"ok": true}'
+    assert response.usage.input_tokens == 13
+    assert response.usage.output_tokens == 5
+    assert response.provider == "anthropic"
+    assert response.model == "claude-sonnet-4-6"
+
+
+async def test_anthropic_request_mapping_sends_json_schema_output_config() -> None:
+    client = _FakeAnthropicClient(response=_anthropic_message(text='{"ok": true}'))
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test",
+        default_model="claude-sonnet-4-6",
+        client=client,
+        max_tokens=4096,
+        request_timeout=42.0,
+    )
+    await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    kwargs = client.messages.calls[0]
+    assert kwargs["model"] == _ANTHROPIC_REQUEST.model
+    assert kwargs["max_tokens"] == 4096
+    assert kwargs["messages"] == [{"role": "user", "content": _ANTHROPIC_REQUEST.input}]
+    fmt = kwargs["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    # _STRICT_SCHEMA carries no unsupported keywords, so the sanitized schema equals it.
+    assert fmt["schema"] == _ANTHROPIC_REQUEST.json_schema
+    # Per-request timeout is applied via with_options, not the create() call.
+    assert client.option_calls[0]["timeout"] == 42.0
+
+
+async def test_anthropic_refusal_returns_parse_error() -> None:
+    provider = _anthropic_provider_with(
+        _anthropic_message(
+            text="",
+            stop_reason="refusal",
+            stop_details=_FakeStopDetails(explanation="I cannot help with that."),
+        )
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error
+    assert "refused" in response.parse_error
+    assert "I cannot help with that." in response.parse_error
+    assert response.raw_text == ""
+
+
+async def test_anthropic_truncation_returns_parse_error() -> None:
+    provider = _anthropic_provider_with(
+        _anthropic_message(text='{"ok": tr', stop_reason="max_tokens")
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error
+    assert "truncated" in response.parse_error
+    assert response.raw_text == '{"ok": tr'
+
+
+@pytest.mark.parametrize("text", ["not json at all", "[1, 2, 3]"])
+async def test_anthropic_parse_failures_do_not_raise(text: str) -> None:
+    client = _FakeAnthropicClient(response=_anthropic_message(text=text))
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test", default_model="claude-sonnet-4-6", client=client
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error
+    assert response.raw_text == text
+    assert len(client.messages.calls) == 1
+
+
+# --- rate-limit / overloaded retry parity -----------------------------------
+
+
+class _SequenceAnthropicMessages:
+    """``messages`` stub that replays a scripted list of outcomes in order."""
+
+    def __init__(self, actions: list[Any]) -> None:
+        self._actions = list(actions)
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> _FakeAnthropicMessage:
+        self.calls.append(kwargs)
+        action = self._actions.pop(0)
+        if isinstance(action, Exception):
+            raise action
+        assert isinstance(action, _FakeAnthropicMessage)
+        return action
+
+
+class _SequenceAnthropicClient:
+    def __init__(self, actions: list[Any]) -> None:
+        self.messages = _SequenceAnthropicMessages(actions)
+        self.option_calls: list[dict[str, Any]] = []
+
+    def with_options(self, **kwargs: Any) -> Any:
+        self.option_calls.append(kwargs)
+        return self
+
+
+def _anthropic_rate_limit_error(*, retry_after: str | None = None) -> anthropic.RateLimitError:
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(429, headers=headers, request=_ANTHROPIC_REQUEST_OBJ)
+    return anthropic.RateLimitError("rate limited", response=response, body=None)
+
+
+def _anthropic_overloaded_error(*, retry_after: str | None = None) -> OverloadedError:
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(529, headers=headers, request=_ANTHROPIC_REQUEST_OBJ)
+    return OverloadedError("overloaded", response=response, body=None)
+
+
+@pytest.fixture
+def _recorded_anthropic_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    delays: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(
+        "rag_recipes.providers.llm.anthropic.asyncio.sleep", _fake_sleep
+    )
+    return delays
+
+
+def _sequence_provider(actions: list[Any], *, max_retries: int = 5) -> AnthropicLLMProvider:
+    return AnthropicLLMProvider(
+        api_key="sk-ant-test",
+        default_model="claude-sonnet-4-6",
+        client=_SequenceAnthropicClient(actions),
+        max_rate_limit_retries=max_retries,
+    )
+
+
+async def test_anthropic_rate_limit_retried_then_succeeds_honors_retry_after(
+    _recorded_anthropic_sleep: list[float],
+) -> None:
+    client = _SequenceAnthropicClient(
+        [_anthropic_rate_limit_error(retry_after="2"), _anthropic_message(text='{"ok": true}')]
+    )
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test",
+        default_model="claude-sonnet-4-6",
+        client=client,
+        max_rate_limit_retries=5,
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json == {"ok": True}
+    assert len(client.messages.calls) == 2
+    # Retry-After header is preferred over computed backoff.
+    assert _recorded_anthropic_sleep == [2.0]
+
+
+async def test_anthropic_overloaded_retried_then_succeeds(
+    _recorded_anthropic_sleep: list[float],
+) -> None:
+    client = _SequenceAnthropicClient(
+        [_anthropic_overloaded_error(), _anthropic_message(text='{"ok": true}')]
+    )
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test",
+        default_model="claude-sonnet-4-6",
+        client=client,
+        max_rate_limit_retries=5,
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json == {"ok": True}
+    assert len(client.messages.calls) == 2
+    # No Retry-After header → one computed backoff sleep.
+    assert len(_recorded_anthropic_sleep) == 1
+
+
+async def test_anthropic_rate_limit_exhausts_retries_raises(
+    _recorded_anthropic_sleep: list[float],
+) -> None:
+    err = _anthropic_rate_limit_error()
+    provider = _sequence_provider([err, err, err], max_retries=2)
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    # 1 initial attempt + 2 retries = 3 calls, 2 sleeps.
+    client = provider._client
+    assert isinstance(client, _SequenceAnthropicClient)
+    assert len(client.messages.calls) == 3
+    assert len(_recorded_anthropic_sleep) == 2
+
+
+async def test_anthropic_overloaded_exhausts_retries_raises(
+    _recorded_anthropic_sleep: list[float],
+) -> None:
+    err = _anthropic_overloaded_error()
+    provider = _sequence_provider([err, err], max_retries=1)
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    client = provider._client
+    assert isinstance(client, _SequenceAnthropicClient)
+    assert len(client.messages.calls) == 2
+    assert len(_recorded_anthropic_sleep) == 1
+
+
+async def test_anthropic_non_retryable_status_raises_immediately(
+    _recorded_anthropic_sleep: list[float],
+) -> None:
+    status_error = anthropic.APIStatusError(
+        "server error",
+        response=httpx.Response(500, request=_ANTHROPIC_REQUEST_OBJ),
+        body=None,
+    )
+    provider = _sequence_provider([status_error], max_retries=5)
+    with pytest.raises(LLMTechnicalError):
+        await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    client = provider._client
+    assert isinstance(client, _SequenceAnthropicClient)
+    assert len(client.messages.calls) == 1
+    assert _recorded_anthropic_sleep == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        anthropic.APITimeoutError(request=_ANTHROPIC_REQUEST_OBJ),
+        anthropic.APIConnectionError(message="boom", request=_ANTHROPIC_REQUEST_OBJ),
+        anthropic.APIError("base error", request=_ANTHROPIC_REQUEST_OBJ, body=None),
+    ],
+)
+async def test_anthropic_technical_errors_wrapped(error: Exception) -> None:
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test",
+        default_model="claude-sonnet-4-6",
+        client=_FakeAnthropicClient(error=error),
+    )
+    with pytest.raises(LLMTechnicalError) as exc_info:
+        await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+    assert exc_info.value.__cause__ is error
+
+
+# --- schema sanitizer + compatibility guard ---------------------------------
+
+
+def test_sanitize_schema_strips_unsupported_keywords_recursively() -> None:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["n", "s", "arr"],
+        "properties": {
+            "n": {"type": "integer", "minimum": 0, "maximum": 10, "multipleOf": 2},
+            "s": {"type": "string", "minLength": 1, "maxLength": 5, "pattern": "^a"},
+            "arr": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": True,
+                "items": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 1,
+                },
+            },
+        },
+    }
+    out = _sanitize_schema(schema)
+
+    # Input is not mutated.
+    assert "minimum" in schema["properties"]["n"]
+
+    n = out["properties"]["n"]
+    assert not ({"minimum", "maximum", "multipleOf"} & set(n))
+    s = out["properties"]["s"]
+    assert not ({"minLength", "maxLength", "pattern"} & set(s))
+    arr = out["properties"]["arr"]
+    assert not ({"minItems", "maxItems", "uniqueItems"} & set(arr))
+    assert not ({"exclusiveMinimum", "exclusiveMaximum"} & set(arr["items"]))
+    # Types and structure survive.
+    assert n["type"] == "integer"
+    assert arr["items"]["type"] == "number"
+
+
+def test_sanitize_schema_preserves_supported_keywords() -> None:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "when": {"type": "string", "format": "date-time"},
+            "kind": {"enum": ["a", "b"]},
+            "ref": {"$ref": "#/$defs/Thing"},
+        },
+        "$defs": {
+            "Thing": {"type": "object", "additionalProperties": False, "properties": {}}
+        },
+    }
+    out = _sanitize_schema(schema)
+
+    assert out["properties"]["when"]["format"] == "date-time"
+    assert out["properties"]["kind"]["enum"] == ["a", "b"]
+    assert out["properties"]["ref"]["$ref"] == "#/$defs/Thing"
+    assert out["additionalProperties"] is False
+
+
+def _iter_schema_nodes(node: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _iter_schema_nodes(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_schema_nodes(item)
+
+
+def _schema_has_recursive_ref(schema: dict[str, Any]) -> bool:
+    """True if any ``$defs`` entry references itself directly or transitively.
+
+    Claude structured outputs reject recursion; the sanitizer cannot rewrite a
+    recursive ``$ref``, so the guard fails loudly instead of masking it.
+    """
+    defs = schema.get("$defs") or schema.get("definitions") or {}
+
+    def refs_in(body: Any) -> set[str]:
+        found: set[str] = set()
+        for node in _iter_schema_nodes(body):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ("/$defs/" in ref or "/definitions/" in ref):
+                found.add(ref.rsplit("/", 1)[-1])
+        return found
+
+    graph = {name: refs_in(body) for name, body in defs.items()}
+    visiting: set[str] = set()
+    done: set[str] = set()
+
+    def has_cycle(name: str) -> bool:
+        visiting.add(name)
+        for target in graph.get(name, set()):
+            if target not in graph:
+                continue
+            if target in visiting:
+                return True
+            if target not in done and has_cycle(target):
+                return True
+        visiting.discard(name)
+        done.add(name)
+        return False
+
+    return any(name not in done and has_cycle(name) for name in graph)
+
+
+@pytest.mark.parametrize(
+    "build_schema",
+    [build_recipe_v1_json_schema, build_answer_v1_json_schema],
+)
+def test_production_schemas_carry_no_unsupported_keywords_or_recursion(
+    build_schema: Any,
+) -> None:
+    # A cheap drift-catcher (NOT a full compatibility proof — union/grammar
+    # limits are verified by the opt-in live test). Fails loudly if the shared
+    # schema later grows a constraint keyword or a recursive $ref.
+    schema = build_schema()
+    for node in _iter_schema_nodes(schema):
+        present = set(node) & _UNSUPPORTED_SCHEMA_KEYWORDS
+        assert not present, f"unsupported keyword(s) {present} in node {node}"
+    assert not _schema_has_recursive_ref(schema)
