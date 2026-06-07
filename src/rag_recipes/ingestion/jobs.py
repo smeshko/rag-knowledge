@@ -35,6 +35,8 @@ from rag_recipes.ingestion.pipeline.extraction import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
     RecipeExtractionOutput,
+    _render_prompt,
+    build_recipe_v1_json_schema,
     run_extraction,
 )
 from rag_recipes.ingestion.pipeline.pdf_text import (
@@ -46,6 +48,7 @@ from rag_recipes.ingestion.pipeline.windows import (
     Window,
     build_windows,
     compute_input_hash,
+    format_window_for_llm,
 )
 from rag_recipes.ingestion.queue import _build_redis_settings
 from rag_recipes.ingestion.status import (
@@ -68,18 +71,20 @@ from rag_recipes.providers.errors import (
     PdfExtractionError,
 )
 from rag_recipes.providers.file_storage.local import LocalFileStorage
-from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
+from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider, _sanitize_schema
 from rag_recipes.providers.llm.anthropic_batch import AnthropicBatchProvider
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
 from rag_recipes.storage.enums import (
     DocumentStatus,
+    ExtractionBatchItemStatus,
     ExtractionRunStatus,
     KnowledgeItemStatus,
 )
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_span import SourceSpan
@@ -347,6 +352,112 @@ async def _run_extraction_batches(
                 .values(last_progress_at=func.now())
             )
             await session.commit()
+
+
+# Non-terminal item statuses: a window with an item in one of these is already
+# registered / in flight, so registration skips it. The partial-unique index
+# scopes idempotency to exactly these (mirrors the migration WHERE clause).
+_NON_TERMINAL_BATCH_ITEM_STATUSES = (
+    ExtractionBatchItemStatus.PENDING,
+    ExtractionBatchItemStatus.SUBMITTING,
+    ExtractionBatchItemStatus.SUBMITTED,
+)
+
+
+async def _register_extraction_batch_items(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    document_id: str,
+    source_version: int,
+    settings: Settings,
+) -> int:
+    """Register each window as a ``PENDING`` ``ExtractionBatchItem`` (Epic 19.2).
+
+    Builds the same request ``run_extraction`` would (so the stored
+    ``request_input`` / ``input_hash`` match a synchronous run — the key 19.3 uses
+    to write ``ExtractionRun``s and re-drive finalize, DECISIONS #5), but instead
+    of calling the provider it persists a ``PENDING`` item carrying the rendered
+    prompt **and** the sanitized ``recipe.v1`` schema. No synchronous LLM call.
+
+    Idempotent: skips windows already terminal-extracted (``done_hashes``) or
+    already-registered (non-terminal items), and treats the partial-unique
+    ``IntegrityError`` as a skip under concurrent / re-delivered runs (DECISIONS
+    #4). Does **not** transition status — the doc stays in ``EXTRACTING_ITEMS``.
+    Returns the number of items newly registered.
+    """
+    async with session_factory() as session:
+        spans = await _load_ordered_spans(session, document_id, source_version)
+        done_hashes = set(
+            (
+                await session.execute(
+                    select(ExtractionRun.input_hash).where(
+                        ExtractionRun.document_id == document_id,
+                        ExtractionRun.source_version == source_version,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        registered_hashes = set(
+            (
+                await session.execute(
+                    select(ExtractionBatchItem.input_hash).where(
+                        ExtractionBatchItem.document_id == document_id,
+                        ExtractionBatchItem.source_version == source_version,
+                        ExtractionBatchItem.status.in_(
+                            _NON_TERMINAL_BATCH_ITEM_STATUSES
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    windows = build_windows(
+        spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
+    )
+    # The sanitized schema is identical for every window — build it once and store
+    # the same dict on each item so submission is a pure transform (DECISIONS #5).
+    request_schema = _sanitize_schema(build_recipe_v1_json_schema())
+
+    registered = 0
+    for window in windows:
+        input_hash = compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION)
+        if input_hash in done_hashes or input_hash in registered_hashes:
+            continue
+        async with session_factory() as session:
+            item = ExtractionBatchItem(
+                document_id=document_id,
+                source_version=source_version,
+                input_hash=input_hash,
+                input_source_span_ids=window.span_ids,
+                request_input=_render_prompt(format_window_for_llm(window)),
+                request_schema=request_schema,
+                prompt_version=PROMPT_VERSION,
+                schema_version=SCHEMA_VERSION,
+                status=ExtractionBatchItemStatus.PENDING,
+                batch_id=None,
+            )
+            session.add(item)
+            try:
+                await session.flush()
+            except IntegrityError:
+                # The partial-unique index rejected a duplicate non-terminal item
+                # (concurrent / re-delivered registration) — idempotent skip.
+                await session.rollback()
+                registered_hashes.add(input_hash)
+                continue
+            # Heartbeat so the batch-aware stuck-job sweep sees progress.
+            await session.execute(
+                update(Document)
+                .where(Document.id == document_id)
+                .values(last_progress_at=func.now())
+            )
+            await session.commit()
+        registered_hashes.add(input_hash)
+        registered += 1
+    return registered
 
 
 async def _finalize_extraction(
@@ -701,6 +812,7 @@ async def process_document(
     *,
     source_version: int = 1,
     reuse_source_spans: bool = False,
+    batch_mode: bool = False,
     _session_id: str | None = None,
 ) -> int:
     """Run a Document's full ingestion lifecycle to its terminal status.
@@ -788,13 +900,6 @@ async def process_document(
                         spans_count,
                     )
 
-                # LLM extraction -> validate -> persist -> dedup -> chunks. Provider
-                # seam (mirrors 8.1's in-job extractor/storage construction): tests
-                # inject ctx["llm_provider"]; production builds OpenAI from settings.
-                provider: LLMProvider = ctx.get("llm_provider") or _build_llm_provider(
-                    settings, observability
-                )
-
                 if entry == "fresh":
                     # Session #3: short-lived transition-only scope. Releases the row
                     # lock before the (slow) LLM stage and marks the doc as in
@@ -819,6 +924,33 @@ async def process_document(
                     logger.info(
                         "resuming extraction for %s from extracting_items", document_id
                     )
+
+                # Epic 19.2 batch path: register each window as a PENDING
+                # ExtractionBatchItem (no synchronous LLM call) and return, leaving
+                # the doc parked in EXTRACTING_ITEMS for the cron submitter + 19.3
+                # poller to drive. No finalize/embed/index here.
+                if batch_mode:
+                    registered = await _register_extraction_batch_items(
+                        session_factory,
+                        document_id=document_id,
+                        source_version=source_version,
+                        settings=settings,
+                    )
+                    logger.info(
+                        "registered %d batch item(s) for %s; parked in "
+                        "EXTRACTING_ITEMS for batch submission",
+                        registered,
+                        document_id,
+                    )
+                    return registered
+
+                # LLM extraction -> validate -> persist -> dedup -> chunks. Provider
+                # seam (mirrors 8.1's in-job extractor/storage construction): tests
+                # inject ctx["llm_provider"]; production builds the provider from
+                # settings (OpenAI or Anthropic per llm_provider).
+                provider: LLMProvider = ctx.get("llm_provider") or _build_llm_provider(
+                    settings, observability
+                )
 
                 # Phase 9.5: extract every window committing per batch (durable,
                 # heartbeated progress; DECISIONS #4), then promote the staged
