@@ -39,7 +39,6 @@ from rag_recipes.providers.llm.anthropic import (
 __all__ = [
     "AnthropicBatchProvider",
     "BatchExtractionRequest",
-    "BatchInfo",
     "BatchSubmitResult",
 ]
 
@@ -57,14 +56,6 @@ class BatchExtractionRequest:
 
 @dataclass(frozen=True)
 class BatchSubmitResult:
-    provider_batch_id: str
-    request_count: int
-
-
-@dataclass(frozen=True)
-class BatchInfo:
-    """A recent provider batch, used by the submitter's reconciliation list-match."""
-
     provider_batch_id: str
     request_count: int
 
@@ -136,41 +127,6 @@ class AnthropicBatchProvider:
             provider_batch_id=batch.id, request_count=len(requests)
         )
 
-    async def list_recent_batches(self, *, limit: int = 100) -> list[BatchInfo]:
-        """Return the most recent provider batches (first page only) for reconcile.
-
-        Used by the submitter to confirm whether a stale ``SUBMITTING`` local batch
-        was actually accepted after a crash, so it can resolve it without a
-        re-submit (DECISIONS #7). Owns retries like ``submit_batch``; reads only the
-        first page (recency-ordered) to stay bounded.
-        """
-        attempt = 0
-        while True:
-            try:
-                page = await self._client.messages.batches.list(
-                    limit=limit,
-                    extra_headers=None,
-                    timeout=self._request_timeout,
-                )
-                break
-            except anthropic.RateLimitError as exc:
-                if attempt >= self._max_rate_limit_retries:
-                    raise LLMTechnicalError(str(exc)) from exc
-                await self._sleep_before_retry(exc, attempt)
-                attempt += 1
-            except anthropic.APIStatusError as exc:
-                if (
-                    exc.status_code != _OVERLOADED_STATUS_CODE
-                    or attempt >= self._max_rate_limit_retries
-                ):
-                    raise LLMTechnicalError(str(exc)) from exc
-                await self._sleep_before_retry(exc, attempt)
-                attempt += 1
-            except anthropic.APIError as exc:
-                raise LLMTechnicalError(str(exc)) from exc
-
-        return [_batch_info(batch) for batch in page.data]
-
     @staticmethod
     def _build_request(request: BatchExtractionRequest) -> Request:
         output_config: OutputConfigParam = {
@@ -194,16 +150,3 @@ class AnthropicBatchProvider:
         retry_after = _retry_after_seconds(exc)
         delay = retry_after if retry_after is not None else _backoff_delay(attempt)
         await asyncio.sleep(delay)
-
-
-def _batch_info(batch: Any) -> BatchInfo:
-    """Map a provider ``MessageBatch`` to ``BatchInfo`` (total request count)."""
-    counts = batch.request_counts
-    total = (
-        counts.canceled
-        + counts.errored
-        + counts.expired
-        + counts.processing
-        + counts.succeeded
-    )
-    return BatchInfo(provider_batch_id=batch.id, request_count=total)

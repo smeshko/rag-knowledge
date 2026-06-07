@@ -48,8 +48,6 @@ logger = logging.getLogger(__name__)
 # Per-request serialization overhead beyond input + schema (custom_id, JSON
 # envelope, message wrapper) — a conservative constant for the byte estimate.
 _REQUEST_ENVELOPE_BYTES = 512
-# How many recent provider batches to scan when reconciling.
-_RECONCILE_LIST_LIMIT = 100
 
 
 def _build_batch_provider(settings: Settings) -> AnthropicBatchProvider:
@@ -85,7 +83,7 @@ async def submit_extraction_batches(ctx: dict[str, Any]) -> int:
         return 0
 
     provider = _build_batch_provider(settings)
-    await _reconcile_submitting_batches(session_factory, settings, provider)
+    await _reconcile_submitting_batches(session_factory, settings)
 
     # Claim phase: pull every available chunk into SUBMITTING *before* any provider
     # call, so the submit phase iterates a fixed set — a per-chunk submit failure
@@ -233,23 +231,33 @@ async def _revert_chunk(
 async def _reconcile_submitting_batches(
     session_factory: async_sessionmaker[Any],
     settings: Settings,
-    provider: AnthropicBatchProvider,
 ) -> None:
-    """Resolve SUBMITTING batches stranded by a prior crash (DECISIONS #7).
+    """Revert SUBMITTING batches stranded by a prior crash (DECISIONS #7).
 
-    Confirms acceptance by matching a recent provider batch (same total request
-    count, an id not already linked locally) → finalize to SUBMITTED. When a match
-    can't be made confidently, the terminal fallback reverts the batch to PENDING
-    for re-submission, so a SUBMITTING batch is never stranded forever.
+    A SUBMITTING batch past ``anthropic_batch_submitting_timeout_minutes`` means a
+    prior run crashed around the provider call. Resolution is the terminal,
+    always-terminating fallback: revert it to ``PENDING`` so its items re-submit
+    on the next claim. Re-submitting a chunk Anthropic *did* accept is wasteful but
+    not corrupting — 19.3 ingests results idempotently keyed on ``input_hash``, so
+    duplicate results collapse to one ``ExtractionRun`` (≤2× cost for that chunk in
+    the rare crash case).
+
+    We deliberately do **not** "confirm" acceptance by matching a recent provider
+    batch on request count (review #2.1): a coincidental same-count match would
+    link the items to the *wrong* provider batch, so 19.3 would never deliver their
+    results and they'd sit ``SUBMITTED`` (sweep-exempt) forever — strictly worse
+    than a dedup-safe re-submit, and the exact "stranded forever" class DECISIONS
+    #7 exists to prevent. A safe confirm needs the per-``custom_id`` results surface
+    19.3 owns; it can be added there if the re-submit cost ever matters.
     """
     threshold = datetime.now(tz=UTC) - timedelta(
         minutes=settings.anthropic_batch_submitting_timeout_minutes
     )
     async with session_factory() as session:
-        stale = list(
+        stale_ids = list(
             (
                 await session.execute(
-                    select(ExtractionBatch).where(
+                    select(ExtractionBatch.id).where(
                         ExtractionBatch.processing_status
                         == ExtractionBatchStatus.SUBMITTING,
                         ExtractionBatch.created_at < threshold,
@@ -259,49 +267,11 @@ async def _reconcile_submitting_batches(
             .scalars()
             .all()
         )
-        stale_info = [(b.id, b.request_count) for b in stale]
-        used_ids = set(
-            (
-                await session.execute(
-                    select(ExtractionBatch.provider_batch_id).where(
-                        ExtractionBatch.provider_batch_id.is_not(None)
-                    )
-                )
-            )
-            .scalars()
-            .all()
+
+    for batch_id in stale_ids:
+        logger.warning(
+            "reconcile: reverting stale SUBMITTING batch %s to PENDING for "
+            "re-submission",
+            batch_id,
         )
-
-    if not stale_info:
-        return
-
-    try:
-        recent = await provider.list_recent_batches(limit=_RECONCILE_LIST_LIMIT)
-    except LLMTechnicalError as exc:
-        # Can't confirm this run — leave them for the terminal fallback below
-        # (which still fires, reverting to PENDING since no match is found).
-        logger.warning("reconcile: list_recent_batches failed (%s); reverting stale", exc)
-        recent = []
-
-    for batch_id, request_count in stale_info:
-        candidates = [
-            info
-            for info in recent
-            if info.request_count == request_count
-            and info.provider_batch_id not in used_ids
-        ]
-        if len(candidates) == 1:
-            match = candidates[0]
-            used_ids.add(match.provider_batch_id)
-            logger.info(
-                "reconcile: confirmed batch %s as accepted provider batch %s",
-                batch_id,
-                match.provider_batch_id,
-            )
-            await _finalize_chunk(session_factory, batch_id, match.provider_batch_id)
-        else:
-            logger.warning(
-                "reconcile: could not confirm batch %s; reverting items to PENDING",
-                batch_id,
-            )
-            await _revert_chunk(session_factory, batch_id)
+        await _revert_chunk(session_factory, batch_id)

@@ -25,7 +25,6 @@ from rag_recipes.ingestion.pipeline.extraction import PROMPT_VERSION, SCHEMA_VER
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.anthropic_batch import (
     BatchExtractionRequest,
-    BatchInfo,
     BatchSubmitResult,
 )
 from rag_recipes.storage.enums import (
@@ -49,16 +48,9 @@ _TEST_CATEGORY = "batch-submitter-test"
 
 
 class _FakeBatchProvider:
-    def __init__(
-        self,
-        *,
-        fail: bool = False,
-        recent: Sequence[BatchInfo] = (),
-        on_submit: Any = None,
-    ) -> None:
+    def __init__(self, *, fail: bool = False, on_submit: Any = None) -> None:
         self.submit_calls: list[tuple[list[BatchExtractionRequest], str | None]] = []
         self._fail = fail
-        self._recent = list(recent)
         self._on_submit = on_submit
         self._counter = 0
 
@@ -77,9 +69,6 @@ class _FakeBatchProvider:
         return BatchSubmitResult(
             provider_batch_id=f"msgbatch_{self._counter}", request_count=len(requests)
         )
-
-    async def list_recent_batches(self, *, limit: int = 100) -> list[BatchInfo]:
-        return list(self._recent)
 
 
 @pytest_asyncio.fixture
@@ -383,53 +372,77 @@ async def _seed_stale_submitting_batch(
         return batch.id
 
 
-async def test_reconcile_confirms_accepted_batch_via_list_match(
+async def test_reconcile_reverts_stale_submitting_batch_then_resubmits(
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    batch_id = await _seed_stale_submitting_batch(session_factory, count=3)
-    # The provider reports a recent batch with the same request count → confirmed.
-    fake = _FakeBatchProvider(
-        recent=[BatchInfo(provider_batch_id="msgbatch_real", request_count=3)]
-    )
-    monkeypatch.setattr(batch_module, "_build_batch_provider", lambda settings: fake)
-    ctx = {"settings": _settings(), "session_factory": session_factory}
-
-    await submit_extraction_batches(ctx)
-
-    # No re-submit; the stale batch is resolved to SUBMITTED via list-match.
-    assert len(fake.submit_calls) == 0
-    async with session_factory() as session:
-        batch = await session.get(ExtractionBatch, batch_id)
-        assert batch is not None
-        assert batch.processing_status is ExtractionBatchStatus.SUBMITTED
-        assert batch.provider_batch_id == "msgbatch_real"
-    counts = await _items_by_status(session_factory)
-    assert counts == {"submitted": 3}
-
-
-async def test_reconcile_terminal_fallback_reverts_unconfirmable(
-    session_factory: async_sessionmaker[AsyncSession],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    # A stale SUBMITTING batch (prior crash) is always reverted to PENDING — we do
+    # NOT confirm via a count-only list-match (that could false-link to the wrong
+    # provider batch and strand items SUBMITTED forever; review #2.1). The reverted
+    # items are then re-claimed and re-submitted in the same run (dedup-safe in
+    # 19.3 on input_hash), so the original batch ends FAILED and a NEW batch
+    # carries the items to SUBMITTED.
     batch_id = await _seed_stale_submitting_batch(session_factory, count=2)
-    # No matching recent batch → cannot confirm → terminal fallback reverts.
-    fake = _FakeBatchProvider(recent=[])
+    fake = _FakeBatchProvider()
     monkeypatch.setattr(batch_module, "_build_batch_provider", lambda settings: fake)
     ctx = {"settings": _settings(), "session_factory": session_factory}
 
     await submit_extraction_batches(ctx)
 
     async with session_factory() as session:
-        batch = await session.get(ExtractionBatch, batch_id)
-        assert batch is not None
-        assert batch.processing_status is ExtractionBatchStatus.FAILED
-    # Items reverted to PENDING — eligible for re-submission. (They were then
-    # re-claimed and re-submitted in the same run, so end state is SUBMITTED;
-    # assert the reverted batch is FAILED and a NEW batch carried them.)
+        original = await session.get(ExtractionBatch, batch_id)
+        assert original is not None
+        assert original.processing_status is ExtractionBatchStatus.FAILED
+    # Items re-submitted via a fresh batch.
     counts = await _items_by_status(session_factory)
     assert counts == {"submitted": 2}
     assert len(fake.submit_calls) == 1
+
+
+async def test_reconcile_does_not_touch_fresh_submitting_batch(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A SUBMITTING batch within the timeout (created just now) is a healthy in-flight
+    # submit, not a crash — reconcile must leave it alone.
+    async with session_factory() as session:
+        document_id = await _make_document(session)
+        batch = ExtractionBatch(
+            provider="anthropic",
+            provider_batch_id="msgbatch_live",
+            model="claude-sonnet-4-6",
+            processing_status=ExtractionBatchStatus.SUBMITTING,
+            request_count=1,
+        )
+        session.add(batch)
+        await session.flush()
+        session.add(
+            ExtractionBatchItem(
+                document_id=document_id,
+                source_version=1,
+                input_hash=f"fresh-{document_id}",
+                input_source_span_ids=["span_a"],
+                request_input="w",
+                request_schema={"type": "object"},
+                prompt_version=PROMPT_VERSION,
+                schema_version=SCHEMA_VERSION,
+                status=ExtractionBatchItemStatus.SUBMITTING,
+                batch_id=batch.id,
+            )
+        )
+        await session.commit()
+        fresh_id = batch.id
+
+    fake = _FakeBatchProvider()
+    monkeypatch.setattr(batch_module, "_build_batch_provider", lambda settings: fake)
+    ctx = {"settings": _settings(), "session_factory": session_factory}
+    await submit_extraction_batches(ctx)
+
+    async with session_factory() as session:
+        batch = await session.get(ExtractionBatch, fresh_id)
+        assert batch is not None
+        assert batch.processing_status is ExtractionBatchStatus.SUBMITTING
+    assert len(fake.submit_calls) == 0
 
 
 # --- concurrency ------------------------------------------------------------
