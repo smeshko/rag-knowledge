@@ -1122,6 +1122,34 @@ def test_sanitize_schema_preserves_supported_keywords() -> None:
     assert out["additionalProperties"] is False
 
 
+def test_sanitize_schema_preserves_property_named_like_a_keyword() -> None:
+    # A field literally named after a stripped keyword must survive — only its
+    # subschema is sanitized, never the field itself (review #1.1). Otherwise a
+    # future recipe/answer field named e.g. "pattern" would be silently deleted
+    # and the strictified "required" list would reference a missing property.
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["pattern", "maximum"],
+        "properties": {
+            "pattern": {"type": "string", "maxLength": 5},
+            "maximum": {"type": "integer", "minimum": 0},
+        },
+        "$defs": {
+            "minItems": {"type": "object", "additionalProperties": False, "properties": {}}
+        },
+    }
+    out = _sanitize_schema(schema)
+
+    # Field names that collide with keywords are preserved.
+    assert set(out["properties"]) == {"pattern", "maximum"}
+    assert out["$defs"].keys() == {"minItems"}
+    # ...but the unsupported keywords inside their subschemas are still stripped.
+    assert "maxLength" not in out["properties"]["pattern"]
+    assert "minimum" not in out["properties"]["maximum"]
+    assert out["properties"]["pattern"]["type"] == "string"
+
+
 def _iter_schema_nodes(node: Any) -> Iterator[dict[str, Any]]:
     if isinstance(node, dict):
         yield node

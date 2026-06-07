@@ -77,6 +77,12 @@ _UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
     }
 )
 
+# Keys whose value is a ``{name: subschema}`` map. The keys *inside* these maps are
+# author-controlled field/definition names, NOT schema keywords — so a field
+# literally named ``pattern`` / ``maximum`` / etc. must be recursed into, never
+# stripped. Sanitization descends into the values of these maps only.
+_SUBSCHEMA_MAP_KEYWORDS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
+
 
 def _backoff_delay(
     attempt: int,
@@ -120,9 +126,13 @@ def _extract_text(content: Iterable[Any]) -> str:
 def _sanitize_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Return a deep copy of ``schema`` with Claude-unsupported keywords stripped.
 
-    Pure function — the caller's dict is never mutated. Recurses every nested
-    mapping/sequence, so ``properties``, ``items``, ``$defs``/``definitions``,
-    ``anyOf``/``allOf``/``oneOf`` are all covered.
+    Pure function — the caller's dict is never mutated. Strips keywords from each
+    schema node and recurses every nested schema, so ``properties``, ``items``,
+    ``$defs``/``definitions``, ``anyOf``/``allOf``/``oneOf`` are all covered. The
+    *keys* of a ``properties``/``$defs``/``definitions``/``patternProperties`` map
+    are field/definition names, not keywords, so they are never stripped — a field
+    named ``pattern`` (or any other keyword) survives; only its subschema is
+    sanitized (review #1.1).
     """
     sanitized = copy.deepcopy(schema)
     _strip_unsupported(sanitized)
@@ -133,8 +143,14 @@ def _strip_unsupported(node: Any) -> None:
     if isinstance(node, dict):
         for keyword in _UNSUPPORTED_SCHEMA_KEYWORDS:
             node.pop(keyword, None)
-        for value in node.values():
-            _strip_unsupported(value)
+        for key, value in node.items():
+            if key in _SUBSCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+                # value is a {name: subschema} map — recurse into each subschema
+                # but treat the map's own keys as opaque names, not keywords.
+                for subschema in value.values():
+                    _strip_unsupported(subschema)
+            else:
+                _strip_unsupported(value)
     elif isinstance(node, list):
         for item in node:
             _strip_unsupported(item)
