@@ -5,12 +5,14 @@ Anthropic Message Batches using a **durable claim-before-call protocol** so a
 crash/commit-failure after the provider accepts a batch can never re-submit /
 double-charge (DECISIONS #7):
 
-1. **Reconcile** stale ``SUBMITTING`` batches (a prior run crashed between the
-   provider call and the success commit). Confirm acceptance via a recent-batch
-   list-match → finalize to ``SUBMITTED``; otherwise (the terminal, always-
-   terminating fallback) revert to ``PENDING`` for re-submission. Re-submitting a
-   chunk Anthropic *did* accept is wasteful but not corrupting — 19.3 ingests
-   results idempotently keyed on ``input_hash``.
+1. **Reconcile** stale ``SUBMITTING`` batches (a prior run crashed around the
+   provider call) by unconditionally reverting them to ``PENDING`` (the terminal,
+   always-terminating fallback). Re-submitting a chunk Anthropic *did* accept is
+   wasteful but not corrupting — 19.3 ingests results idempotently keyed on
+   ``input_hash``. We do **not** try to "confirm" acceptance by matching a recent
+   provider batch on request count: a coincidental match would link items to the
+   wrong batch and strand them ``SUBMITTED`` forever (review #2.1); a safe confirm
+   needs the per-``custom_id`` results surface 19.3 owns.
 2. **Claim** chunks of ``PENDING`` items (``FOR UPDATE SKIP LOCKED`` so concurrent
    crons never grab the same items), chunked by **both** a request count and an
    estimated serialized-bytes cap, committing each chunk to ``SUBMITTING`` (items

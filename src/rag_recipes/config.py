@@ -50,8 +50,8 @@ class Settings(BaseSettings):
     anthropic_batch_max_bytes: int = Field(default=200_000_000, ge=1, le=256_000_000)
     anthropic_batch_submit_interval_minutes: int = Field(default=5, ge=1)
     # How long a SUBMITTING batch may sit before reconciliation treats it as a
-    # crashed submit and resolves it (confirm via list-match, else revert to
-    # PENDING for re-submission; DECISIONS #7).
+    # crashed submit and reverts it to PENDING for dedup-safe re-submission
+    # (DECISIONS #7; review #2.1).
     anthropic_batch_submitting_timeout_minutes: int = Field(default=60, ge=1)
 
     llm_model: str = "gpt-4.1"

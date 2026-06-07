@@ -11,8 +11,9 @@ Idempotency caveat: the installed ``anthropic`` SDK leaves ``_idempotency_header
 unset (``None``), so it does **not** send an idempotency header for Anthropic, and
 the Batches API's idempotency support is unverified. ``submit_batch`` still forwards
 a caller-supplied key via ``extra_headers`` best-effort, but the submitter's
-crash-recovery does **not** rely on it — TASK-005's reconcile-by-list is the
-authoritative mechanism (see DECISIONS #7).
+crash-recovery does **not** rely on it — the submitter reconciles a stale
+``SUBMITTING`` batch by unconditionally reverting it to ``PENDING`` for dedup-safe
+re-submission (see DECISIONS #7 and review #2.1).
 """
 
 from __future__ import annotations
