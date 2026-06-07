@@ -69,6 +69,7 @@ from rag_recipes.providers.errors import (
 )
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
+from rag_recipes.providers.llm.anthropic_batch import AnthropicBatchProvider
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
@@ -179,6 +180,24 @@ def _build_llm_provider(
         settings.openai_api_key,
         default_model=settings.llm_model,
         observability=observability,
+        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+        request_timeout=settings.llm_request_timeout_seconds,
+    )
+
+
+def _build_batch_provider(settings: Settings) -> AnthropicBatchProvider:
+    """Construct the Anthropic batch provider for the cron submitter (Epic 19.2).
+
+    Only the Anthropic batch path exists — there is no OpenAI batch provider — so
+    this is constructed unconditionally from ``anthropic_api_key`` (the submitter
+    guards on ``settings.llm_provider == "anthropic"`` before calling it). The
+    ``None`` narrow mirrors ``_build_llm_provider``'s defense-in-depth.
+    """
+    api_key = settings.anthropic_api_key
+    if api_key is None:
+        raise ValueError("anthropic_api_key is required for batch submission")
+    return AnthropicBatchProvider(
+        api_key,
         max_rate_limit_retries=settings.llm_max_rate_limit_retries,
         request_timeout=settings.llm_request_timeout_seconds,
     )
