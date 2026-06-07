@@ -101,6 +101,10 @@ async def test_batch_and_item_round_trip(db_session: AsyncSession) -> None:
     assert reloaded.batch_id == batch.id
     assert reloaded.request_schema == {"type": "object", "additionalProperties": False}
     assert reloaded.input_source_span_ids == ["span_a", "span_b"]
+    # Epic 19.3 retry/audit columns: submit_attempts backfills to 0; audit nullable.
+    assert reloaded.submit_attempts == 0
+    assert reloaded.result_type is None
+    assert reloaded.error_message is None
 
 
 async def test_partial_unique_index_blocks_duplicate_non_terminal(
