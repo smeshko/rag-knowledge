@@ -44,6 +44,7 @@ from rag_recipes.ingestion.pipeline.extraction import (
 )
 from rag_recipes.ingestion.pipeline.persist import persist_knowledge_item
 from rag_recipes.ingestion.pipeline.windows import Window
+from rag_recipes.ingestion.queue import enqueue_job
 from rag_recipes.ingestion.validation import HardValidationError
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.anthropic import map_message_to_structured_output
@@ -554,3 +555,172 @@ async def _reconstruct_window(
         by_id[span_id] for span_id in item.input_source_span_ids if span_id in by_id
     )
     return Window(spans=ordered)
+
+
+# Local batch statuses still worth polling (have a provider_batch_id, not terminal).
+_POLLABLE_BATCH_STATUSES = (
+    ExtractionBatchStatus.SUBMITTED,
+    ExtractionBatchStatus.IN_PROGRESS,
+)
+
+
+async def poll_extraction_batches(ctx: dict[str, Any]) -> int:
+    """Poll in-flight batches; on ``ended``, ingest results + mark the batch done.
+
+    Each batch is processed in its own transaction under a ``FOR UPDATE SKIP
+    LOCKED`` row lock so overlapping poller runs never double-process one. A
+    provider error on a batch leaves it non-terminal for the next tick (never
+    crashes the whole run). Returns the number of results ingested.
+    """
+    settings: Settings = ctx["settings"]
+    session_factory: async_sessionmaker[Any] = ctx["session_factory"]
+
+    if settings.llm_provider != "anthropic":
+        logger.info(
+            "batch poller skipped: llm_provider=%s (no batch provider)",
+            settings.llm_provider,
+        )
+        return 0
+
+    provider = _build_batch_provider(settings)
+    async with session_factory() as session:
+        batch_ids = list(
+            (
+                await session.execute(
+                    select(ExtractionBatch.id).where(
+                        ExtractionBatch.processing_status.in_(_POLLABLE_BATCH_STATUSES),
+                        ExtractionBatch.provider_batch_id.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    ingested = 0
+    touched: set[tuple[str, int]] = set()
+    for batch_id in batch_ids:
+        count, batch_touched = await _poll_one_batch(
+            session_factory, provider, batch_id, settings
+        )
+        ingested += count
+        touched |= batch_touched
+
+    if touched:
+        await finalize_completed_documents(session_factory, ctx["redis"], touched)
+
+    logger.info("batch poller ingested %d result(s)", ingested)
+    return ingested
+
+
+async def _poll_one_batch(
+    session_factory: async_sessionmaker[Any],
+    provider: AnthropicBatchProvider,
+    batch_id: str,
+    settings: Settings,
+) -> tuple[int, set[tuple[str, int]]]:
+    async with session_factory() as session:
+        batch = (
+            await session.execute(
+                select(ExtractionBatch)
+                .where(ExtractionBatch.id == batch_id)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            batch is None
+            or batch.provider_batch_id is None
+            or batch.processing_status not in _POLLABLE_BATCH_STATUSES
+        ):
+            # Locked by another poller, or already terminal — skip.
+            return 0, set()
+
+        provider_batch_id = batch.provider_batch_id
+        try:
+            status = await provider.retrieve_batch(provider_batch_id)
+            if status.processing_status != "ended":
+                # Track the provider's progress locally; re-poll next tick.
+                if status.processing_status == "in_progress":
+                    batch.processing_status = ExtractionBatchStatus.IN_PROGRESS
+                await session.commit()
+                return 0, set()
+
+            ingested = 0
+            touched: set[tuple[str, int]] = set()
+            async for result in provider.iter_results(provider_batch_id):
+                item = (
+                    await session.execute(
+                        select(ExtractionBatchItem).where(
+                            ExtractionBatchItem.id == result.custom_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if item is None:
+                    continue
+                await ingest_batch_result(session, item, result, settings=settings)
+                touched.add((item.document_id, item.source_version))
+                ingested += 1
+
+            batch.processing_status = ExtractionBatchStatus.ENDED
+            batch.completed_at = datetime.now(tz=UTC)
+            await session.commit()
+            return ingested, touched
+        except LLMTechnicalError as exc:
+            # Transient provider failure — leave the batch non-terminal for the
+            # next tick; nothing is half-ingested (ingest is idempotent per item).
+            await session.rollback()
+            logger.warning("poll: batch %s provider error (%s); will retry", batch_id, exc)
+            return 0, set()
+
+
+# Non-terminal item statuses for completion detection: a document is ready to
+# finalize only when none of its items remain in one of these.
+_NON_TERMINAL_ITEM_STATUSES_FOR_COMPLETION = (
+    ExtractionBatchItemStatus.PENDING,
+    ExtractionBatchItemStatus.SUBMITTING,
+    ExtractionBatchItemStatus.SUBMITTED,
+)
+
+
+async def finalize_completed_documents(
+    session_factory: async_sessionmaker[Any],
+    redis: Any,
+    touched: set[tuple[str, int]],
+) -> int:
+    """Re-drive documents whose every window now has a terminal result.
+
+    Completion is **per-document, not per-batch** (19.2 splits a doc's windows
+    across batches; DECISIONS #4): a doc is finalized only when no
+    ``ExtractionBatchItem`` for ``(document, source_version)`` is still non-terminal.
+    Re-enqueues the normal **resume** path (``batch_mode`` stays ``False``) — the
+    existing ``_resume_or_fresh → "resume"`` skips done windows via ``done_hashes``
+    and ``_finalize_extraction`` promotes the committed staging candidates. Adds no
+    finalize logic; idempotent (a redundant resume no-ops). Returns docs re-driven.
+    """
+    finalized = 0
+    for document_id, source_version in touched:
+        async with session_factory() as session:
+            remaining = await session.scalar(
+                select(func.count())
+                .select_from(ExtractionBatchItem)
+                .where(
+                    ExtractionBatchItem.document_id == document_id,
+                    ExtractionBatchItem.source_version == source_version,
+                    ExtractionBatchItem.status.in_(
+                        _NON_TERMINAL_ITEM_STATUSES_FOR_COMPLETION
+                    ),
+                )
+            )
+        if remaining:
+            # Windows still in flight (e.g. split across batches) — wait for the
+            # last one before re-driving, or finalize would drop un-ingested windows.
+            continue
+        await enqueue_job(
+            redis,
+            "process_document",
+            document_id,
+            source_version=source_version,
+            session_id=document_id,
+        )
+        finalized += 1
+    return finalized
