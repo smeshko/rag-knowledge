@@ -19,6 +19,7 @@ from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
+from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.reranker.base import RerankerProvider
@@ -75,14 +76,36 @@ def get_llm_provider(
 ) -> LLMProvider:
     """Build the production LLM provider for the query-time answer endpoint.
 
-    Tests override this with a ``FakeLLMProvider``. The default model resolves to
-    ``answer_llm_model`` when set, else ``llm_model`` (a class-level default can't
-    reference a sibling field, so the fallback lives here at the boundary). Like
-    ``get_embedding_provider``, no ``ProviderObservability`` is injected — request-
-    time providers are deliberately untraced (answers are synchronous, not a traced
-    ingestion job), so the answer layer inherits the provider's retry + parse-error
-    handling but not Langfuse tracing (request-time answer tracing is deferred).
+    Tests override this with a ``FakeLLMProvider``. Dispatches on
+    ``settings.llm_provider`` (Epic 19.1): ``"anthropic"`` builds Claude on the
+    Anthropic settings, anything else stays OpenAI (the default). On OpenAI the
+    model resolves to ``answer_llm_model`` when set, else ``llm_model`` (a
+    class-level default can't reference a sibling field, so the fallback lives
+    here). On Anthropic the answer model is ``anthropic_llm_model`` — the
+    OpenAI-shaped ``answer_llm_model`` override is **deliberately ignored** so a
+    deployment that set ``ANSWER_LLM_MODEL=gpt-4.1-mini`` can't route a GPT id to
+    Claude (DECISIONS #5).
+
+    Like ``get_embedding_provider``, no ``ProviderObservability`` is injected —
+    request-time providers are deliberately untraced (answers are synchronous,
+    not a traced ingestion job), so the answer layer inherits the provider's
+    retry + parse-error handling but not Langfuse tracing (deferred). The config
+    validator guarantees ``anthropic_api_key`` when Anthropic is selected; the
+    ``None`` narrow is defense-in-depth and satisfies mypy.
     """
+    if settings.llm_provider == "anthropic":
+        api_key = settings.anthropic_api_key
+        if api_key is None:
+            raise ValueError(
+                "anthropic_api_key is required when llm_provider == 'anthropic'"
+            )
+        return AnthropicLLMProvider(
+            api_key,
+            default_model=settings.anthropic_llm_model,
+            max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+            request_timeout=settings.llm_request_timeout_seconds,
+            max_tokens=settings.anthropic_max_tokens,
+        )
     return OpenAILLMProvider(
         settings.openai_api_key,
         default_model=settings.answer_llm_model or settings.llm_model,
