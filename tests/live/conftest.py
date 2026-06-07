@@ -35,6 +35,10 @@ class LiveCredentials(BaseSettings):
     llm_model: str = "gpt-4.1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    # Anthropic live creds (Epic 19.1). A blank ``ANTHROPIC_LLM_MODEL=`` in
+    # ``.env`` falls back to the Sonnet default via ``env_ignore_empty=True``.
+    anthropic_api_key: str | None = None
+    anthropic_llm_model: str = "claude-sonnet-4-6"
 
 
 @pytest.fixture
@@ -43,5 +47,18 @@ def live_credentials() -> LiveCredentials:
     if not credentials.openai_api_key:
         pytest.skip(
             "OPENAI_API_KEY not set (env or .env) — set it to run the live OpenAI test"
+        )
+    return credentials
+
+
+@pytest.fixture
+def live_anthropic_credentials() -> LiveCredentials:
+    # Keyed on the Anthropic key so the OpenAI-key skip does not gate the
+    # Anthropic live test (and vice-versa).
+    credentials = LiveCredentials()
+    if not credentials.anthropic_api_key:
+        pytest.skip(
+            "ANTHROPIC_API_KEY not set (env or .env) — set it to run the live "
+            "Anthropic test"
         )
     return credentials
