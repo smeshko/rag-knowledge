@@ -19,9 +19,9 @@ re-submission (see DECISIONS #7 and review #2.1).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import anthropic
 from anthropic import AsyncAnthropic
@@ -35,13 +35,32 @@ from rag_recipes.providers.llm.anthropic import (
     _backoff_delay,
     _retry_after_seconds,
     _sanitize_schema,
+    map_message_to_structured_output,
 )
+from rag_recipes.providers.llm.types import StructuredOutputResponse
 
 __all__ = [
     "AnthropicBatchProvider",
     "BatchExtractionRequest",
+    "BatchResult",
+    "BatchStatus",
     "BatchSubmitResult",
 ]
+
+_T = TypeVar("_T")
+
+# Provider error types that resubmitting cannot fix — mapped to a terminal
+# REJECTED result. Everything else (server/overloaded/rate-limit/gateway-timeout)
+# is treated as retryable (DECISIONS #2; 19.3 bounds the retry by submit_attempts).
+_NON_RETRYABLE_ERROR_TYPES = frozenset(
+    {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "billing_error",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +78,24 @@ class BatchExtractionRequest:
 class BatchSubmitResult:
     provider_batch_id: str
     request_count: int
+
+
+@dataclass(frozen=True)
+class BatchStatus:
+    """The provider's view of a batch (poller only needs ``processing_status``)."""
+
+    processing_status: str
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """One normalized per-window batch result (19.3)."""
+
+    custom_id: str
+    result_type: str  # "succeeded" | "errored" | "expired" | "canceled"
+    message: Any | None = None  # the Anthropic Message, for succeeded
+    error_type: str | None = None  # the inner provider error type, for errored
+    retryable: bool = False  # errored: invalid_request etc. are non-retryable
 
 
 class AnthropicBatchProvider:
@@ -145,9 +182,86 @@ class AnthropicBatchProvider:
         )
         return Request(custom_id=request.custom_id, params=params)
 
+    async def retrieve_batch(self, provider_batch_id: str) -> BatchStatus:
+        """Return the provider's current status for a batch (over ``batches.retrieve``)."""
+        batch = await self._call_with_retry(
+            lambda: self._client.messages.batches.retrieve(
+                provider_batch_id, timeout=self._request_timeout
+            )
+        )
+        return BatchStatus(processing_status=batch.processing_status)
+
+    async def iter_results(
+        self, provider_batch_id: str
+    ) -> AsyncIterator[BatchResult]:
+        """Stream a completed batch's per-window results, normalized to ``BatchResult``."""
+        decoder = await self._call_with_retry(
+            lambda: self._client.messages.batches.results(
+                provider_batch_id, timeout=self._request_timeout
+            )
+        )
+        async for entry in decoder:
+            yield _normalize_result(entry)
+
+    def to_structured_output(
+        self, result: BatchResult, *, model: str
+    ) -> StructuredOutputResponse:
+        """Map a succeeded result's message to a ``StructuredOutputResponse``.
+
+        Uses the same 19.1 mapping the synchronous provider applies, so a batch
+        refusal/truncation/unparseable becomes a ``parse_error`` identically.
+        """
+        return map_message_to_structured_output(
+            result.message, provider=self.provider, model=model
+        )
+
+    async def _call_with_retry(self, op: Callable[[], Awaitable[_T]]) -> _T:
+        """Run ``op`` under the shared retry/error policy (429/529 retry, else raise)."""
+        attempt = 0
+        while True:
+            try:
+                return await op()
+            except anthropic.RateLimitError as exc:
+                if attempt >= self._max_rate_limit_retries:
+                    raise LLMTechnicalError(str(exc)) from exc
+                await self._sleep_before_retry(exc, attempt)
+                attempt += 1
+            except anthropic.APIStatusError as exc:
+                if (
+                    exc.status_code != _OVERLOADED_STATUS_CODE
+                    or attempt >= self._max_rate_limit_retries
+                ):
+                    raise LLMTechnicalError(str(exc)) from exc
+                await self._sleep_before_retry(exc, attempt)
+                attempt += 1
+            except anthropic.APIError as exc:
+                raise LLMTechnicalError(str(exc)) from exc
+
     async def _sleep_before_retry(
         self, exc: anthropic.APIStatusError, attempt: int
     ) -> None:
         retry_after = _retry_after_seconds(exc)
         delay = retry_after if retry_after is not None else _backoff_delay(attempt)
         await asyncio.sleep(delay)
+
+
+def _normalize_result(entry: Any) -> BatchResult:
+    """Map a provider ``MessageBatchIndividualResponse`` to a ``BatchResult``."""
+    result = entry.result
+    result_type = result.type
+    if result_type == "succeeded":
+        return BatchResult(
+            custom_id=entry.custom_id,
+            result_type="succeeded",
+            message=result.message,
+        )
+    if result_type == "errored":
+        error_type = result.error.error.type
+        return BatchResult(
+            custom_id=entry.custom_id,
+            result_type="errored",
+            error_type=error_type,
+            retryable=error_type not in _NON_RETRYABLE_ERROR_TYPES,
+        )
+    # expired / canceled carry no message or error.
+    return BatchResult(custom_id=entry.custom_id, result_type=result_type)

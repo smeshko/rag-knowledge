@@ -1,8 +1,9 @@
-"""Unit tests for AnthropicBatchProvider.submit_batch (Epic 19.2)."""
+"""Unit tests for AnthropicBatchProvider — submit (19.2) + retrieve/results (19.3)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import anthropic
@@ -14,6 +15,7 @@ from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.anthropic_batch import (
     AnthropicBatchProvider,
     BatchExtractionRequest,
+    BatchResult,
 )
 
 _REQUEST_OBJ = httpx.Request("POST", "https://api.anthropic.com/v1/messages/batches")
@@ -215,3 +217,176 @@ async def test_other_api_error_wrapped() -> None:
     provider = _provider(client)
     with pytest.raises(LLMTechnicalError):
         await provider.submit_batch([_request()])
+
+
+# === retrieve / results / message mapping (19.3) ============================
+
+
+@dataclass
+class _FakeTextBlock:
+    text: str
+    type: str = "text"
+
+
+@dataclass
+class _FakeUsage:
+    input_tokens: int = 5
+    output_tokens: int = 3
+
+
+@dataclass
+class _FakeStopDetails:
+    explanation: str | None = None
+
+
+@dataclass
+class _FakeMessage:
+    content: list[_FakeTextBlock]
+    usage: _FakeUsage = field(default_factory=_FakeUsage)
+    stop_reason: str = "end_turn"
+    stop_details: _FakeStopDetails | None = None
+
+
+def _message(
+    text: str, *, stop_reason: str = "end_turn", explanation: str | None = None
+) -> _FakeMessage:
+    return _FakeMessage(
+        content=[_FakeTextBlock(text=text)],
+        stop_reason=stop_reason,
+        stop_details=_FakeStopDetails(explanation=explanation) if explanation else None,
+    )
+
+
+@dataclass
+class _FakeInnerError:
+    type: str
+
+
+@dataclass
+class _FakeErrorResponse:
+    error: _FakeInnerError
+
+
+@dataclass
+class _FakeResult:
+    type: str
+    message: Any = None
+    error: Any = None
+
+
+@dataclass
+class _FakeEntry:
+    custom_id: str
+    result: _FakeResult
+
+
+@dataclass
+class _FakeRetrievedBatch:
+    processing_status: str
+
+
+class _FakeDecoder:
+    def __init__(self, entries: list[_FakeEntry]) -> None:
+        self._entries = entries
+
+    async def __aiter__(self) -> AsyncIterator[_FakeEntry]:
+        for entry in self._entries:
+            yield entry
+
+
+class _RetrieveResultsBatches:
+    def __init__(
+        self,
+        *,
+        status: str = "ended",
+        entries: list[_FakeEntry] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._status = status
+        self._entries = entries or []
+        self._error = error
+
+    async def retrieve(self, provider_batch_id: str, **kwargs: Any) -> _FakeRetrievedBatch:
+        if self._error is not None:
+            raise self._error
+        return _FakeRetrievedBatch(processing_status=self._status)
+
+    async def results(self, provider_batch_id: str, **kwargs: Any) -> _FakeDecoder:
+        if self._error is not None:
+            raise self._error
+        return _FakeDecoder(self._entries)
+
+
+class _RetrieveResultsClient:
+    def __init__(self, batches: _RetrieveResultsBatches) -> None:
+        self.batches = batches
+        self.messages = _FakeMessagesResource(batches)  # type: ignore[arg-type]
+
+
+def _rr_provider(batches: _RetrieveResultsBatches) -> AnthropicBatchProvider:
+    return AnthropicBatchProvider(api_key="sk-ant-test", client=_RetrieveResultsClient(batches))  # type: ignore[arg-type]
+
+
+async def test_retrieve_batch_returns_processing_status() -> None:
+    provider = _rr_provider(_RetrieveResultsBatches(status="in_progress"))
+    status = await provider.retrieve_batch("msgbatch_1")
+    assert status.processing_status == "in_progress"
+
+
+async def test_iter_results_normalizes_every_result_type() -> None:
+    entries = [
+        _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message('{"items": []}'))),
+        _FakeEntry(
+            "ebitem_bad",
+            _FakeResult(
+                type="errored",
+                error=_FakeErrorResponse(_FakeInnerError("invalid_request_error")),
+            ),
+        ),
+        _FakeEntry(
+            "ebitem_srv",
+            _FakeResult(type="errored", error=_FakeErrorResponse(_FakeInnerError("api_error"))),
+        ),
+        _FakeEntry("ebitem_exp", _FakeResult(type="expired")),
+        _FakeEntry("ebitem_can", _FakeResult(type="canceled")),
+    ]
+    provider = _rr_provider(_RetrieveResultsBatches(entries=entries))
+
+    results = [r async for r in provider.iter_results("msgbatch_1")]
+    by_id = {r.custom_id: r for r in results}
+    assert by_id["ebitem_ok"].result_type == "succeeded"
+    assert by_id["ebitem_bad"].result_type == "errored"
+    assert by_id["ebitem_bad"].error_type == "invalid_request_error"
+    assert by_id["ebitem_bad"].retryable is False
+    assert by_id["ebitem_srv"].retryable is True  # server error is retryable
+    assert by_id["ebitem_exp"].result_type == "expired"
+    assert by_id["ebitem_can"].result_type == "canceled"
+
+
+async def test_to_structured_output_uses_shared_mapping() -> None:
+    provider = _rr_provider(_RetrieveResultsBatches())
+
+    clean = BatchResult(custom_id="c", result_type="succeeded", message=_message('{"items": []}'))
+    resp = provider.to_structured_output(clean, model="claude-sonnet-4-6")
+    assert resp.output_json == {"items": []}
+    assert resp.parse_error is None
+    assert resp.provider == "anthropic"
+    assert resp.model == "claude-sonnet-4-6"
+
+    refusal = BatchResult(
+        custom_id="c",
+        result_type="succeeded",
+        message=_message("", stop_reason="refusal", explanation="nope"),
+    )
+    rresp = provider.to_structured_output(refusal, model="claude-sonnet-4-6")
+    assert rresp.output_json is None
+    assert rresp.parse_error and "refused" in rresp.parse_error
+
+
+async def test_retrieve_results_errors_wrapped() -> None:
+    batches = _RetrieveResultsBatches(
+        error=anthropic.APITimeoutError(request=_REQUEST_OBJ)
+    )
+    provider = _rr_provider(batches)
+    with pytest.raises(LLMTechnicalError):
+        await provider.retrieve_batch("msgbatch_1")

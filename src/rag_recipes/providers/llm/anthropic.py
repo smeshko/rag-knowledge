@@ -45,7 +45,7 @@ from rag_recipes.providers.llm.types import (
     TokenUsage,
 )
 
-__all__ = ["AnthropicLLMProvider"]
+__all__ = ["AnthropicLLMProvider", "map_message_to_structured_output"]
 
 # Capped exponential backoff bounds for retryable responses (mirrors the OpenAI
 # provider's tuning; kept local so the two providers stay decoupled).
@@ -254,36 +254,20 @@ class AnthropicLLMProvider(LLMProvider):
                 except anthropic.APIError as exc:
                     raise LLMTechnicalError(str(exc)) from exc
 
-            raw_text = _extract_text(message.content)
-            usage = message.usage
-            token_usage = TokenUsage(
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
+            response = map_message_to_structured_output(
+                message, provider=self.provider, model=request.model
             )
 
-            parse_error = self._parse_error(
-                message.stop_reason, message.stop_details, raw_text
-            )
-            output_json = None if parse_error else json.loads(raw_text)
-            response = StructuredOutputResponse(
-                output_json=output_json,
-                parse_error=parse_error,
-                raw_text=raw_text,
-                usage=token_usage,
-                provider=self.provider,
-                model=request.model,
-            )
-
-            status = "success" if parse_error is None else "rejected"
+            status = "success" if response.parse_error is None else "rejected"
             observation.update(
-                output={"parsed": output_json, "raw": raw_text},
+                output={"parsed": response.output_json, "raw": response.raw_text},
                 usage_details={
-                    "input": token_usage.input_tokens,
-                    "output": token_usage.output_tokens,
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
                 },
                 metadata={"status": status},
-                level="DEFAULT" if parse_error is None else "WARNING",
-                status_message=parse_error,
+                level="DEFAULT" if response.parse_error is None else "WARNING",
+                status_message=response.parse_error,
             )
             return response
 
@@ -294,23 +278,51 @@ class AnthropicLLMProvider(LLMProvider):
         delay = retry_after if retry_after is not None else _backoff_delay(attempt)
         await asyncio.sleep(delay)
 
-    @staticmethod
-    def _parse_error(
-        stop_reason: str | None,
-        stop_details: RefusalStopDetails | None,
-        raw_text: str,
-    ) -> str | None:
-        if stop_reason == "refusal":
-            explanation = stop_details.explanation if stop_details is not None else None
-            if explanation:
-                return f"model refused to generate output: {explanation}"
-            return "model refused to generate output"
-        if stop_reason == "max_tokens":
-            return "output truncated by provider (stop_reason=max_tokens)"
-        try:
-            parsed = json.loads(raw_text)
-        except ValueError:
-            return "model output is not valid JSON"
-        if not isinstance(parsed, dict):
-            return "model output is not a JSON object"
-        return None
+
+def map_message_to_structured_output(
+    message: Any, *, provider: str, model: str
+) -> StructuredOutputResponse:
+    """Map an Anthropic ``Message`` to a ``StructuredOutputResponse``.
+
+    The single source of truth for Anthropic Messages-response parse semantics
+    (refusal / truncation / unparseable / non-object → ``parse_error``; clean →
+    ``output_json``), shared by the synchronous provider and 19.3's batch result
+    ingestion so both paths produce byte-identical runs.
+    """
+    raw_text = _extract_text(message.content)
+    usage = message.usage
+    token_usage = TokenUsage(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+    )
+    parse_error = _parse_error(message.stop_reason, message.stop_details, raw_text)
+    output_json = None if parse_error else json.loads(raw_text)
+    return StructuredOutputResponse(
+        output_json=output_json,
+        parse_error=parse_error,
+        raw_text=raw_text,
+        usage=token_usage,
+        provider=provider,
+        model=model,
+    )
+
+
+def _parse_error(
+    stop_reason: str | None,
+    stop_details: RefusalStopDetails | None,
+    raw_text: str,
+) -> str | None:
+    if stop_reason == "refusal":
+        explanation = stop_details.explanation if stop_details is not None else None
+        if explanation:
+            return f"model refused to generate output: {explanation}"
+        return "model refused to generate output"
+    if stop_reason == "max_tokens":
+        return "output truncated by provider (stop_reason=max_tokens)"
+    try:
+        parsed = json.loads(raw_text)
+    except ValueError:
+        return "model output is not valid JSON"
+    if not isinstance(parsed, dict):
+        return "model output is not a JSON object"
+    return None
