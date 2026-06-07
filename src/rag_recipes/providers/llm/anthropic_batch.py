@@ -19,11 +19,13 @@ re-submission (see DECISIONS #7 and review #2.1).
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import anthropic
+import httpx
 from anthropic import AsyncAnthropic
 from anthropic.types import JSONOutputFormatParam, MessageParam, OutputConfigParam
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
@@ -199,12 +201,16 @@ class AnthropicBatchProvider:
     ) -> AsyncIterator[BatchResult]:
         """Stream a completed batch's per-window results, normalized to ``BatchResult``.
 
-        ``batches.results()`` returns a lazy decoder whose *iteration* does the
-        streaming HTTP read, so a connection drop mid-stream raises here, not at
-        the initial call. The seam is the normalization boundary, so wrap the
-        iteration too and re-raise as ``LLMTechnicalError`` — otherwise a raw
-        ``anthropic.APIError`` would escape the poller's per-batch handler and skip
-        finalize for healthy batches already ingested this tick (review #1.1).
+        ``batches.results()`` returns a lazy ``AsyncJSONLDecoder`` that iterates the
+        raw ``http_response.aiter_bytes()`` with **no** httpx→anthropic translation
+        (unlike ``messages.create``). So a mid-stream connection drop raises a raw
+        ``httpx`` error and a truncated/garbled line raises ``json.JSONDecodeError``
+        — neither an ``anthropic.APIError``. The seam is the normalization boundary,
+        so wrap the iteration and re-raise *all* of those as ``LLMTechnicalError`` —
+        otherwise the raw error escapes the poller's per-batch handler and skips
+        finalize for healthy batches already ingested this tick, leaving them to be
+        reaped FAILED (review #1.1, #2.1, #2.2). ``AnthropicError`` is the SDK base
+        (covers ``APIError`` and the bare ``AnthropicError``).
         """
         decoder = await self._call_with_retry(
             lambda: self._client.messages.batches.results(
@@ -214,7 +220,7 @@ class AnthropicBatchProvider:
         try:
             async for entry in decoder:
                 yield _normalize_result(entry)
-        except anthropic.APIError as exc:
+        except (anthropic.AnthropicError, httpx.HTTPError, json.JSONDecodeError) as exc:
             raise LLMTechnicalError(str(exc)) from exc
 
     def to_structured_output(
@@ -248,7 +254,10 @@ class AnthropicBatchProvider:
                     raise LLMTechnicalError(str(exc)) from exc
                 await self._sleep_before_retry(exc, attempt)
                 attempt += 1
-            except anthropic.APIError as exc:
+            except anthropic.AnthropicError as exc:
+                # SDK base error (covers APIError subclasses *and* the bare
+                # AnthropicError, e.g. results() raising "no results_url yet" on an
+                # ended-but-not-ready batch race; review #2.4).
                 raise LLMTechnicalError(str(exc)) from exc
 
     async def _sleep_before_retry(

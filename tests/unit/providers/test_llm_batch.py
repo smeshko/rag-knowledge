@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -418,14 +419,37 @@ class _RaisingResultsClient:
         self.messages = _FakeMessagesResource(self.batches)  # type: ignore[arg-type]
 
 
-async def test_iter_results_normalizes_mid_stream_error() -> None:
-    # A connection drop mid-stream (during decoder iteration, not the initial call)
-    # must surface as LLMTechnicalError so the poller's per-batch handler catches it
-    # (review #1.1).
+class _InitialRaiseResultsBatches:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def results(self, provider_batch_id: str, **kwargs: Any) -> Any:
+        raise self._exc
+
+
+class _InitialRaiseClient:
+    def __init__(self, exc: Exception) -> None:
+        self.batches = _InitialRaiseResultsBatches(exc)
+        self.messages = _FakeMessagesResource(self.batches)  # type: ignore[arg-type]
+
+
+# The AsyncJSONLDecoder reads raw bytes, so mid-stream failures are httpx errors
+# or json decode errors — NOT anthropic.APIError. All must normalize (review #2.1/#2.2).
+@pytest.mark.parametrize(
+    "exc",
+    [
+        anthropic.APIError("stream dropped", request=_REQUEST_OBJ, body=None),
+        httpx.ReadError("connection reset"),
+        httpx.RemoteProtocolError("peer closed"),
+        json.JSONDecodeError("Expecting value", "", 0),
+    ],
+)
+async def test_iter_results_normalizes_mid_stream_error(exc: Exception) -> None:
+    # A failure mid-stream (during decoder iteration, not the initial call) must
+    # surface as LLMTechnicalError so the poller's per-batch handler catches it
+    # (review #1.1, #2.1, #2.2).
     first = _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message("{}")))
-    decoder = _RaisingDecoder(
-        first, anthropic.APIError("stream dropped", request=_REQUEST_OBJ, body=None)
-    )
+    decoder = _RaisingDecoder(first, exc)
     provider = AnthropicBatchProvider(
         api_key="sk-ant-test", client=_RaisingResultsClient(decoder)  # type: ignore[arg-type]
     )
@@ -433,4 +457,16 @@ async def test_iter_results_normalizes_mid_stream_error() -> None:
     with pytest.raises(LLMTechnicalError):
         async for result in provider.iter_results("msgbatch_1"):
             seen.append(result)
-    assert len(seen) == 1  # the first result streamed before the drop
+    assert len(seen) == 1  # the first result streamed before the failure
+
+
+async def test_iter_results_initial_bare_anthropic_error_normalized() -> None:
+    # batches.results() raises a bare anthropic.AnthropicError (not an APIError) on
+    # an ended-but-not-ready batch race — _call_with_retry must normalize it (review #2.4).
+    provider = AnthropicBatchProvider(
+        api_key="sk-ant-test",
+        client=_InitialRaiseClient(anthropic.AnthropicError("no results_url yet")),  # type: ignore[arg-type]
+    )
+    with pytest.raises(LLMTechnicalError):
+        async for _ in provider.iter_results("msgbatch_1"):
+            pass
