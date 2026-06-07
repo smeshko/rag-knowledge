@@ -31,21 +31,49 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql import func
 
 from rag_recipes.config import Settings
-from rag_recipes.ingestion.pipeline.extraction import SCHEMA_VERSION
+from rag_recipes.ingestion.pipeline.dedup import compute_candidate_score
+from rag_recipes.ingestion.pipeline.extraction import (
+    SCHEMA_VERSION,
+    RecipeExtractionOutput,
+)
+from rag_recipes.ingestion.pipeline.persist import persist_knowledge_item
+from rag_recipes.ingestion.pipeline.windows import Window
+from rag_recipes.ingestion.queue import enqueue_job
+from rag_recipes.ingestion.validation import HardValidationError
 from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.llm.anthropic import map_message_to_structured_output
 from rag_recipes.providers.llm.anthropic_batch import (
     AnthropicBatchProvider,
     BatchExtractionRequest,
+    BatchResult,
 )
-from rag_recipes.storage.enums import ExtractionBatchItemStatus, ExtractionBatchStatus
+from rag_recipes.storage.enums import (
+    ExtractionBatchItemStatus,
+    ExtractionBatchStatus,
+    ExtractionRunStatus,
+)
+from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_batch import ExtractionBatch
 from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
+from rag_recipes.storage.models.extraction_run import ExtractionRun
+from rag_recipes.storage.models.source_span import SourceSpan
 
 logger = logging.getLogger(__name__)
+
+# Terminal item status for each non-success result type (used on the duplicate /
+# already-ingested path, and at the retry cap).
+_TERMINAL_ITEM_STATUS: dict[str, ExtractionBatchItemStatus] = {
+    "succeeded": ExtractionBatchItemStatus.SUCCEEDED,
+    "errored": ExtractionBatchItemStatus.ERRORED,
+    "expired": ExtractionBatchItemStatus.EXPIRED,
+    "canceled": ExtractionBatchItemStatus.CANCELED,
+}
 
 # Per-request serialization overhead beyond input + schema (custom_id, JSON
 # envelope, message wrapper) — a conservative constant for the byte estimate.
@@ -277,3 +305,432 @@ async def _reconcile_submitting_batches(
             batch_id,
         )
         await _revert_chunk(session_factory, batch_id)
+
+
+async def ingest_batch_result(
+    session: AsyncSession,
+    item: ExtractionBatchItem,
+    result: BatchResult,
+    *,
+    settings: Settings,
+) -> None:
+    """Turn one batch result into a terminal ``ExtractionRun`` (+ staging candidates).
+
+    Idempotent and atomic (DECISIONS #3): locks the item row, ingests only
+    ``SUBMITTED`` items, and skips if a terminal ``ExtractionRun`` already exists
+    for ``(document, source_version, input_hash)`` — the cross-phase invariant 19.2
+    reconciliation relies on. The run insert + item status flip share the caller's
+    transaction (the poller commits per batch). Mirrors the synchronous
+    ``run_extraction`` terminal mapping + the staging-persist loop (DECISIONS #1).
+    """
+    locked = await session.get(ExtractionBatchItem, item.id, with_for_update=True)
+    if locked is None or locked.status is not ExtractionBatchItemStatus.SUBMITTED:
+        return
+    item = locked
+
+    # Idempotency: a run for this window already exists (e.g. a 19.2 reconcile
+    # re-submit of an already-accepted chunk) — converge the item terminal, no run.
+    existing = await session.scalar(
+        select(ExtractionRun.id)
+        .where(
+            ExtractionRun.document_id == item.document_id,
+            ExtractionRun.source_version == item.source_version,
+            ExtractionRun.input_hash == item.input_hash,
+        )
+        .limit(1)
+    )
+    if existing is not None:
+        item.status = _TERMINAL_ITEM_STATUS.get(
+            result.result_type, ExtractionBatchItemStatus.REJECTED
+        )
+        item.result_type = result.result_type
+        return
+
+    if result.result_type == "succeeded":
+        await _ingest_succeeded(session, item, result, settings=settings)
+        return
+    if result.result_type == "canceled" or (
+        result.result_type == "errored" and not result.retryable
+    ):
+        await _ingest_terminal_failure(session, item, result, settings=settings)
+        return
+    # errored(retryable) / expired → bounded re-submit, else REJECTED at the cap.
+    await _ingest_retryable_failure(session, item, result, settings=settings)
+
+
+async def _model_for(session: AsyncSession, item: ExtractionBatchItem, settings: Settings) -> str:
+    if item.batch_id is not None:
+        model = await session.scalar(
+            select(ExtractionBatch.model).where(ExtractionBatch.id == item.batch_id)
+        )
+        if model:
+            return model
+    return settings.anthropic_llm_model
+
+
+def _new_run(
+    item: ExtractionBatchItem,
+    *,
+    model: str,
+    status: ExtractionRunStatus,
+    output_json: dict[str, Any] | None,
+    error_message: str | None,
+) -> ExtractionRun:
+    return ExtractionRun(
+        document_id=item.document_id,
+        source_version=item.source_version,
+        provider="anthropic",
+        model=model,
+        prompt_version=item.prompt_version,
+        schema_version=item.schema_version,
+        input_source_span_ids=item.input_source_span_ids,
+        input_hash=item.input_hash,
+        status=status,
+        output_json=output_json,
+        error_message=error_message,
+        completed_at=datetime.now(tz=UTC),
+    )
+
+
+async def _ingest_succeeded(
+    session: AsyncSession,
+    item: ExtractionBatchItem,
+    result: BatchResult,
+    *,
+    settings: Settings,
+) -> None:
+    model = await _model_for(session, item, settings)
+    response = map_message_to_structured_output(
+        result.message, provider="anthropic", model=model
+    )
+    item.result_type = "succeeded"
+
+    if response.output_json is None:
+        run = _new_run(
+            item,
+            model=model,
+            status=ExtractionRunStatus.REJECTED,
+            output_json=None,
+            error_message=response.parse_error,
+        )
+        session.add(run)
+        item.status = ExtractionBatchItemStatus.REJECTED
+        item.error_message = response.parse_error
+        return
+
+    try:
+        parsed = RecipeExtractionOutput.model_validate(response.output_json)
+    except ValidationError as exc:
+        run = _new_run(
+            item,
+            model=model,
+            status=ExtractionRunStatus.REJECTED,
+            output_json=response.output_json,
+            error_message=str(exc),
+        )
+        session.add(run)
+        item.status = ExtractionBatchItemStatus.REJECTED
+        item.error_message = str(exc)
+        return
+
+    run = _new_run(
+        item,
+        model=model,
+        status=ExtractionRunStatus.SUCCESS,
+        output_json=response.output_json,
+        error_message=None,
+    )
+    session.add(run)
+    await session.flush()  # need run.id for the staging candidates
+
+    window = await _reconstruct_window(session, item)
+    for extracted in parsed.items:
+        try:
+            await persist_knowledge_item(
+                session,
+                extracted,
+                extraction_run_id=run.id,
+                document_id=item.document_id,
+                source_version=item.source_version,
+                window=window,
+                staging=True,
+                candidate_score=compute_candidate_score(
+                    extracted, window_span_ids=item.input_source_span_ids
+                ),
+            )
+        except HardValidationError as exc:
+            logger.info(
+                "dropping hard-invalid batch candidate for %s: %s",
+                item.document_id,
+                exc,
+            )
+    item.status = ExtractionBatchItemStatus.SUCCEEDED
+
+
+async def _ingest_terminal_failure(
+    session: AsyncSession,
+    item: ExtractionBatchItem,
+    result: BatchResult,
+    *,
+    settings: Settings,
+) -> None:
+    model = await _model_for(session, item, settings)
+    detail = result.error_type or result.result_type
+    error_message = f"batch result {result.result_type}: {detail}"
+    session.add(
+        _new_run(
+            item,
+            model=model,
+            status=ExtractionRunStatus.REJECTED,
+            output_json=None,
+            error_message=error_message,
+        )
+    )
+    item.status = (
+        ExtractionBatchItemStatus.CANCELED
+        if result.result_type == "canceled"
+        else ExtractionBatchItemStatus.REJECTED
+    )
+    item.result_type = result.result_type
+    item.error_message = error_message
+
+
+async def _ingest_retryable_failure(
+    session: AsyncSession,
+    item: ExtractionBatchItem,
+    result: BatchResult,
+    *,
+    settings: Settings,
+) -> None:
+    if item.submit_attempts < settings.anthropic_batch_max_submit_attempts:
+        # Revert for re-submission by 19.2's submitter. Bump the document heartbeat
+        # so the brief PENDING→re-claim window isn't reaped by 19.2's stale-PENDING
+        # sweep (DECISIONS #2; cross-phase self-review #1).
+        item.status = ExtractionBatchItemStatus.PENDING
+        item.batch_id = None
+        item.submit_attempts += 1
+        item.result_type = result.result_type
+        await session.execute(
+            update(Document)
+            .where(Document.id == item.document_id)
+            .values(last_progress_at=func.now())
+        )
+        return
+
+    # Cap hit — surface as a REJECTED audit run, never retry forever.
+    model = await _model_for(session, item, settings)
+    error_message = f"{result.result_type} after {item.submit_attempts} attempts"
+    session.add(
+        _new_run(
+            item,
+            model=model,
+            status=ExtractionRunStatus.REJECTED,
+            output_json=None,
+            error_message=error_message,
+        )
+    )
+    item.status = _TERMINAL_ITEM_STATUS.get(
+        result.result_type, ExtractionBatchItemStatus.REJECTED
+    )
+    item.result_type = result.result_type
+    item.error_message = error_message
+
+
+async def _reconstruct_window(
+    session: AsyncSession, item: ExtractionBatchItem
+) -> Window:
+    """Rebuild the extraction ``Window`` from the item's recorded span ids.
+
+    ``persist_knowledge_item`` / ``validate_hard`` need a real ``Window``; the
+    spans are immutable per ``(document, source_version)`` and the recorded order
+    in ``input_source_span_ids`` reproduces the original window exactly.
+    """
+    rows = (
+        await session.execute(
+            select(SourceSpan).where(SourceSpan.id.in_(item.input_source_span_ids))
+        )
+    ).scalars().all()
+    by_id = {span.id: span for span in rows}
+    ordered = tuple(
+        by_id[span_id] for span_id in item.input_source_span_ids if span_id in by_id
+    )
+    return Window(spans=ordered)
+
+
+# Local batch statuses still worth polling (have a provider_batch_id, not terminal).
+_POLLABLE_BATCH_STATUSES = (
+    ExtractionBatchStatus.SUBMITTED,
+    ExtractionBatchStatus.IN_PROGRESS,
+)
+
+
+async def poll_extraction_batches(ctx: dict[str, Any]) -> int:
+    """Poll in-flight batches; on ``ended``, ingest results + mark the batch done.
+
+    Each batch is processed in its own transaction under a ``FOR UPDATE SKIP
+    LOCKED`` row lock so overlapping poller runs never double-process one. A
+    provider error on a batch leaves it non-terminal for the next tick (never
+    crashes the whole run). Returns the number of results ingested.
+    """
+    settings: Settings = ctx["settings"]
+    session_factory: async_sessionmaker[Any] = ctx["session_factory"]
+
+    if settings.llm_provider != "anthropic":
+        logger.info(
+            "batch poller skipped: llm_provider=%s (no batch provider)",
+            settings.llm_provider,
+        )
+        return 0
+
+    provider = _build_batch_provider(settings)
+    async with session_factory() as session:
+        batch_ids = list(
+            (
+                await session.execute(
+                    select(ExtractionBatch.id).where(
+                        ExtractionBatch.processing_status.in_(_POLLABLE_BATCH_STATUSES),
+                        ExtractionBatch.provider_batch_id.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    ingested = 0
+    touched: set[tuple[str, int]] = set()
+    for batch_id in batch_ids:
+        count, batch_touched = await _poll_one_batch(
+            session_factory, provider, batch_id, settings
+        )
+        ingested += count
+        touched |= batch_touched
+
+    if touched:
+        await finalize_completed_documents(session_factory, ctx["redis"], touched)
+
+    logger.info("batch poller ingested %d result(s)", ingested)
+    return ingested
+
+
+async def _poll_one_batch(
+    session_factory: async_sessionmaker[Any],
+    provider: AnthropicBatchProvider,
+    batch_id: str,
+    settings: Settings,
+) -> tuple[int, set[tuple[str, int]]]:
+    async with session_factory() as session:
+        batch = (
+            await session.execute(
+                select(ExtractionBatch)
+                .where(ExtractionBatch.id == batch_id)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            batch is None
+            or batch.provider_batch_id is None
+            or batch.processing_status not in _POLLABLE_BATCH_STATUSES
+        ):
+            # Locked by another poller, or already terminal — skip.
+            return 0, set()
+
+        provider_batch_id = batch.provider_batch_id
+        try:
+            status = await provider.retrieve_batch(provider_batch_id)
+            if status.processing_status != "ended":
+                # Track the provider's progress locally; re-poll next tick.
+                if status.processing_status == "in_progress":
+                    batch.processing_status = ExtractionBatchStatus.IN_PROGRESS
+                await session.commit()
+                return 0, set()
+
+            ingested = 0
+            touched: set[tuple[str, int]] = set()
+            async for result in provider.iter_results(provider_batch_id):
+                item = (
+                    await session.execute(
+                        select(ExtractionBatchItem).where(
+                            ExtractionBatchItem.id == result.custom_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if item is None:
+                    continue
+                await ingest_batch_result(session, item, result, settings=settings)
+                touched.add((item.document_id, item.source_version))
+                ingested += 1
+
+            batch.processing_status = ExtractionBatchStatus.ENDED
+            batch.completed_at = datetime.now(tz=UTC)
+            await session.commit()
+            return ingested, touched
+        except Exception as exc:
+            # Type-agnostic per-batch isolation (review #3.1): ANY error processing
+            # this batch — a provider/transport error, a malformed result line, a
+            # transient DB error — must not escape and skip finalize for the other
+            # healthy batches already ingested this tick (the poll cron is
+            # max_tries=1, so an escape strands those docs → reaped FAILED). Roll
+            # this batch back (its ingest is idempotent), leave it non-terminal for
+            # the next tick, and let the caller continue. (CancelledError is a
+            # BaseException, so a real shutdown still propagates.)
+            await session.rollback()
+            logger.warning(
+                "poll: batch %s failed (%s); rolled back, will retry next tick",
+                batch_id,
+                exc,
+            )
+            return 0, set()
+
+
+# Non-terminal item statuses for completion detection: a document is ready to
+# finalize only when none of its items remain in one of these.
+_NON_TERMINAL_ITEM_STATUSES_FOR_COMPLETION = (
+    ExtractionBatchItemStatus.PENDING,
+    ExtractionBatchItemStatus.SUBMITTING,
+    ExtractionBatchItemStatus.SUBMITTED,
+)
+
+
+async def finalize_completed_documents(
+    session_factory: async_sessionmaker[Any],
+    redis: Any,
+    touched: set[tuple[str, int]],
+) -> int:
+    """Re-drive documents whose every window now has a terminal result.
+
+    Completion is **per-document, not per-batch** (19.2 splits a doc's windows
+    across batches; DECISIONS #4): a doc is finalized only when no
+    ``ExtractionBatchItem`` for ``(document, source_version)`` is still non-terminal.
+    Re-enqueues the normal **resume** path (``batch_mode`` stays ``False``) — the
+    existing ``_resume_or_fresh → "resume"`` skips done windows via ``done_hashes``
+    and ``_finalize_extraction`` promotes the committed staging candidates. Adds no
+    finalize logic; idempotent (a redundant resume no-ops). Returns docs re-driven.
+    """
+    finalized = 0
+    for document_id, source_version in touched:
+        async with session_factory() as session:
+            remaining = await session.scalar(
+                select(func.count())
+                .select_from(ExtractionBatchItem)
+                .where(
+                    ExtractionBatchItem.document_id == document_id,
+                    ExtractionBatchItem.source_version == source_version,
+                    ExtractionBatchItem.status.in_(
+                        _NON_TERMINAL_ITEM_STATUSES_FOR_COMPLETION
+                    ),
+                )
+            )
+        if remaining:
+            # Windows still in flight (e.g. split across batches) — wait for the
+            # last one before re-driving, or finalize would drop un-ingested windows.
+            continue
+        await enqueue_job(
+            redis,
+            "process_document",
+            document_id,
+            source_version=source_version,
+            session_id=document_id,
+        )
+        finalized += 1
+    return finalized

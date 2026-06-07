@@ -23,7 +23,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from rag_recipes.config import Settings, get_settings
-from rag_recipes.ingestion.batch import submit_extraction_batches
+from rag_recipes.ingestion.batch import (
+    poll_extraction_batches,
+    submit_extraction_batches,
+)
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
 from rag_recipes.ingestion.pipeline.chunking import persist_chunks_for_ready_items
 from rag_recipes.ingestion.pipeline.dedup import (
@@ -1060,6 +1063,16 @@ class WorkerSettings:
             submit_extraction_batches,
             minute=set(
                 range(0, 60, _SETTINGS.anthropic_batch_submit_interval_minutes)
+            ),
+            run_at_startup=False,
+            unique=True,
+            max_tries=1,
+            timeout=_SETTINGS.worker_job_timeout_seconds,
+        ),
+        cron(
+            poll_extraction_batches,
+            minute=set(
+                range(0, 60, _SETTINGS.anthropic_batch_poll_interval_minutes)
             ),
             run_at_startup=False,
             unique=True,

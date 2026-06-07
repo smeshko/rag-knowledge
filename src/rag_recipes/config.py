@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # crashed submit and reverts it to PENDING for dedup-safe re-submission
     # (DECISIONS #7; review #2.1).
     anthropic_batch_submitting_timeout_minutes: int = Field(default=60, ge=1)
+    # Batch poll/ingest (Epic 19.3). The poller cron interval, and the per-window
+    # cap on re-submitting expired/transient-errored windows (at the cap the window
+    # becomes a REJECTED audit run rather than retrying forever).
+    anthropic_batch_poll_interval_minutes: int = Field(default=5, ge=1)
+    anthropic_batch_max_submit_attempts: int = Field(default=2, ge=1)
 
     llm_model: str = "gpt-4.1"
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request

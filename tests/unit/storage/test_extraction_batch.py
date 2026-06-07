@@ -43,6 +43,18 @@ def test_item_columns_include_request_input_and_schema() -> None:
     assert isinstance(cols["input_source_span_ids"].type, JSONB)
 
 
+def test_item_has_retry_audit_columns() -> None:
+    cols = ExtractionBatchItem.__table__.columns
+    assert "submit_attempts" in cols
+    assert "result_type" in cols
+    assert "error_message" in cols
+    assert cols["submit_attempts"].nullable is False
+    assert cols["result_type"].nullable is True
+    assert cols["error_message"].nullable is True
+    # submit_attempts backfills to 0 (server_default) so 19.2 rows upgrade cleanly.
+    assert cols["submit_attempts"].server_default is not None
+
+
 def test_item_batch_id_is_nullable_fk() -> None:
     col = ExtractionBatchItem.__table__.columns["batch_id"]
     assert col.nullable is True

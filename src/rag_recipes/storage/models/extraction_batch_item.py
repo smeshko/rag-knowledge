@@ -95,6 +95,14 @@ class ExtractionBatchItem(Base):
         sa.ForeignKey("extraction_batches.id"),
         nullable=True,
     )
+    # Retry/audit (Epic 19.3). submit_attempts bounds the re-submission of
+    # expired/transient-errored windows; result_type/error_message record the
+    # provider outcome at ingestion.
+    submit_attempts: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default="0", default=0
+    )
+    result_type: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,
