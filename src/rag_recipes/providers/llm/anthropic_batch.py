@@ -59,6 +59,9 @@ _NON_RETRYABLE_ERROR_TYPES = frozenset(
         "permission_error",
         "not_found_error",
         "billing_error",
+        # An oversized window can't be fixed by re-submitting — don't burn the
+        # retry budget on it (review #1.2; defensive — not in the 0.107 union yet).
+        "request_too_large_error",
     }
 )
 
@@ -194,14 +197,25 @@ class AnthropicBatchProvider:
     async def iter_results(
         self, provider_batch_id: str
     ) -> AsyncIterator[BatchResult]:
-        """Stream a completed batch's per-window results, normalized to ``BatchResult``."""
+        """Stream a completed batch's per-window results, normalized to ``BatchResult``.
+
+        ``batches.results()`` returns a lazy decoder whose *iteration* does the
+        streaming HTTP read, so a connection drop mid-stream raises here, not at
+        the initial call. The seam is the normalization boundary, so wrap the
+        iteration too and re-raise as ``LLMTechnicalError`` — otherwise a raw
+        ``anthropic.APIError`` would escape the poller's per-batch handler and skip
+        finalize for healthy batches already ingested this tick (review #1.1).
+        """
         decoder = await self._call_with_retry(
             lambda: self._client.messages.batches.results(
                 provider_batch_id, timeout=self._request_timeout
             )
         )
-        async for entry in decoder:
-            yield _normalize_result(entry)
+        try:
+            async for entry in decoder:
+                yield _normalize_result(entry)
+        except anthropic.APIError as exc:
+            raise LLMTechnicalError(str(exc)) from exc
 
     def to_structured_output(
         self, result: BatchResult, *, model: str

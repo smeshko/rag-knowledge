@@ -390,3 +390,47 @@ async def test_retrieve_results_errors_wrapped() -> None:
     provider = _rr_provider(batches)
     with pytest.raises(LLMTechnicalError):
         await provider.retrieve_batch("msgbatch_1")
+
+
+class _RaisingDecoder:
+    """Decoder that yields one entry then raises mid-stream (connection drop)."""
+
+    def __init__(self, first: _FakeEntry, exc: Exception) -> None:
+        self._first = first
+        self._exc = exc
+
+    async def __aiter__(self) -> AsyncIterator[_FakeEntry]:
+        yield self._first
+        raise self._exc
+
+
+class _RaisingResultsBatches:
+    def __init__(self, decoder: _RaisingDecoder) -> None:
+        self._decoder = decoder
+
+    async def results(self, provider_batch_id: str, **kwargs: Any) -> _RaisingDecoder:
+        return self._decoder
+
+
+class _RaisingResultsClient:
+    def __init__(self, decoder: _RaisingDecoder) -> None:
+        self.batches = _RaisingResultsBatches(decoder)
+        self.messages = _FakeMessagesResource(self.batches)  # type: ignore[arg-type]
+
+
+async def test_iter_results_normalizes_mid_stream_error() -> None:
+    # A connection drop mid-stream (during decoder iteration, not the initial call)
+    # must surface as LLMTechnicalError so the poller's per-batch handler catches it
+    # (review #1.1).
+    first = _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message("{}")))
+    decoder = _RaisingDecoder(
+        first, anthropic.APIError("stream dropped", request=_REQUEST_OBJ, body=None)
+    )
+    provider = AnthropicBatchProvider(
+        api_key="sk-ant-test", client=_RaisingResultsClient(decoder)  # type: ignore[arg-type]
+    )
+    seen = []
+    with pytest.raises(LLMTechnicalError):
+        async for result in provider.iter_results("msgbatch_1"):
+            seen.append(result)
+    assert len(seen) == 1  # the first result streamed before the drop

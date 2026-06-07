@@ -149,6 +149,7 @@ async def _seed_submitted_batch(
     *,
     status: ExtractionBatchStatus = ExtractionBatchStatus.SUBMITTED,
     items: int = 2,
+    provider_batch_id: str = "msgbatch_live",
 ) -> tuple[str, list[str]]:
     async with session_factory() as session:
         repo = DocumentRepository(session)
@@ -175,7 +176,7 @@ async def _seed_submitted_batch(
         )
         batch = ExtractionBatch(
             provider="anthropic",
-            provider_batch_id="msgbatch_live",
+            provider_batch_id=provider_batch_id,
             model="claude-sonnet-4-6",
             processing_status=status,
             request_count=items,
@@ -329,3 +330,88 @@ async def test_concurrent_polls_do_not_double_ingest(
     )
     # Exactly one run per item — no double-ingest.
     assert await _runs_count(session_factory) == 3
+
+
+class _MixedPollProvider:
+    """Ended for both batches, but one batch's result stream raises mid-iteration."""
+
+    def __init__(self, ok_results: dict[str, list[BatchResult]], raising_id: str) -> None:
+        self._ok = ok_results
+        self._raising_id = raising_id
+
+    async def retrieve_batch(self, provider_batch_id: str) -> BatchStatus:
+        return BatchStatus(processing_status="ended")
+
+    async def iter_results(self, provider_batch_id: str) -> AsyncIterator[BatchResult]:
+        if provider_batch_id == self._raising_id:
+            # Simulate a normalized mid-stream provider failure (review #1.1).
+            from rag_recipes.providers.errors import LLMTechnicalError
+
+            raise LLMTechnicalError("stream dropped")
+        for result in self._ok.get(provider_batch_id, []):
+            yield result
+
+
+async def test_healthy_doc_finalized_when_another_batch_errors(
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Doc A's batch ends cleanly (→ complete → re-driven); Doc B's batch errors
+    # mid-stream. The error must NOT prevent Doc A from being finalized this tick,
+    # and Doc B's batch stays non-terminal for the next tick (review #1.1).
+    good_batch, good_items = await _seed_submitted_batch(
+        session_factory, items=2, provider_batch_id="mb_ok"
+    )
+    bad_batch, _ = await _seed_submitted_batch(
+        session_factory, items=2, provider_batch_id="mb_err"
+    )
+    async with session_factory() as session:
+        good_doc = await session.scalar(
+            select(ExtractionBatchItem.document_id).where(
+                ExtractionBatchItem.batch_id == good_batch
+            )
+        )
+        bad_doc = await session.scalar(
+            select(ExtractionBatchItem.document_id).where(
+                ExtractionBatchItem.batch_id == bad_batch
+            )
+        )
+    provider = _MixedPollProvider({"mb_ok": _succeeded_results(good_items)}, raising_id="mb_err")
+    monkeypatch.setattr(batch_module, "_build_batch_provider", lambda s: provider)
+    redis = AsyncMock()
+    ctx = {"settings": _settings(), "session_factory": session_factory, "redis": redis}
+
+    # Must not raise despite the mid-stream error on mb_err.
+    ingested = await poll_extraction_batches(ctx)
+
+    assert ingested == 2  # only Doc A's results
+    # Doc A is complete → re-driven exactly once; Doc B is not.
+    redis.enqueue_job.assert_awaited_once()
+    assert redis.enqueue_job.await_args.args[0] == "process_document"
+    assert redis.enqueue_job.await_args.args[1] == good_doc
+
+    async with session_factory() as session:
+        ok_batch = (
+            await session.execute(
+                select(ExtractionBatch).where(ExtractionBatch.provider_batch_id == "mb_ok")
+            )
+        ).scalar_one()
+        err_batch = (
+            await session.execute(
+                select(ExtractionBatch).where(ExtractionBatch.provider_batch_id == "mb_err")
+            )
+        ).scalar_one()
+        assert ok_batch.processing_status is ExtractionBatchStatus.ENDED
+        # The errored batch is left non-terminal (rolled back) for the next tick.
+        assert err_batch.processing_status in (
+            ExtractionBatchStatus.SUBMITTED,
+            ExtractionBatchStatus.IN_PROGRESS,
+        )
+        bad_items = (
+            await session.execute(
+                select(ExtractionBatchItem.status).where(
+                    ExtractionBatchItem.document_id == bad_doc
+                )
+            )
+        ).scalars().all()
+        assert all(s is ExtractionBatchItemStatus.SUBMITTED for s in bad_items)
