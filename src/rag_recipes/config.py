@@ -41,6 +41,18 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_llm_model: str = "claude-sonnet-4-6"
     anthropic_max_tokens: int = Field(default=8192, ge=1)
+    # Batch submission (Epic 19.2). The cron submitter chunks pending windows by
+    # BOTH a request count and an estimated serialized-bytes cap (request_input +
+    # repeated schema can blow past 256MB well under the count cap). max_requests
+    # default is lowered from Anthropic's 100k so the byte cap is usually the
+    # binding limit; max_bytes keeps a margin under the 256MB hard cap.
+    anthropic_batch_max_requests: int = Field(default=10000, ge=1, le=100000)
+    anthropic_batch_max_bytes: int = Field(default=200_000_000, ge=1, le=256_000_000)
+    anthropic_batch_submit_interval_minutes: int = Field(default=5, ge=1)
+    # How long a SUBMITTING batch may sit before reconciliation treats it as a
+    # crashed submit and reverts it to PENDING for dedup-safe re-submission
+    # (DECISIONS #7; review #2.1).
+    anthropic_batch_submitting_timeout_minutes: int = Field(default=60, ge=1)
 
     llm_model: str = "gpt-4.1"
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request

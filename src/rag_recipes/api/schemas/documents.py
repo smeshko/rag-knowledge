@@ -33,6 +33,23 @@ class UploadResponse(BaseModel):
     ingestion: UploadIngestion
 
 
+class BatchUploadItemResult(BaseModel):
+    """Per-file outcome in a batch cohort upload (Epic 19.2)."""
+
+    filename: str
+    status: str  # "created" | "duplicate" | "error"
+    document_id: str | None = None
+    error: str | None = None
+
+
+class BatchUploadResponse(BaseModel):
+    items: list[BatchUploadItemResult]
+    total: int
+    created: int
+    duplicates: int
+    errors: int
+
+
 class DocumentListItem(BaseModel):
     """The doc §3 list item — smaller than ``DocumentResponse`` (no
     ``asset_id``/``language``/timestamps)."""

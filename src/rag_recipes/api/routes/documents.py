@@ -36,6 +36,8 @@ from rag_recipes.api.dependencies import (
 )
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.documents import (
+    BatchUploadItemResult,
+    BatchUploadResponse,
     DocumentCounts,
     DocumentDetailResponse,
     DocumentListItem,
@@ -199,6 +201,59 @@ async def _handle_upload(
     storage: FileStorageProvider,
     arq_redis: ArqRedis,
 ) -> UploadResponse:
+    document, is_duplicate = await _create_document_from_upload(
+        file=file,
+        category=category,
+        subcategory=subcategory,
+        title=title,
+        author=author,
+        language=language,
+        session=session,
+        storage=storage,
+    )
+    # Fresh-insert path only — kick off synchronous ingestion. Duplicate / race
+    # recoveries must not re-enqueue (they returned an already-processing doc).
+    if not is_duplicate:
+        try:
+            await enqueue_job(
+                arq_redis, "process_document", document.id, session_id=document.id
+            )
+        except Exception:
+            # The document row is committed and queued; the 7.2 stuck-job cron
+            # will mark it failed if it never gets picked up. Surface the error
+            # in logs so an operator can manually re-enqueue. Do NOT fail the 201.
+            logger.exception(
+                "Failed to enqueue process_document for %s; stuck-job cron will catch it",
+                document.id,
+            )
+
+    return UploadResponse(
+        document=DocumentResponse.model_validate(document),
+        ingestion=UploadIngestion(status=document.status.value),
+    )
+
+
+async def _create_document_from_upload(
+    *,
+    file: UploadFile | None,
+    category: str,
+    subcategory: str | None,
+    title: str | None,
+    author: str | None,
+    language: str | None,
+    session: AsyncSession,
+    storage: FileStorageProvider,
+) -> tuple[Document, bool]:
+    """Validate + dedup + store + create a ``Document`` from an uploaded PDF.
+
+    Returns ``(document, is_duplicate)``: ``is_duplicate`` is ``True`` for a
+    content-hash hit or a duplicate-race winner (an already-existing document is
+    returned), ``False`` for a fresh insert (committed + refreshed). Raises the
+    documented ``ApiError`` envelopes on each failure class (module docstring).
+    **Enqueueing is the caller's job** — this helper never starts ingestion, so
+    the synchronous (``POST /documents``) and batch (``POST /documents/batch``)
+    endpoints can route the created document differently.
+    """
     if file is None:
         raise ApiError(
             status_code=400,
@@ -245,10 +300,7 @@ async def _handle_upload(
                 code=ErrorCode.INTERNAL_ERROR,
                 message="Existing SourceAsset has no Document; inconsistent state.",
             )
-        return UploadResponse(
-            document=DocumentResponse.model_validate(existing_document),
-            ingestion=UploadIngestion(status=existing_document.status.value),
-        )
+        return existing_document, True
 
     asset_id = new_id(SourceAsset.ID_PREFIX)
     key = f"source-assets/{asset_id}/original.pdf"
@@ -312,10 +364,7 @@ async def _handle_upload(
                 code=ErrorCode.INTERNAL_ERROR,
                 message="Duplicate race recovery failed: winning Document not found.",
             ) from None
-        return UploadResponse(
-            document=DocumentResponse.model_validate(winner_document),
-            ingestion=UploadIngestion(status=winner_document.status.value),
-        )
+        return winner_document, True
     except Exception as exc:
         await _best_effort_rollback(session)
         await _best_effort_delete(storage, key)
@@ -338,23 +387,104 @@ async def _handle_upload(
         ) from exc
 
     await session.refresh(document)
+    return document, False
 
-    # Fresh-insert path only — kick off ingestion. The duplicate-recovery
-    # paths above return before reaching here and must not re-enqueue.
-    try:
-        await enqueue_job(arq_redis, "process_document", document.id, session_id=document.id)
-    except Exception:
-        # The document row is committed and queued; the 7.2 stuck-job cron
-        # will mark it failed if it never gets picked up. Surface the error
-        # in logs so an operator can manually re-enqueue. Do NOT fail the 201.
-        logger.exception(
-            "Failed to enqueue process_document for %s; stuck-job cron will catch it",
-            document.id,
+
+def _anthropic_batch_enabled(settings: Settings) -> bool:
+    return settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key)
+
+
+@router.post("/documents/batch", status_code=201)
+async def upload_documents_batch(
+    files: Annotated[list[UploadFile], File()],
+    category: Annotated[str, Form()] = "recipes",
+    subcategory: Annotated[str | None, Form()] = None,
+    language: Annotated[str | None, Form()] = None,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    storage: FileStorageProvider = Depends(get_file_storage),  # noqa: B008
+    arq_redis: ArqRedis = Depends(get_arq_redis),  # noqa: B008
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> Any:
+    """Upload a cohort of PDFs and defer extraction into the Anthropic batch path.
+
+    Each file is created exactly as ``POST /documents`` does (shared helper), but
+    enqueued with ``batch_mode=True`` so ``process_document`` registers windows
+    instead of running synchronous extraction. Per-file failures (non-PDF, etc.)
+    yield an ``error`` item without aborting the cohort.
+
+    **Refuses creation unless the Anthropic batch path is enabled** (``llm_provider
+    == "anthropic"`` + a key): otherwise the created docs would register windows
+    that no submitter could ever drain, stranding them in ``EXTRACTING_ITEMS``
+    (DECISIONS #3; Codex round-1 #2).
+    """
+    if not _anthropic_batch_enabled(settings):
+        raise ApiError(
+            status_code=409,
+            code=ErrorCode.INVALID_REQUEST,
+            message=(
+                "Batch upload requires the Anthropic batch path "
+                "(LLM_PROVIDER=anthropic + ANTHROPIC_API_KEY)."
+            ),
         )
 
-    return UploadResponse(
-        document=DocumentResponse.model_validate(document),
-        ingestion=UploadIngestion(status=document.status.value),
+    results: list[BatchUploadItemResult] = []
+    for file in files:
+        filename = _safe_filename(file.filename)
+        try:
+            document, is_duplicate = await _create_document_from_upload(
+                file=file,
+                category=category,
+                subcategory=subcategory,
+                title=None,
+                author=None,
+                language=language,
+                session=session,
+                storage=storage,
+            )
+        except ApiError as exc:
+            # Per-file failure (non-PDF, storage/commit error) — record and keep
+            # processing the rest of the cohort.
+            results.append(
+                BatchUploadItemResult(
+                    filename=filename, status="error", error=exc.message
+                )
+            )
+            continue
+
+        if is_duplicate:
+            results.append(
+                BatchUploadItemResult(
+                    filename=filename, status="duplicate", document_id=document.id
+                )
+            )
+            continue
+
+        try:
+            await enqueue_job(
+                arq_redis,
+                "process_document",
+                document.id,
+                batch_mode=True,
+                session_id=document.id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to enqueue batch process_document for %s; stuck-job cron "
+                "will catch it",
+                document.id,
+            )
+        results.append(
+            BatchUploadItemResult(
+                filename=filename, status="created", document_id=document.id
+            )
+        )
+
+    return BatchUploadResponse(
+        items=results,
+        total=len(results),
+        created=sum(1 for r in results if r.status == "created"),
+        duplicates=sum(1 for r in results if r.status == "duplicate"),
+        errors=sum(1 for r in results if r.status == "error"),
     )
 
 

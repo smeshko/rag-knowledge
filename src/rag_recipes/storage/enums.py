@@ -37,6 +37,31 @@ class ExtractionRunStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class ExtractionBatchStatus(StrEnum):
+    # Local mirror of the Anthropic batch lifecycle (Epic 19.2). SUBMITTING is the
+    # durable-claim state committed *before* the provider call so a crash can never
+    # double-submit (DECISIONS #7); 19.3 advances IN_PROGRESS/ENDED on poll.
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    IN_PROGRESS = "in_progress"
+    ENDED = "ended"
+    FAILED = "failed"
+
+
+class ExtractionBatchItemStatus(StrEnum):
+    # Per-window registration lifecycle (Epic 19.2). 19.2 sets PENDING/SUBMITTING/
+    # SUBMITTED; the terminal values are declared now so 19.3 result ingestion needs
+    # no enum migration.
+    PENDING = "pending"
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    SUCCEEDED = "succeeded"
+    REJECTED = "rejected"
+    ERRORED = "errored"
+    EXPIRED = "expired"
+    CANCELED = "canceled"
+
+
 class KnowledgeItemStatus(StrEnum):
     READY = "ready"
     NEEDS_REVIEW = "needs_review"
