@@ -459,3 +459,64 @@ def test_rerank_provider_unsupported_allowed_when_disabled(
     monkeypatch.setenv("RERANK_PROVIDER", "cohere")
     settings = Settings(_env_file=None)
     assert settings.rerank_provider == "cohere"
+
+
+# --- llm_provider switch + Anthropic settings (Epic 19.1) -------------------
+
+
+def test_llm_provider_defaults_to_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unset config must be byte-for-byte today's behaviour: OpenAI by default,
+    # and the Anthropic fields carry their documented defaults.
+    _required_env(monkeypatch)
+    for var in (
+        "LLM_PROVIDER",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_LLM_MODEL",
+        "ANTHROPIC_MAX_TOKENS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.llm_provider == "openai"
+    assert settings.anthropic_api_key is None
+    assert settings.anthropic_llm_model == "claude-sonnet-4-6"
+    assert settings.anthropic_max_tokens == 8192
+
+
+def test_llm_provider_anthropic_without_key_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cross-field rule: selecting Anthropic without a key fails at load with a
+    # message naming the missing field, not at the first runtime call.
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(ValidationError, match="anthropic_api_key"):
+        Settings(_env_file=None)
+
+
+def test_llm_provider_anthropic_with_key_constructs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("ANTHROPIC_LLM_MODEL", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.llm_provider == "anthropic"
+    assert settings.anthropic_api_key == "sk-ant-test"
+    assert settings.anthropic_llm_model == "claude-sonnet-4-6"
+
+
+def test_llm_provider_invalid_value_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    with pytest.raises(ValidationError, match="llm_provider"):
+        Settings(_env_file=None)
+
+
+def test_anthropic_max_tokens_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_MAX_TOKENS", "0")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "anthropic_max_tokens" in str(excinfo.value).lower()
