@@ -335,30 +335,45 @@ async def test_concurrent_polls_do_not_double_ingest(
 class _MixedPollProvider:
     """Ended for both batches, but one batch's result stream raises mid-iteration."""
 
-    def __init__(self, ok_results: dict[str, list[BatchResult]], raising_id: str) -> None:
+    def __init__(
+        self,
+        ok_results: dict[str, list[BatchResult]],
+        raising_id: str,
+        exc: Exception | None = None,
+    ) -> None:
         self._ok = ok_results
         self._raising_id = raising_id
+        from rag_recipes.providers.errors import LLMTechnicalError
+
+        self._exc = exc if exc is not None else LLMTechnicalError("stream dropped")
 
     async def retrieve_batch(self, provider_batch_id: str) -> BatchStatus:
         return BatchStatus(processing_status="ended")
 
     async def iter_results(self, provider_batch_id: str) -> AsyncIterator[BatchResult]:
         if provider_batch_id == self._raising_id:
-            # Simulate a normalized mid-stream provider failure (review #1.1).
-            from rag_recipes.providers.errors import LLMTechnicalError
-
-            raise LLMTechnicalError("stream dropped")
+            raise self._exc
         for result in self._ok.get(provider_batch_id, []):
             yield result
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        None,  # default: LLMTechnicalError (normalized provider error)
+        AttributeError("'NoneType' object has no attribute 'type'"),  # malformed result
+        RuntimeError("transient DB error"),  # any non-LLMTechnicalError
+    ],
+)
 async def test_healthy_doc_finalized_when_another_batch_errors(
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
+    exc: Exception | None,
 ) -> None:
-    # Doc A's batch ends cleanly (→ complete → re-driven); Doc B's batch errors
-    # mid-stream. The error must NOT prevent Doc A from being finalized this tick,
-    # and Doc B's batch stays non-terminal for the next tick (review #1.1).
+    # Doc A's batch ends cleanly (→ complete → re-driven); Doc B's batch raises
+    # mid-stream — for ANY error type. The error must NOT prevent Doc A from being
+    # finalized this tick, and Doc B's batch stays non-terminal for the next tick
+    # (review #1.1, #3.1 — type-agnostic per-batch isolation).
     good_batch, good_items = await _seed_submitted_batch(
         session_factory, items=2, provider_batch_id="mb_ok"
     )
@@ -376,7 +391,9 @@ async def test_healthy_doc_finalized_when_another_batch_errors(
                 ExtractionBatchItem.batch_id == bad_batch
             )
         )
-    provider = _MixedPollProvider({"mb_ok": _succeeded_results(good_items)}, raising_id="mb_err")
+    provider = _MixedPollProvider(
+        {"mb_ok": _succeeded_results(good_items)}, raising_id="mb_err", exc=exc
+    )
     monkeypatch.setattr(batch_module, "_build_batch_provider", lambda s: provider)
     redis = AsyncMock()
     ctx = {"settings": _settings(), "session_factory": session_factory, "redis": redis}

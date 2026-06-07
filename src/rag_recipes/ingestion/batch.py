@@ -665,11 +665,21 @@ async def _poll_one_batch(
             batch.completed_at = datetime.now(tz=UTC)
             await session.commit()
             return ingested, touched
-        except LLMTechnicalError as exc:
-            # Transient provider failure — leave the batch non-terminal for the
-            # next tick; nothing is half-ingested (ingest is idempotent per item).
+        except Exception as exc:
+            # Type-agnostic per-batch isolation (review #3.1): ANY error processing
+            # this batch — a provider/transport error, a malformed result line, a
+            # transient DB error — must not escape and skip finalize for the other
+            # healthy batches already ingested this tick (the poll cron is
+            # max_tries=1, so an escape strands those docs → reaped FAILED). Roll
+            # this batch back (its ingest is idempotent), leave it non-terminal for
+            # the next tick, and let the caller continue. (CancelledError is a
+            # BaseException, so a real shutdown still propagates.)
             await session.rollback()
-            logger.warning("poll: batch %s provider error (%s); will retry", batch_id, exc)
+            logger.warning(
+                "poll: batch %s failed (%s); rolled back, will retry next tick",
+                batch_id,
+                exc,
+            )
             return 0, set()
 
 
