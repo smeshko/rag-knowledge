@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from rag_recipes.config import Settings, get_settings
+from rag_recipes.ingestion.batch import submit_extraction_batches
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
 from rag_recipes.ingestion.pipeline.chunking import persist_chunks_for_ready_items
 from rag_recipes.ingestion.pipeline.dedup import (
@@ -72,7 +73,6 @@ from rag_recipes.providers.errors import (
 )
 from rag_recipes.providers.file_storage.local import LocalFileStorage
 from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider, _sanitize_schema
-from rag_recipes.providers.llm.anthropic_batch import AnthropicBatchProvider
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
@@ -185,24 +185,6 @@ def _build_llm_provider(
         settings.openai_api_key,
         default_model=settings.llm_model,
         observability=observability,
-        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-        request_timeout=settings.llm_request_timeout_seconds,
-    )
-
-
-def _build_batch_provider(settings: Settings) -> AnthropicBatchProvider:
-    """Construct the Anthropic batch provider for the cron submitter (Epic 19.2).
-
-    Only the Anthropic batch path exists — there is no OpenAI batch provider — so
-    this is constructed unconditionally from ``anthropic_api_key`` (the submitter
-    guards on ``settings.llm_provider == "anthropic"`` before calling it). The
-    ``None`` narrow mirrors ``_build_llm_provider``'s defense-in-depth.
-    """
-    api_key = settings.anthropic_api_key
-    if api_key is None:
-        raise ValueError("anthropic_api_key is required for batch submission")
-    return AnthropicBatchProvider(
-        api_key,
         max_rate_limit_retries=settings.llm_max_rate_limit_retries,
         request_timeout=settings.llm_request_timeout_seconds,
     )
@@ -1073,6 +1055,16 @@ class WorkerSettings:
             unique=True,
             max_tries=1,
             timeout=_SETTINGS.stuck_job_timeout_minutes * 60,
+        ),
+        cron(
+            submit_extraction_batches,
+            minute=set(
+                range(0, 60, _SETTINGS.anthropic_batch_submit_interval_minutes)
+            ),
+            run_at_startup=False,
+            unique=True,
+            max_tries=1,
+            timeout=_SETTINGS.worker_job_timeout_seconds,
         ),
     ]
     redis_settings = _build_redis_settings(_SETTINGS)
