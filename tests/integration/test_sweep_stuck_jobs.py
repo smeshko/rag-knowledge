@@ -11,9 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_recipes.config import get_settings
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
 from rag_recipes.ingestion.status import transition_to
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionBatchItemStatus,
+    SourceType,
+    UploadStatus,
+)
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
 from rag_recipes.storage.repositories.failures import FailuresRepository
@@ -138,6 +144,29 @@ async def _make_document(
         for next_status in path:
             await transition_to(session, document.id, next_status)
     return document.id
+
+
+async def _add_batch_item(
+    session: AsyncSession,
+    document_id: str,
+    *,
+    status: ExtractionBatchItemStatus,
+    input_hash: str,
+) -> None:
+    session.add(
+        ExtractionBatchItem(
+            document_id=document_id,
+            source_version=1,
+            input_hash=input_hash,
+            input_source_span_ids=["span_a"],
+            request_input="window",
+            request_schema={"type": "object"},
+            prompt_version="recipe-extraction-v1",
+            schema_version="recipe.v1",
+            status=status,
+        )
+    )
+    await session.flush()
 
 
 async def test_sweep_marks_stuck_document_failed_and_records_reason(
@@ -490,3 +519,109 @@ async def test_sweep_continues_after_per_doc_error(
     statuses = {a_status, b_status}
     assert DocumentStatus.FAILED in statuses
     assert DocumentStatus.EXTRACTING_TEXT in statuses
+
+
+# --- batch-aware exemption (Epic 19.2) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "item_status",
+    [ExtractionBatchItemStatus.SUBMITTING, ExtractionBatchItemStatus.SUBMITTED],
+)
+async def test_sweep_exempts_in_flight_batch_document(
+    db_session: AsyncSession,
+    item_status: ExtractionBatchItemStatus,
+) -> None:
+    # An EXTRACTING_ITEMS doc with an in-flight (SUBMITTING/SUBMITTED) batch item
+    # may legitimately wait up to 24h — a stale heartbeat must NOT reap it.
+    document_id = await _make_document(
+        db_session,
+        content_hash=f"sweep-batch-inflight-{item_status.value}",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+    await _set_last_progress_at(db_session, document_id, minutes_ago=120)
+    await _add_batch_item(
+        db_session, document_id, status=item_status, input_hash="inflight-1"
+    )
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 0
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.EXTRACTING_ITEMS
+    failures = await FailuresRepository(db_session).list_failures(document_id)
+    assert failures == []
+
+
+async def test_sweep_reaps_stale_pending_only_batch_document(
+    db_session: AsyncSession,
+) -> None:
+    # Only PENDING items means the submitter never claimed them (disabled/broken).
+    # Such a doc must be surfaced (reaped), never hidden forever (DECISIONS #3).
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-batch-pending-only",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+    await _set_last_progress_at(db_session, document_id, minutes_ago=120)
+    await _add_batch_item(
+        db_session,
+        document_id,
+        status=ExtractionBatchItemStatus.PENDING,
+        input_hash="pending-1",
+    )
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 1
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.FAILED
+
+
+async def test_sweep_reaps_terminal_only_batch_document(
+    db_session: AsyncSession,
+) -> None:
+    # All-terminal items (e.g. after 19.3 ingestion) no longer exempt the doc — it
+    # should make progress on its own; if wedged + stale it is genuinely stuck.
+    document_id = await _make_document(
+        db_session,
+        content_hash="sweep-batch-terminal-only",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await _backdate_updated_at(db_session, document_id, minutes_ago=120)
+    await _set_last_progress_at(db_session, document_id, minutes_ago=120)
+    await _add_batch_item(
+        db_session,
+        document_id,
+        status=ExtractionBatchItemStatus.SUCCEEDED,
+        input_hash="succeeded-1",
+    )
+
+    ctx: dict[str, Any] = {
+        "settings": get_settings(),
+        "session_factory": _make_session_factory(db_session),
+    }
+    count = await sweep_stuck_jobs(ctx)
+
+    assert count == 1
+    db_session.expire_all()
+    status = await db_session.scalar(
+        select(Document.status).where(Document.id == document_id)
+    )
+    assert status == DocumentStatus.FAILED

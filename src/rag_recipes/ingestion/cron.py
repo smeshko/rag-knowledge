@@ -24,10 +24,21 @@ from rag_recipes.ingestion.status import (
     InvalidTransitionError,
     mark_failed,
 )
-from rag_recipes.storage.enums import DocumentStatus
+from rag_recipes.storage.enums import DocumentStatus, ExtractionBatchItemStatus
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
 
 logger = logging.getLogger(__name__)
+
+# A document in EXTRACTING_ITEMS with an *in-flight* batch item may legitimately
+# sit far past the sweep threshold (Anthropic batches run up to 24h), so it is
+# exempt. Crucially this is NOT extended to PENDING: a doc whose only items are
+# PENDING means the submitter never claimed them (disabled/broken), so it must be
+# surfaced (reaped), never hidden forever (Epic 19.2 DECISIONS #3).
+_IN_FLIGHT_BATCH_ITEM_STATUSES = (
+    ExtractionBatchItemStatus.SUBMITTING,
+    ExtractionBatchItemStatus.SUBMITTED,
+)
 
 
 # The sweep treats every non-terminal status as "stuck", so a status that a
@@ -105,6 +116,25 @@ async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
                         or last_progress >= threshold
                     ):
                         continue
+                    # Batch-aware exemption (Epic 19.2): an EXTRACTING_ITEMS doc
+                    # with an in-flight (SUBMITTING/SUBMITTED) batch item may
+                    # legitimately wait up to 24h for results — don't reap it. A
+                    # stale-PENDING-only doc (submitter never claimed) and a
+                    # synchronous EXTRACTING_ITEMS doc with no items both fall
+                    # through and are reaped (DECISIONS #3).
+                    if doc.status is DocumentStatus.EXTRACTING_ITEMS:
+                        in_flight = await session.execute(
+                            select(ExtractionBatchItem.id)
+                            .where(
+                                ExtractionBatchItem.document_id == doc_id,
+                                ExtractionBatchItem.status.in_(
+                                    _IN_FLIGHT_BATCH_ITEM_STATUSES
+                                ),
+                            )
+                            .limit(1)
+                        )
+                        if in_flight.first() is not None:
+                            continue
                     await mark_failed(
                         session,
                         doc_id,
