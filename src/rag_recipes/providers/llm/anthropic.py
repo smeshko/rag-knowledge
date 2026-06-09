@@ -4,8 +4,8 @@ A synchronous Claude provider behind the same ``LLMProvider`` seam as
 ``OpenAILLMProvider`` (DECISIONS #1–#4). Structured output is requested via
 **non-strict forced tool-use** — a single tool whose ``input_schema`` is the
 (sanitized) schema, forced with ``tool_choice={"type": "tool", …}`` — rather than
-the strict ``output_config`` json_schema path, which compiles a constrained
-decoding grammar that 400s on the real ``recipe.v1`` schema ("compiled grammar is
+the strict json-schema output path (the prior mechanism), which compiles a
+constrained decoding grammar that 400s on the real ``recipe.v1`` schema ("compiled grammar is
 too large"). The provider stays schema-agnostic (it receives a dict, not a
 Pydantic model) and returns the identical ``output_json`` / ``parse_error`` /
 ``raw_text`` contract as the OpenAI path. Technical failures raise ``LLMTechnicalError``;
@@ -110,7 +110,7 @@ def _tool_request_fields(schema: dict[str, Any]) -> _ToolRequestFields:
     the synchronous provider and the batch provider so both send identical params.
     Offers one tool whose ``input_schema`` is the sanitized schema and forces it via
     ``tool_choice``. The tool is **non-strict** (no ``strict=True``): a strict
-    ``input_schema`` — like the old ``output_config`` json_schema path — compiles a
+    ``input_schema`` — like the prior strict json-schema output path — compiles a
     constrained-decoding grammar with a size ceiling the real ``recipe.v1`` schema
     exceeds (400 "compiled grammar is too large"). A non-strict ``input_schema`` is
     advisory (no grammar compile, no ceiling); downstream Pydantic + hard/soft
