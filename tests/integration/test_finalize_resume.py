@@ -11,7 +11,6 @@ reimplementation. Completion is per-document (windows may span batches).
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock
@@ -63,9 +62,10 @@ _TEST_CATEGORY = "batch-finalize-test"
 
 
 @dataclass
-class _Block:
-    text: str
-    type: str = "text"
+class _ToolUseBlock:
+    input: Any
+    name: str = "structured_output"
+    type: str = "tool_use"
 
 
 @dataclass
@@ -76,9 +76,9 @@ class _Usage:
 
 @dataclass
 class _Message:
-    content: list[_Block]
+    content: list[Any]
     usage: _Usage = field(default_factory=_Usage)
-    stop_reason: str = "end_turn"
+    stop_reason: str = "tool_use"
     stop_details: Any = None
 
 
@@ -154,13 +154,13 @@ def _ctx(session_factory: async_sessionmaker[AsyncSession]) -> dict[str, Any]:
     return {"settings": _settings(), "session_factory": session_factory, "redis": AsyncMock()}
 
 
-def _recipe_payload(span_ids: list[str]) -> str:
+def _recipe_payload(span_ids: list[str]) -> dict[str, Any]:
     span = span_ids[0]
     recipe = _make_recipe(
         source_span_ids=[span],
         structured_data=_make_structured_data(steps=[_make_step(source_span_ids=[span])]),
     )
-    return json.dumps(RecipeExtractionOutput(items=[recipe]).model_dump(by_alias=True, mode="json"))
+    return RecipeExtractionOutput(items=[recipe]).model_dump(by_alias=True, mode="json")
 
 
 async def _make_doc_and_spans(session: AsyncSession, *, pages: int) -> tuple[str, list[SourceSpan]]:
@@ -277,7 +277,7 @@ async def test_happy_path_end_to_end_reaches_ready(
             BatchResult(
                 custom_id=item.id,
                 result_type="succeeded",
-                message=_Message(content=[_Block(_recipe_payload(item.input_source_span_ids))]),
+                message=_Message(content=[_ToolUseBlock(_recipe_payload(item.input_source_span_ids))]),
             )
             for item in items
         ]
@@ -356,14 +356,14 @@ async def test_completion_detection_split_across_batches(
             BatchResult(
                 custom_id=items[0].id,
                 result_type="succeeded",
-                message=_Message(content=[_Block(_recipe_payload(items[0].input_source_span_ids))]),
+                message=_Message(content=[_ToolUseBlock(_recipe_payload(items[0].input_source_span_ids))]),
             )
         ]
         results_b = [
             BatchResult(
                 custom_id=it.id,
                 result_type="succeeded",
-                message=_Message(content=[_Block(_recipe_payload(it.input_source_span_ids))]),
+                message=_Message(content=[_ToolUseBlock(_recipe_payload(it.input_source_span_ids))]),
             )
             for it in items[1:]
         ]
@@ -434,7 +434,7 @@ async def test_partial_batch_failure_healthy_ready_failed_needs_review(
             BatchResult(
                 custom_id=it.id,
                 result_type="succeeded",
-                message=_Message(content=[_Block(_recipe_payload(it.input_source_span_ids))]),
+                message=_Message(content=[_ToolUseBlock(_recipe_payload(it.input_source_span_ids))]),
             )
             for it in good_items
         ] + [
@@ -486,7 +486,7 @@ async def test_idempotent_replay_after_ready(
             BatchResult(
                 custom_id=it.id,
                 result_type="succeeded",
-                message=_Message(content=[_Block(_recipe_payload(it.input_source_span_ids))]),
+                message=_Message(content=[_ToolUseBlock(_recipe_payload(it.input_source_span_ids))]),
             )
             for it in items
         ]

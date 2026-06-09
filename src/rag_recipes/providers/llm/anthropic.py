@@ -152,18 +152,29 @@ def _retry_after_seconds(exc: anthropic.APIStatusError) -> float | None:
     return seconds if seconds >= 0 else None
 
 
-def _extract_text(content: Iterable[Any]) -> str:
-    """Return the text of the first ``text`` content block, or ``""`` if none.
+def _extract_tool_use(content: Iterable[Any]) -> tuple[dict[str, Any] | None, str]:
+    """Return ``(tool_use input, raw_text)`` for a forced-tool response.
 
-    Read by attribute (``.type`` / ``.text``) rather than ``isinstance`` so the
-    raw-schema ``output_config`` guarantee (first block is text holding valid
-    JSON) is honoured for both the real ``TextBlock`` and the unit-test stub.
+    The success path carries exactly one ``tool_use`` block whose ``.input`` is the
+    already-parsed structured object; ``raw_text`` is its ``json.dumps`` — the
+    faithful analogue of the old text payload, retained for debugging (DECISIONS —
+    supporting decisions). When no ``tool_use`` block is present (a refusal or a
+    degenerate response), returns ``(None, <first text block's text or "">)`` so the
+    model's explanation, if any, survives as ``raw_text``. Read by attribute
+    (``.type`` / ``.input`` / ``.text``) so both the real SDK blocks and the
+    unit-test stubs are handled.
     """
+    text_fallback = ""
     for block in content:
-        if getattr(block, "type", None) == "text":
-            text = block.text
-            return text if isinstance(text, str) else ""
-    return ""
+        block_type = getattr(block, "type", None)
+        if block_type == "tool_use":
+            tool_input = block.input
+            return tool_input, json.dumps(tool_input)
+        if block_type == "text" and not text_fallback:
+            text = getattr(block, "text", "")
+            if isinstance(text, str):
+                text_fallback = text
+    return None, text_fallback
 
 
 def _sanitize_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -323,18 +334,19 @@ def map_message_to_structured_output(
     """Map an Anthropic ``Message`` to a ``StructuredOutputResponse``.
 
     The single source of truth for Anthropic Messages-response parse semantics
-    (refusal / truncation / unparseable / non-object → ``parse_error``; clean →
-    ``output_json``), shared by the synchronous provider and 19.3's batch result
-    ingestion so both paths produce byte-identical runs.
+    (refusal / truncation / missing tool_use / non-object → ``parse_error``; clean →
+    ``output_json`` read from the ``tool_use`` block's ``.input``), shared by the
+    synchronous provider and 19.3's batch result ingestion so both paths produce
+    byte-identical runs.
     """
-    raw_text = _extract_text(message.content)
+    tool_input, raw_text = _extract_tool_use(message.content)
     usage = message.usage
     token_usage = TokenUsage(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
     )
-    parse_error = _parse_error(message.stop_reason, message.stop_details, raw_text)
-    output_json = None if parse_error else json.loads(raw_text)
+    parse_error = _parse_error(message.stop_reason, message.stop_details, tool_input)
+    output_json = None if parse_error else tool_input
     return StructuredOutputResponse(
         output_json=output_json,
         parse_error=parse_error,
@@ -348,7 +360,7 @@ def map_message_to_structured_output(
 def _parse_error(
     stop_reason: str | None,
     stop_details: RefusalStopDetails | None,
-    raw_text: str,
+    tool_input: dict[str, Any] | None,
 ) -> str | None:
     if stop_reason == "refusal":
         explanation = stop_details.explanation if stop_details is not None else None
@@ -356,11 +368,11 @@ def _parse_error(
             return f"model refused to generate output: {explanation}"
         return "model refused to generate output"
     if stop_reason == "max_tokens":
+        # A truncated forced tool-call yields a partial/empty .input — treat it as a
+        # rejection, never a silent partial parse (DECISIONS — risks).
         return "output truncated by provider (stop_reason=max_tokens)"
-    try:
-        parsed = json.loads(raw_text)
-    except ValueError:
-        return "model output is not valid JSON"
-    if not isinstance(parsed, dict):
+    if tool_input is None:
+        return "model did not return structured output (no tool_use block)"
+    if not isinstance(tool_input, dict):
         return "model output is not a JSON object"
     return None

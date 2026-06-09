@@ -691,6 +691,13 @@ _ANTHROPIC_REQUEST_OBJ = httpx.Request("POST", "https://api.anthropic.com/v1/mes
 
 
 @dataclass
+class _FakeToolUseBlock:
+    input: Any
+    name: str = _OUTPUT_TOOL_NAME
+    type: str = "tool_use"
+
+
+@dataclass
 class _FakeTextBlock:
     text: str
     type: str = "text"
@@ -710,21 +717,32 @@ class _FakeStopDetails:
 
 @dataclass
 class _FakeAnthropicMessage:
-    content: list[_FakeTextBlock]
+    content: list[Any]
     usage: _FakeAnthropicUsage = field(default_factory=_FakeAnthropicUsage)
-    stop_reason: str = "end_turn"
+    stop_reason: str = "tool_use"
     stop_details: _FakeStopDetails | None = None
 
 
 def _anthropic_message(
     *,
-    text: str = "{}",
-    stop_reason: str = "end_turn",
+    tool_input: Any = None,
+    text: str | None = None,
+    stop_reason: str = "tool_use",
     stop_details: _FakeStopDetails | None = None,
     usage: _FakeAnthropicUsage | None = None,
 ) -> _FakeAnthropicMessage:
+    """Build a fake Anthropic message.
+
+    ``tool_input`` (the success path) adds a ``tool_use`` block carrying it as
+    ``.input``; ``text`` adds a ``text`` block (the refusal / no-tool_use fallback).
+    """
+    content: list[Any] = []
+    if tool_input is not None:
+        content.append(_FakeToolUseBlock(input=tool_input))
+    if text is not None:
+        content.append(_FakeTextBlock(text=text))
     return _FakeAnthropicMessage(
-        content=[_FakeTextBlock(text=text)],
+        content=content,
         usage=usage or _FakeAnthropicUsage(),
         stop_reason=stop_reason,
         stop_details=stop_details,
@@ -784,7 +802,7 @@ def _anthropic_provider_with(response: _FakeAnthropicMessage) -> AnthropicLLMPro
 class TestAnthropicLLM(LLMContract):
     @pytest.fixture
     def provider(self) -> AnthropicLLMProvider:
-        return _anthropic_provider_with(_anthropic_message(text='{"ok": true}'))
+        return _anthropic_provider_with(_anthropic_message(tool_input={"ok": True}))
 
     @pytest.fixture
     def sample_request(self) -> StructuredOutputRequest:
@@ -813,7 +831,7 @@ def test_anthropic_default_client_disables_sdk_retries() -> None:
 
 async def test_anthropic_clean_parse_sets_output_json() -> None:
     provider = _anthropic_provider_with(
-        _anthropic_message(text='{"ok": true}', usage=_FakeAnthropicUsage(13, 5))
+        _anthropic_message(tool_input={"ok": True}, usage=_FakeAnthropicUsage(13, 5))
     )
     response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
 
@@ -827,7 +845,7 @@ async def test_anthropic_clean_parse_sets_output_json() -> None:
 
 
 async def test_anthropic_request_sends_non_strict_forced_tool_use() -> None:
-    client = _FakeAnthropicClient(response=_anthropic_message(text='{"ok": true}'))
+    client = _FakeAnthropicClient(response=_anthropic_message(tool_input={"ok": True}))
     provider = AnthropicLLMProvider(
         api_key="sk-ant-test",
         default_model="claude-sonnet-4-6",
@@ -886,17 +904,35 @@ async def test_anthropic_truncation_returns_parse_error() -> None:
     assert response.raw_text == '{"ok": tr'
 
 
-@pytest.mark.parametrize("text", ["not json at all", "[1, 2, 3]"])
-async def test_anthropic_parse_failures_do_not_raise(text: str) -> None:
-    client = _FakeAnthropicClient(response=_anthropic_message(text=text))
+async def test_anthropic_missing_tool_use_block_rejected() -> None:
+    # The model answered in prose instead of calling the forced tool — a rejection,
+    # not a crash. The text survives as raw_text (the model's explanation).
+    client = _FakeAnthropicClient(
+        response=_anthropic_message(text="I can't do that", stop_reason="end_turn")
+    )
     provider = AnthropicLLMProvider(
         api_key="sk-ant-test", default_model="claude-sonnet-4-6", client=client
     )
     response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
 
     assert response.output_json is None
-    assert response.parse_error
-    assert response.raw_text == text
+    assert response.parse_error and "tool_use" in response.parse_error
+    assert response.raw_text == "I can't do that"
+    assert len(client.messages.calls) == 1
+
+
+async def test_anthropic_non_object_tool_input_rejected() -> None:
+    # A tool_use block whose .input is not a JSON object is rejected; raw_text is the
+    # serialized input for debugging.
+    client = _FakeAnthropicClient(response=_anthropic_message(tool_input=[1, 2, 3]))
+    provider = AnthropicLLMProvider(
+        api_key="sk-ant-test", default_model="claude-sonnet-4-6", client=client
+    )
+    response = await provider.generate_structured_output(_ANTHROPIC_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error and "JSON object" in response.parse_error
+    assert response.raw_text == json.dumps([1, 2, 3])
     assert len(client.messages.calls) == 1
 
 
@@ -967,7 +1003,7 @@ async def test_anthropic_rate_limit_retried_then_succeeds_honors_retry_after(
     _recorded_anthropic_sleep: list[float],
 ) -> None:
     client = _SequenceAnthropicClient(
-        [_anthropic_rate_limit_error(retry_after="2"), _anthropic_message(text='{"ok": true}')]
+        [_anthropic_rate_limit_error(retry_after="2"), _anthropic_message(tool_input={"ok": True})]
     )
     provider = AnthropicLLMProvider(
         api_key="sk-ant-test",
@@ -987,7 +1023,7 @@ async def test_anthropic_overloaded_retried_then_succeeds(
     _recorded_anthropic_sleep: list[float],
 ) -> None:
     client = _SequenceAnthropicClient(
-        [_anthropic_overloaded_error(), _anthropic_message(text='{"ok": true}')]
+        [_anthropic_overloaded_error(), _anthropic_message(tool_input={"ok": True})]
     )
     provider = AnthropicLLMProvider(
         api_key="sk-ant-test",
