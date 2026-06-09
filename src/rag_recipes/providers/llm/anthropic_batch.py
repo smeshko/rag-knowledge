@@ -3,8 +3,8 @@
 A thin seam over ``AsyncAnthropic().messages.batches`` that keeps all Anthropic
 batch request/response shapes out of the ingestion pipeline (DECISIONS #6). 19.2
 implements ``submit_batch`` only; ``retrieve``/``results`` and the poller are 19.3.
-Each request reuses the 19.1 schema sanitizer and the same ``output_config``
-json_schema structured-output path as the synchronous provider — batch requests
+Each request reuses the 19.1 request builder (``_tool_request_fields``) so batch
+and sync send the identical non-strict forced tool-use shape — batch requests
 support every Messages feature.
 
 Idempotency caveat: the installed ``anthropic`` SDK leaves ``_idempotency_header``
@@ -27,7 +27,7 @@ from typing import Any, TypeVar
 import anthropic
 import httpx
 from anthropic import AsyncAnthropic
-from anthropic.types import JSONOutputFormatParam, MessageParam, OutputConfigParam
+from anthropic.types import MessageParam
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages.batch_create_params import Request
 
@@ -36,7 +36,7 @@ from rag_recipes.providers.llm.anthropic import (
     _OVERLOADED_STATUS_CODE,
     _backoff_delay,
     _retry_after_seconds,
-    _sanitize_schema,
+    _tool_request_fields,
     map_message_to_structured_output,
 )
 from rag_recipes.providers.llm.types import StructuredOutputResponse
@@ -172,18 +172,16 @@ class AnthropicBatchProvider:
 
     @staticmethod
     def _build_request(request: BatchExtractionRequest) -> Request:
-        output_config: OutputConfigParam = {
-            "format": JSONOutputFormatParam(
-                type="json_schema",
-                schema=_sanitize_schema(request.json_schema),
-            )
-        }
         messages: list[MessageParam] = [{"role": "user", "content": request.input}]
+        # Index the shared builder rather than ``**``-unpack it: mypy rejects
+        # spreading a TypedDict into a TypedDict constructor (typeddict-item).
+        tool_fields = _tool_request_fields(request.json_schema)
         params = MessageCreateParamsNonStreaming(
             model=request.model,
             max_tokens=request.max_tokens,
             messages=messages,
-            output_config=output_config,
+            tools=tool_fields["tools"],
+            tool_choice=tool_fields["tool_choice"],
         )
         return Request(custom_id=request.custom_id, params=params)
 

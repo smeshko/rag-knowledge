@@ -52,9 +52,14 @@ def _enable_anthropic_settings() -> None:
 
 
 def _disable_batch_settings() -> None:
-    # Token set (auth passes) but llm_provider stays openai → batch path disabled.
+    # Token set (auth passes) but llm_provider forced to openai → batch path
+    # disabled. Force it explicitly rather than inheriting the ambient default, so a
+    # local .env with LLM_PROVIDER=anthropic doesn't leave the Anthropic batch path
+    # enabled (_anthropic_batch_enabled checks llm_provider == "anthropic").
     real = get_settings()
-    overridden = real.model_copy(update={"personal_api_token": TEST_API_TOKEN})
+    overridden = real.model_copy(
+        update={"personal_api_token": TEST_API_TOKEN, "llm_provider": "openai"}
+    )
     app.dependency_overrides[get_settings] = lambda: overridden
 
 

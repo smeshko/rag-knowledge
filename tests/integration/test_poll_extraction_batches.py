@@ -48,9 +48,10 @@ _TEST_CATEGORY = "batch-poller-test"
 
 
 @dataclass
-class _Block:
-    text: str
-    type: str = "text"
+class _ToolUseBlock:
+    input: Any
+    name: str = "structured_output"
+    type: str = "tool_use"
 
 
 @dataclass
@@ -61,14 +62,14 @@ class _Usage:
 
 @dataclass
 class _Message:
-    content: list[_Block]
+    content: list[Any]
     usage: _Usage = field(default_factory=_Usage)
-    stop_reason: str = "end_turn"
+    stop_reason: str = "tool_use"
     stop_details: Any = None
 
 
-def _msg(text: str) -> _Message:
-    return _Message(content=[_Block(text=text)])
+def _msg(tool_input: Any) -> _Message:
+    return _Message(content=[_ToolUseBlock(input=tool_input)])
 
 
 class _FakePollProvider:
@@ -207,7 +208,7 @@ async def _seed_submitted_batch(
 
 def _succeeded_results(item_ids: list[str]) -> list[BatchResult]:
     return [
-        BatchResult(custom_id=iid, result_type="succeeded", message=_msg('{"items": []}'))
+        BatchResult(custom_id=iid, result_type="succeeded", message=_msg({"items": []}))
         for iid in item_ids
     ]
 

@@ -9,8 +9,8 @@ a fake Anthropic ``Message`` so no network call happens.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -50,9 +50,10 @@ pytestmark = pytest.mark.asyncio
 
 
 @dataclass
-class _Block:
-    text: str
-    type: str = "text"
+class _ToolUseBlock:
+    input: Any
+    name: str = "structured_output"
+    type: str = "tool_use"
 
 
 @dataclass
@@ -68,22 +69,27 @@ class _StopDetails:
 
 @dataclass
 class _Message:
-    content: list[_Block]
+    content: list[Any]
     usage: _Usage = field(default_factory=_Usage)
-    stop_reason: str = "end_turn"
+    stop_reason: str = "tool_use"
     stop_details: _StopDetails | None = None
 
 
-def _msg(text: str, *, stop_reason: str = "end_turn", explanation: str | None = None) -> _Message:
+def _msg(
+    tool_input: Any = None, *, stop_reason: str = "tool_use", explanation: str | None = None
+) -> _Message:
+    """A succeeded forced-tool message carries ``tool_input`` (a dict) in a tool_use
+    block; a refusal (``tool_input=None``) carries no tool_use block."""
+    content = [] if tool_input is None else [_ToolUseBlock(input=tool_input)]
     return _Message(
-        content=[_Block(text=text)],
+        content=content,
         stop_reason=stop_reason,
         stop_details=_StopDetails(explanation=explanation) if explanation else None,
     )
 
 
-def _succeeded(text: str) -> BatchResult:
-    return BatchResult(custom_id="c", result_type="succeeded", message=_msg(text))
+def _succeeded(tool_input: Any) -> BatchResult:
+    return BatchResult(custom_id="c", result_type="succeeded", message=_msg(tool_input))
 
 
 # --- seeding ---------------------------------------------------------------
@@ -185,7 +191,7 @@ _SETTINGS = get_settings().model_copy(
 
 async def test_succeeded_empty_items_creates_success_run(db_session: AsyncSession) -> None:
     item, _ = await _seed(db_session)
-    await ingest_batch_result(db_session, item, _succeeded('{"items": []}'), settings=_SETTINGS)
+    await ingest_batch_result(db_session, item, _succeeded({"items": []}), settings=_SETTINGS)
 
     runs = await _runs(db_session, item.document_id)
     assert len(runs) == 1
@@ -207,9 +213,7 @@ async def test_succeeded_with_recipe_persists_staging_candidate(
         structured_data=_make_structured_data(steps=[_make_step(source_span_ids=[span_id])]),
     )
     payload = RecipeExtractionOutput(items=[recipe]).model_dump(by_alias=True, mode="json")
-    await ingest_batch_result(
-        db_session, item, _succeeded(json.dumps(payload)), settings=_SETTINGS
-    )
+    await ingest_batch_result(db_session, item, _succeeded(payload), settings=_SETTINGS)
 
     runs = await _runs(db_session, item.document_id)
     assert len(runs) == 1 and runs[0].status is ExtractionRunStatus.SUCCESS
@@ -234,7 +238,7 @@ async def test_succeeded_refusal_rejected(db_session: AsyncSession) -> None:
     result = BatchResult(
         custom_id="c",
         result_type="succeeded",
-        message=_msg("", stop_reason="refusal", explanation="nope"),
+        message=_msg(None, stop_reason="refusal", explanation="nope"),
     )
     await ingest_batch_result(db_session, item, result, settings=_SETTINGS)
 
@@ -249,7 +253,7 @@ async def test_succeeded_pydantic_invalid_rejected_with_output(
 ) -> None:
     item, _ = await _seed(db_session)
     await ingest_batch_result(
-        db_session, item, _succeeded('{"items": "not-a-list"}'), settings=_SETTINGS
+        db_session, item, _succeeded({"items": "not-a-list"}), settings=_SETTINGS
     )
     runs = await _runs(db_session, item.document_id)
     assert len(runs) == 1 and runs[0].status is ExtractionRunStatus.REJECTED
@@ -309,11 +313,11 @@ async def test_expired_at_cap_rejected(db_session: AsyncSession) -> None:
 
 async def test_idempotent_replay_creates_nothing(db_session: AsyncSession) -> None:
     item, _ = await _seed(db_session)
-    await ingest_batch_result(db_session, item, _succeeded('{"items": []}'), settings=_SETTINGS)
+    await ingest_batch_result(db_session, item, _succeeded({"items": []}), settings=_SETTINGS)
     runs_after_first = await _runs(db_session, item.document_id)
     assert len(runs_after_first) == 1
     # Item is now terminal; a second ingest must no-op (status guard).
-    await ingest_batch_result(db_session, item, _succeeded('{"items": []}'), settings=_SETTINGS)
+    await ingest_batch_result(db_session, item, _succeeded({"items": []}), settings=_SETTINGS)
     assert len(await _runs(db_session, item.document_id)) == 1
 
 
@@ -337,7 +341,7 @@ async def test_idempotent_duplicate_input_hash_run_exists(db_session: AsyncSessi
         )
     )
     await db_session.flush()
-    await ingest_batch_result(db_session, item, _succeeded('{"items": []}'), settings=_SETTINGS)
+    await ingest_batch_result(db_session, item, _succeeded({"items": []}), settings=_SETTINGS)
     # Still exactly one run; the duplicate item converges terminal.
     assert len(await _runs(db_session, item.document_id)) == 1
     assert item.status is ExtractionBatchItemStatus.SUCCEEDED

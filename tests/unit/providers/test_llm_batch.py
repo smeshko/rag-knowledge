@@ -13,6 +13,7 @@ import pytest
 from anthropic._exceptions import OverloadedError
 
 from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.llm.anthropic import _OUTPUT_TOOL_NAME
 from rag_recipes.providers.llm.anthropic_batch import (
     AnthropicBatchProvider,
     BatchExtractionRequest,
@@ -92,10 +93,14 @@ async def test_submit_batch_maps_requests_and_returns_result() -> None:
     assert params["model"] == "claude-sonnet-4-6"
     assert params["max_tokens"] == 8192
     assert params["messages"] == [{"role": "user", "content": "extract this"}]
-    fmt = params["output_config"]["format"]
-    assert fmt["type"] == "json_schema"
-    # _sanitize_schema is reused: unsupported keywords are stripped from the sent schema.
-    sent_props = fmt["schema"]["properties"]["n"]
+    # Batch sends the same non-strict forced tool-use shape as the sync path (no
+    # output_config), so neither path compiles the oversized strict grammar.
+    assert "output_config" not in params
+    tools = params["tools"]
+    assert len(tools) == 1 and tools[0]["name"] == _OUTPUT_TOOL_NAME
+    assert params["tool_choice"] == {"type": "tool", "name": _OUTPUT_TOOL_NAME}
+    # _sanitize_schema is reused: unsupported keywords are stripped from input_schema.
+    sent_props = tools[0]["input_schema"]["properties"]["n"]
     assert "minimum" not in sent_props and "maximum" not in sent_props
 
 
@@ -224,9 +229,10 @@ async def test_other_api_error_wrapped() -> None:
 
 
 @dataclass
-class _FakeTextBlock:
-    text: str
-    type: str = "text"
+class _FakeToolUseBlock:
+    input: Any
+    name: str = "structured_output"
+    type: str = "tool_use"
 
 
 @dataclass
@@ -242,17 +248,20 @@ class _FakeStopDetails:
 
 @dataclass
 class _FakeMessage:
-    content: list[_FakeTextBlock]
+    content: list[Any]
     usage: _FakeUsage = field(default_factory=_FakeUsage)
-    stop_reason: str = "end_turn"
+    stop_reason: str = "tool_use"
     stop_details: _FakeStopDetails | None = None
 
 
 def _message(
-    text: str, *, stop_reason: str = "end_turn", explanation: str | None = None
+    tool_input: Any = None, *, stop_reason: str = "tool_use", explanation: str | None = None
 ) -> _FakeMessage:
+    """A succeeded forced-tool message carries ``tool_input`` in a tool_use block;
+    a refusal (``tool_input=None``) carries no tool_use block."""
+    content = [] if tool_input is None else [_FakeToolUseBlock(input=tool_input)]
     return _FakeMessage(
-        content=[_FakeTextBlock(text=text)],
+        content=content,
         stop_reason=stop_reason,
         stop_details=_FakeStopDetails(explanation=explanation) if explanation else None,
     )
@@ -336,7 +345,7 @@ async def test_retrieve_batch_returns_processing_status() -> None:
 
 async def test_iter_results_normalizes_every_result_type() -> None:
     entries = [
-        _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message('{"items": []}'))),
+        _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message({"items": []}))),
         _FakeEntry(
             "ebitem_bad",
             _FakeResult(
@@ -367,7 +376,7 @@ async def test_iter_results_normalizes_every_result_type() -> None:
 async def test_to_structured_output_uses_shared_mapping() -> None:
     provider = _rr_provider(_RetrieveResultsBatches())
 
-    clean = BatchResult(custom_id="c", result_type="succeeded", message=_message('{"items": []}'))
+    clean = BatchResult(custom_id="c", result_type="succeeded", message=_message({"items": []}))
     resp = provider.to_structured_output(clean, model="claude-sonnet-4-6")
     assert resp.output_json == {"items": []}
     assert resp.parse_error is None
@@ -377,7 +386,7 @@ async def test_to_structured_output_uses_shared_mapping() -> None:
     refusal = BatchResult(
         custom_id="c",
         result_type="succeeded",
-        message=_message("", stop_reason="refusal", explanation="nope"),
+        message=_message(None, stop_reason="refusal", explanation="nope"),
     )
     rresp = provider.to_structured_output(refusal, model="claude-sonnet-4-6")
     assert rresp.output_json is None
@@ -448,7 +457,7 @@ async def test_iter_results_normalizes_mid_stream_error(exc: Exception) -> None:
     # A failure mid-stream (during decoder iteration, not the initial call) must
     # surface as LLMTechnicalError so the poller's per-batch handler catches it
     # (review #1.1, #2.1, #2.2).
-    first = _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message("{}")))
+    first = _FakeEntry("ebitem_ok", _FakeResult(type="succeeded", message=_message({})))
     decoder = _RaisingDecoder(first, exc)
     provider = AnthropicBatchProvider(
         api_key="sk-ant-test", client=_RaisingResultsClient(decoder)  # type: ignore[arg-type]

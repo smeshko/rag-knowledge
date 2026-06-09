@@ -1,11 +1,14 @@
 """AnthropicLLMProvider — structured generation via the Anthropic SDK (Epic 19.1).
 
 A synchronous Claude provider behind the same ``LLMProvider`` seam as
-``OpenAILLMProvider`` (DECISIONS #1–#4). Structured output is requested with the
-raw-schema ``output_config={"format": {"type": "json_schema", "schema": …}}``
-path — the provider stays schema-agnostic (it receives a dict, not a Pydantic
-model) and returns the identical ``output_json`` / ``parse_error`` / ``raw_text``
-contract as the OpenAI path. Technical failures raise ``LLMTechnicalError``;
+``OpenAILLMProvider`` (DECISIONS #1–#4). Structured output is requested via
+**non-strict forced tool-use** — a single tool whose ``input_schema`` is the
+(sanitized) schema, forced with ``tool_choice={"type": "tool", …}`` — rather than
+the strict json-schema output path (the prior mechanism), which compiles a
+constrained decoding grammar that 400s on the real ``recipe.v1`` schema ("compiled grammar is
+too large"). The provider stays schema-agnostic (it receives a dict, not a
+Pydantic model) and returns the identical ``output_json`` / ``parse_error`` /
+``raw_text`` contract as the OpenAI path. Technical failures raise ``LLMTechnicalError``;
 refused / truncated / unparseable output is returned with ``output_json=None``
 and a ``parse_error`` (never raised), always preserving ``raw_text``.
 
@@ -25,15 +28,15 @@ import copy
 import json
 import random
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, TypedDict
 
 import anthropic
 from anthropic import AsyncAnthropic
 from anthropic.types import (
-    JSONOutputFormatParam,
     MessageParam,
-    OutputConfigParam,
     RefusalStopDetails,
+    ToolChoiceToolParam,
+    ToolParam,
 )
 
 from rag_recipes.providers._observability import ProviderObservability, TraceContext
@@ -83,6 +86,46 @@ _UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
 # stripped. Sanitization descends into the values of these maps only.
 _SUBSCHEMA_MAP_KEYWORDS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
 
+# The provider is schema-agnostic and always offers exactly one tool, so a fixed
+# name is simplest; the mapping reads the sole ``tool_use`` block regardless of
+# name (DECISIONS — supporting decisions). Must match ``^[a-zA-Z0-9_-]{1,64}$``.
+_OUTPUT_TOOL_NAME = "structured_output"
+_OUTPUT_TOOL_DESCRIPTION = (
+    "Record the structured extraction result. Call this tool exactly once, passing "
+    "the result as its input conforming to the provided input_schema."
+)
+
+
+class _ToolRequestFields(TypedDict):
+    """The forced-tool request fields shared by the sync and batch request builds."""
+
+    tools: list[ToolParam]
+    tool_choice: ToolChoiceToolParam
+
+
+def _tool_request_fields(schema: dict[str, Any]) -> _ToolRequestFields:
+    """Build the non-strict forced-tool fields for a structured-output ``schema``.
+
+    The single source of the Anthropic structured-output request shape, reused by
+    the synchronous provider and the batch provider so both send identical params.
+    Offers one tool whose ``input_schema`` is the sanitized schema and forces it via
+    ``tool_choice``. The tool is **non-strict** (no ``strict=True``): a strict
+    ``input_schema`` — like the prior strict json-schema output path — compiles a
+    constrained-decoding grammar with a size ceiling the real ``recipe.v1`` schema
+    exceeds (400 "compiled grammar is too large"). A non-strict ``input_schema`` is
+    advisory (no grammar compile, no ceiling); downstream Pydantic + hard/soft
+    validation backstops correctness (DECISIONS — selected option, rationale).
+    """
+    tool: ToolParam = {
+        "name": _OUTPUT_TOOL_NAME,
+        "description": _OUTPUT_TOOL_DESCRIPTION,
+        "input_schema": _sanitize_schema(schema),
+    }
+    return {
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": _OUTPUT_TOOL_NAME},
+    }
+
 
 def _backoff_delay(
     attempt: int,
@@ -109,18 +152,29 @@ def _retry_after_seconds(exc: anthropic.APIStatusError) -> float | None:
     return seconds if seconds >= 0 else None
 
 
-def _extract_text(content: Iterable[Any]) -> str:
-    """Return the text of the first ``text`` content block, or ``""`` if none.
+def _extract_tool_use(content: Iterable[Any]) -> tuple[dict[str, Any] | None, str]:
+    """Return ``(tool_use input, raw_text)`` for a forced-tool response.
 
-    Read by attribute (``.type`` / ``.text``) rather than ``isinstance`` so the
-    raw-schema ``output_config`` guarantee (first block is text holding valid
-    JSON) is honoured for both the real ``TextBlock`` and the unit-test stub.
+    The success path carries exactly one ``tool_use`` block whose ``.input`` is the
+    already-parsed structured object; ``raw_text`` is its ``json.dumps`` — the
+    faithful analogue of the old text payload, retained for debugging (DECISIONS —
+    supporting decisions). When no ``tool_use`` block is present (a refusal or a
+    degenerate response), returns ``(None, <first text block's text or "">)`` so the
+    model's explanation, if any, survives as ``raw_text``. Read by attribute
+    (``.type`` / ``.input`` / ``.text``) so both the real SDK blocks and the
+    unit-test stubs are handled.
     """
+    text_fallback = ""
     for block in content:
-        if getattr(block, "type", None) == "text":
-            text = block.text
-            return text if isinstance(text, str) else ""
-    return ""
+        block_type = getattr(block, "type", None)
+        if block_type == "tool_use":
+            tool_input = block.input
+            return tool_input, json.dumps(tool_input)
+        if block_type == "text" and not text_fallback:
+            text = getattr(block, "text", "")
+            if isinstance(text, str):
+                text_fallback = text
+    return None, text_fallback
 
 
 def _sanitize_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -211,12 +265,7 @@ class AnthropicLLMProvider(LLMProvider):
             metadata=metadata,
             trace_context=trace_context,
         ) as observation:
-            output_config: OutputConfigParam = {
-                "format": JSONOutputFormatParam(
-                    type="json_schema",
-                    schema=_sanitize_schema(request.json_schema),
-                )
-            }
+            tool_fields = _tool_request_fields(request.json_schema)
             messages: list[MessageParam] = [
                 {"role": "user", "content": request.input}
             ]
@@ -235,7 +284,7 @@ class AnthropicLLMProvider(LLMProvider):
                         model=request.model,
                         max_tokens=self._max_tokens,
                         messages=messages,
-                        output_config=output_config,
+                        **tool_fields,
                     )
                     break
                 except anthropic.RateLimitError as exc:
@@ -285,18 +334,19 @@ def map_message_to_structured_output(
     """Map an Anthropic ``Message`` to a ``StructuredOutputResponse``.
 
     The single source of truth for Anthropic Messages-response parse semantics
-    (refusal / truncation / unparseable / non-object → ``parse_error``; clean →
-    ``output_json``), shared by the synchronous provider and 19.3's batch result
-    ingestion so both paths produce byte-identical runs.
+    (refusal / truncation / missing tool_use / non-object → ``parse_error``; clean →
+    ``output_json`` read from the ``tool_use`` block's ``.input``), shared by the
+    synchronous provider and 19.3's batch result ingestion so both paths produce
+    byte-identical runs.
     """
-    raw_text = _extract_text(message.content)
+    tool_input, raw_text = _extract_tool_use(message.content)
     usage = message.usage
     token_usage = TokenUsage(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
     )
-    parse_error = _parse_error(message.stop_reason, message.stop_details, raw_text)
-    output_json = None if parse_error else json.loads(raw_text)
+    parse_error = _parse_error(message.stop_reason, message.stop_details, tool_input)
+    output_json = None if parse_error else tool_input
     return StructuredOutputResponse(
         output_json=output_json,
         parse_error=parse_error,
@@ -310,7 +360,7 @@ def map_message_to_structured_output(
 def _parse_error(
     stop_reason: str | None,
     stop_details: RefusalStopDetails | None,
-    raw_text: str,
+    tool_input: dict[str, Any] | None,
 ) -> str | None:
     if stop_reason == "refusal":
         explanation = stop_details.explanation if stop_details is not None else None
@@ -318,11 +368,11 @@ def _parse_error(
             return f"model refused to generate output: {explanation}"
         return "model refused to generate output"
     if stop_reason == "max_tokens":
+        # A truncated forced tool-call yields a partial/empty .input — treat it as a
+        # rejection, never a silent partial parse (DECISIONS — risks).
         return "output truncated by provider (stop_reason=max_tokens)"
-    try:
-        parsed = json.loads(raw_text)
-    except ValueError:
-        return "model output is not valid JSON"
-    if not isinstance(parsed, dict):
+    if tool_input is None:
+        return "model did not return structured output (no tool_use block)"
+    if not isinstance(tool_input, dict):
         return "model output is not a JSON object"
     return None
