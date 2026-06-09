@@ -13,6 +13,7 @@ import pytest
 from anthropic._exceptions import OverloadedError
 
 from rag_recipes.providers.errors import LLMTechnicalError
+from rag_recipes.providers.llm.anthropic import _OUTPUT_TOOL_NAME
 from rag_recipes.providers.llm.anthropic_batch import (
     AnthropicBatchProvider,
     BatchExtractionRequest,
@@ -92,10 +93,14 @@ async def test_submit_batch_maps_requests_and_returns_result() -> None:
     assert params["model"] == "claude-sonnet-4-6"
     assert params["max_tokens"] == 8192
     assert params["messages"] == [{"role": "user", "content": "extract this"}]
-    fmt = params["output_config"]["format"]
-    assert fmt["type"] == "json_schema"
-    # _sanitize_schema is reused: unsupported keywords are stripped from the sent schema.
-    sent_props = fmt["schema"]["properties"]["n"]
+    # Batch sends the same non-strict forced tool-use shape as the sync path (no
+    # output_config), so neither path compiles the oversized strict grammar.
+    assert "output_config" not in params
+    tools = params["tools"]
+    assert len(tools) == 1 and tools[0]["name"] == _OUTPUT_TOOL_NAME
+    assert params["tool_choice"] == {"type": "tool", "name": _OUTPUT_TOOL_NAME}
+    # _sanitize_schema is reused: unsupported keywords are stripped from input_schema.
+    sent_props = tools[0]["input_schema"]["properties"]["n"]
     assert "minimum" not in sent_props and "maximum" not in sent_props
 
 

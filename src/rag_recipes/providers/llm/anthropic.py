@@ -1,11 +1,14 @@
 """AnthropicLLMProvider — structured generation via the Anthropic SDK (Epic 19.1).
 
 A synchronous Claude provider behind the same ``LLMProvider`` seam as
-``OpenAILLMProvider`` (DECISIONS #1–#4). Structured output is requested with the
-raw-schema ``output_config={"format": {"type": "json_schema", "schema": …}}``
-path — the provider stays schema-agnostic (it receives a dict, not a Pydantic
-model) and returns the identical ``output_json`` / ``parse_error`` / ``raw_text``
-contract as the OpenAI path. Technical failures raise ``LLMTechnicalError``;
+``OpenAILLMProvider`` (DECISIONS #1–#4). Structured output is requested via
+**non-strict forced tool-use** — a single tool whose ``input_schema`` is the
+(sanitized) schema, forced with ``tool_choice={"type": "tool", …}`` — rather than
+the strict ``output_config`` json_schema path, which compiles a constrained
+decoding grammar that 400s on the real ``recipe.v1`` schema ("compiled grammar is
+too large"). The provider stays schema-agnostic (it receives a dict, not a
+Pydantic model) and returns the identical ``output_json`` / ``parse_error`` /
+``raw_text`` contract as the OpenAI path. Technical failures raise ``LLMTechnicalError``;
 refused / truncated / unparseable output is returned with ``output_json=None``
 and a ``parse_error`` (never raised), always preserving ``raw_text``.
 
@@ -25,15 +28,15 @@ import copy
 import json
 import random
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, TypedDict
 
 import anthropic
 from anthropic import AsyncAnthropic
 from anthropic.types import (
-    JSONOutputFormatParam,
     MessageParam,
-    OutputConfigParam,
     RefusalStopDetails,
+    ToolChoiceToolParam,
+    ToolParam,
 )
 
 from rag_recipes.providers._observability import ProviderObservability, TraceContext
@@ -82,6 +85,46 @@ _UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
 # literally named ``pattern`` / ``maximum`` / etc. must be recursed into, never
 # stripped. Sanitization descends into the values of these maps only.
 _SUBSCHEMA_MAP_KEYWORDS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
+
+# The provider is schema-agnostic and always offers exactly one tool, so a fixed
+# name is simplest; the mapping reads the sole ``tool_use`` block regardless of
+# name (DECISIONS — supporting decisions). Must match ``^[a-zA-Z0-9_-]{1,64}$``.
+_OUTPUT_TOOL_NAME = "structured_output"
+_OUTPUT_TOOL_DESCRIPTION = (
+    "Record the structured extraction result. Call this tool exactly once, passing "
+    "the result as its input conforming to the provided input_schema."
+)
+
+
+class _ToolRequestFields(TypedDict):
+    """The forced-tool request fields shared by the sync and batch request builds."""
+
+    tools: list[ToolParam]
+    tool_choice: ToolChoiceToolParam
+
+
+def _tool_request_fields(schema: dict[str, Any]) -> _ToolRequestFields:
+    """Build the non-strict forced-tool fields for a structured-output ``schema``.
+
+    The single source of the Anthropic structured-output request shape, reused by
+    the synchronous provider and the batch provider so both send identical params.
+    Offers one tool whose ``input_schema`` is the sanitized schema and forces it via
+    ``tool_choice``. The tool is **non-strict** (no ``strict=True``): a strict
+    ``input_schema`` — like the old ``output_config`` json_schema path — compiles a
+    constrained-decoding grammar with a size ceiling the real ``recipe.v1`` schema
+    exceeds (400 "compiled grammar is too large"). A non-strict ``input_schema`` is
+    advisory (no grammar compile, no ceiling); downstream Pydantic + hard/soft
+    validation backstops correctness (DECISIONS — selected option, rationale).
+    """
+    tool: ToolParam = {
+        "name": _OUTPUT_TOOL_NAME,
+        "description": _OUTPUT_TOOL_DESCRIPTION,
+        "input_schema": _sanitize_schema(schema),
+    }
+    return {
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": _OUTPUT_TOOL_NAME},
+    }
 
 
 def _backoff_delay(
@@ -211,12 +254,7 @@ class AnthropicLLMProvider(LLMProvider):
             metadata=metadata,
             trace_context=trace_context,
         ) as observation:
-            output_config: OutputConfigParam = {
-                "format": JSONOutputFormatParam(
-                    type="json_schema",
-                    schema=_sanitize_schema(request.json_schema),
-                )
-            }
+            tool_fields = _tool_request_fields(request.json_schema)
             messages: list[MessageParam] = [
                 {"role": "user", "content": request.input}
             ]
@@ -235,7 +273,7 @@ class AnthropicLLMProvider(LLMProvider):
                         model=request.model,
                         max_tokens=self._max_tokens,
                         messages=messages,
-                        output_config=output_config,
+                        **tool_fields,
                     )
                     break
                 except anthropic.RateLimitError as exc:

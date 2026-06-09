@@ -31,6 +31,7 @@ from rag_recipes.ingestion.pipeline.extraction import build_recipe_v1_json_schem
 from rag_recipes.providers._observability import ProviderObservability, TraceContext
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.anthropic import (
+    _OUTPUT_TOOL_NAME,
     _UNSUPPORTED_SCHEMA_KEYWORDS,
     AnthropicLLMProvider,
     _sanitize_schema,
@@ -825,7 +826,7 @@ async def test_anthropic_clean_parse_sets_output_json() -> None:
     assert response.model == "claude-sonnet-4-6"
 
 
-async def test_anthropic_request_mapping_sends_json_schema_output_config() -> None:
+async def test_anthropic_request_sends_non_strict_forced_tool_use() -> None:
     client = _FakeAnthropicClient(response=_anthropic_message(text='{"ok": true}'))
     provider = AnthropicLLMProvider(
         api_key="sk-ant-test",
@@ -840,10 +841,18 @@ async def test_anthropic_request_mapping_sends_json_schema_output_config() -> No
     assert kwargs["model"] == _ANTHROPIC_REQUEST.model
     assert kwargs["max_tokens"] == 4096
     assert kwargs["messages"] == [{"role": "user", "content": _ANTHROPIC_REQUEST.input}]
-    fmt = kwargs["output_config"]["format"]
-    assert fmt["type"] == "json_schema"
+    # Non-strict forced tool-use replaces output_config — the strict json_schema path
+    # compiles a constrained-decoding grammar that 400s on the real recipe.v1 schema.
+    assert "output_config" not in kwargs
+    tools = kwargs["tools"]
+    assert len(tools) == 1
+    tool = tools[0]
+    assert tool["name"] == _OUTPUT_TOOL_NAME
+    # Non-strict: a strict tool input_schema would compile the same oversized grammar.
+    assert not tool.get("strict")
     # _STRICT_SCHEMA carries no unsupported keywords, so the sanitized schema equals it.
-    assert fmt["schema"] == _ANTHROPIC_REQUEST.json_schema
+    assert tool["input_schema"] == _ANTHROPIC_REQUEST.json_schema
+    assert kwargs["tool_choice"] == {"type": "tool", "name": _OUTPUT_TOOL_NAME}
     # Per-request timeout is applied via with_options, not the create() call.
     assert client.option_calls[0]["timeout"] == 42.0
 
