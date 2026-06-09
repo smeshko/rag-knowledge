@@ -16,7 +16,10 @@ from typing import Any
 import pytest
 
 from rag_recipes.answers.schema import build_answer_v1_json_schema
-from rag_recipes.ingestion.pipeline.extraction import build_recipe_v1_json_schema
+from rag_recipes.ingestion.pipeline.extraction import (
+    RecipeExtractionOutput,
+    build_recipe_v1_json_schema,
+)
 from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
 from tests.live.conftest import LiveCredentials
@@ -96,6 +99,10 @@ async def test_anthropic_llm_accepts_real_recipe_v1_schema(
     assert response.parse_error is None
     assert isinstance(response.output_json, dict)
     assert isinstance(response.output_json["items"], list)
+    # End-to-end guard: the structured output must validate against the production
+    # Pydantic model, not merely be schema-shaped. The request 400s before this line
+    # if the strict-grammar path ever regresses ("compiled grammar is too large").
+    RecipeExtractionOutput.model_validate(response.output_json)
 
 
 @pytest.mark.live
