@@ -384,10 +384,15 @@ _COUNT_KEYS = (
     "fixtures",
     "recipes_extracted",
     "extraction_failures",
+    "hard_validation_failures",
     "over_split_fixtures",
     "ready",
     "needs_review",
 )
+
+# Rate metrics that live in `aggregate` alongside the raw counts. Unlike the
+# counts they are quality signals, so they are regression-gated (DECISIONS #5).
+_RATE_KEYS = ("extraction_success_rate",)
 
 _DIRECTION_HIGHER = "higher_is_better"
 _DIRECTION_INFO = "informational"
@@ -398,9 +403,10 @@ FLAG_REGRESSION = "[REGRESSION]"
 def _scalar_metrics(results: dict[str, Any]) -> dict[str, float | int | None]:
     """Flatten an extraction ``results`` payload to its comparable scalar metrics.
 
-    Per-field objective accuracy (15.1), item counts (15.1), judge pass rate
-    (15.2), and judge-human agreement (15.3). Calibration is deliberately a
-    review view, not a diffed metric (see ``confidence-review``).
+    Per-field objective accuracy (15.1), item counts (15.1), extraction
+    coverage (15.1), judge pass rate (15.2), and judge-human agreement (15.3).
+    Calibration is deliberately a review view, not a diffed metric (see
+    ``confidence-review``).
     """
     metrics: dict[str, float | int | None] = {}
     aggregate = results.get("aggregate") or {}
@@ -409,6 +415,9 @@ def _scalar_metrics(results: dict[str, Any]) -> dict[str, float | int | None]:
     for count_key in _COUNT_KEYS:
         if count_key in aggregate:
             metrics[f"count.{count_key}"] = aggregate[count_key]
+    for rate_key in _RATE_KEYS:
+        if rate_key in aggregate:
+            metrics[f"coverage.{rate_key}"] = aggregate[rate_key]
     judge = results.get("judge") or {}
     if judge:
         metrics["judge.pass_rate"] = judge.get("pass_rate")

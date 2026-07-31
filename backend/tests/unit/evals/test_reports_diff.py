@@ -149,6 +149,34 @@ def test_a_drop_just_beyond_the_tolerance_is_still_a_regression(tmp_path: Path) 
     assert _change(result, "field_accuracy.yield")["flag"] == FLAG_REGRESSION
 
 
+def test_extraction_coverage_drop_is_a_regression_even_when_accuracy_holds(
+    tmp_path: Path,
+) -> None:
+    # Survivor bias: accuracy is a mean over the fixtures that produced a score,
+    # so a run where almost everything failed can keep a perfect mean. The
+    # coverage rate is the metric that catches it.
+    baseline = _write_baseline(
+        tmp_path,
+        _results(
+            field_accuracy={"title_normalized": 1.0},
+            counts={"fixtures": 100, "extraction_success_rate": 1.0},
+        ),
+    )
+    run_dir = _write_run(
+        tmp_path,
+        _results(
+            field_accuracy={"title_normalized": 1.0},
+            counts={"fixtures": 100, "extraction_success_rate": 0.01},
+        ),
+    )
+    result = diff_against_baseline(baseline, run_dir)
+    assert _change(result, "field_accuracy.title_normalized")["flag"] == "unchanged"
+    change = _change(result, "coverage.extraction_success_rate")
+    assert change["flag"] == FLAG_REGRESSION
+    assert change["direction"] == "higher_is_better"
+    assert result.status == "regressions_detected"
+
+
 def test_counts_are_diffed_but_informational(tmp_path: Path) -> None:
     baseline = _write_baseline(tmp_path, _results(counts={"ready": 115, "needs_review": 3}))
     run_dir = _write_run(tmp_path, _results(counts={"ready": 100, "needs_review": 18}))

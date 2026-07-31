@@ -11,6 +11,11 @@ detached in-memory ``SourceSpan`` (id ``synthetic_span_id(fixture.name)``)
 wrapped in a single ``Window`` — no PDF, no DB row. By design every synthetic
 fixture holds a single recipe, so the driver scores the first extracted item.
 
+Each candidate is put through the *same* two-stage validation the persist path
+uses: ``validate_hard`` first (a failure means production would persist nothing,
+so the fixture is recorded ``hard_validation_failed`` and never scored), then
+``validate_soft`` for the ready-vs-needs_review split (DECISIONS #4).
+
 Judge integration (Phase 15.2): when ``judge`` names a committed judge prompt,
 the driver loads it via ``load_judge`` (reusing the *same* injected provider —
 never a second one), replays cached ratings from the on-disk ``JudgeCache``
@@ -31,10 +36,14 @@ computed over rated fixtures only.
           {"name", "status": "scored", "recipes_returned", "review_status",
            "warnings", "confidence_overall", "missing_fields", "scores": {...}},
           {"name", "status": "extraction_failed", "error"},
+          {"name", "status": "hard_validation_failed", "recipes_returned",
+           "failures"},             # production would persist nothing
         ],
         "aggregate": {
           "fixtures", "recipes_extracted", "extraction_failures",
+          "hard_validation_failures",
           "over_split_fixtures",      # fixtures the extractor split into >1 item
+          "extraction_success_rate",  # scored / fixtures — regression-gated
           "ready", "needs_review", "average_confidence",
           "field_accuracy": {...},  # per-field means (None when ineligible)
           "missing_field_counts": {...},
@@ -87,7 +96,11 @@ from rag_recipes.ingestion.pipeline.extraction import (
     run_extraction,
 )
 from rag_recipes.ingestion.pipeline.windows import Window
-from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
+from rag_recipes.ingestion.validation import (
+    SoftValidationThresholds,
+    validate_hard,
+    validate_soft,
+)
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.storage.enums import ExtractionRunStatus
 from rag_recipes.storage.models.source_span import SourceSpan
@@ -295,7 +308,9 @@ def _render_summary(
         f"Fixture set: {fixture_set} ({aggregate['fixtures']} fixtures)",
         f"Recipes extracted: {aggregate['recipes_extracted']}",
         f"Extraction failures: {aggregate['extraction_failures']}",
+        f"Hard-validation failures: {aggregate['hard_validation_failures']}",
         f"Fixtures split across items: {aggregate['over_split_fixtures']}",
+        f"Extraction success rate: {fmt(aggregate['extraction_success_rate'])}",
         f"Ready: {aggregate['ready']}",
         f"Needs review: {aggregate['needs_review']}",
         f"Average confidence: {fmt(aggregate['average_confidence'])}",
@@ -442,6 +457,7 @@ async def run_extraction_eval(
         ready = 0
         needs_review = 0
         extraction_failures = 0
+        hard_validation_failures = 0
         recipes_extracted = 0
         over_split = 0
 
@@ -464,6 +480,26 @@ async def run_extraction_eval(
             if len(recipes) > 1:
                 over_split += 1
             recipe = recipes[0]
+            # Replay the *whole* persist-path classification, not half of it:
+            # production runs validate_hard first and persists nothing when it
+            # fires (persist.py raises HardValidationError). Scoring a candidate
+            # it would have discarded — wrong item_type, blank title, a
+            # hallucinated span id — would count it ready and hand it objective
+            # scores for a recipe that never reaches the corpus.
+            hard_failures = validate_hard(recipe, window)
+            if hard_failures:
+                hard_validation_failures += 1
+                per_fixture.append(
+                    {
+                        "name": fixture.name,
+                        "status": "hard_validation_failed",
+                        "recipes_returned": len(recipes),
+                        "failures": [failure.code for failure in hard_failures],
+                    }
+                )
+                if judge_section is not None:
+                    judge_section.skip(fixture.name, "hard validation failed")
+                continue
             if judge_section is not None:
                 await judge_section.rate(fixture, recipe)
             warnings = validate_soft(recipe, thresholds=thresholds)
@@ -501,9 +537,15 @@ async def run_extraction_eval(
             "fixtures": len(fixtures),
             "recipes_extracted": recipes_extracted,
             "extraction_failures": extraction_failures,
+            "hard_validation_failures": hard_validation_failures,
             "over_split_fixtures": over_split,
             "ready": ready,
             "needs_review": needs_review,
+            # Coverage is a *rate*, so it is regression-gated where the raw
+            # counts are only context (DECISIONS #5): per-field accuracy is a
+            # mean over the fixtures that produced a score, so 99 failures and
+            # one perfect survivor would otherwise read as a clean run.
+            "extraction_success_rate": (ready + needs_review) / len(fixtures),
             "average_confidence": _mean(confidences),
             "field_accuracy": {
                 field: _mean(accuracy_values[field]) for field in accuracy_fields

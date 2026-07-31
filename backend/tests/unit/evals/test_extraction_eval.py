@@ -170,6 +170,76 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
     assert aggregate["average_confidence"] is None
 
 
+async def test_a_candidate_production_would_discard_is_not_scored_or_counted_ready(
+    tmp_path: Path,
+) -> None:
+    # persist.py runs validate_hard first and persists nothing when it fires, so
+    # a candidate citing a span that is not in the window must not be blessed
+    # `ready` and handed a perfect span-provenance score by the eval.
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    bad = stew_output()
+    bad["items"][0]["source_span_ids"] = ["span_hallucinated"]
+    provider = FakeLLMProvider({request_hash("bean-stew", STEW_SOURCE): bad})
+    run = await run_extraction_eval(
+        "smoke",
+        "hard-fail-eval",
+        llm_provider=provider,
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+    )
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    entry = results["per_fixture"][0]
+    assert entry["status"] == "hard_validation_failed"
+    assert "source_span_not_in_window" in entry["failures"]
+    assert "scores" not in entry
+    aggregate = results["aggregate"]
+    assert aggregate["hard_validation_failures"] == 1
+    assert aggregate["ready"] == 0
+    assert aggregate["needs_review"] == 0
+    assert aggregate["extraction_success_rate"] == pytest.approx(0.0)
+    assert aggregate["field_accuracy"]["title_normalized"] is None
+
+
+async def test_survivor_only_accuracy_is_caught_by_the_coverage_rate(tmp_path: Path) -> None:
+    # A run where one fixture scores perfectly and the other is rejected keeps
+    # accuracy at 1.00; the coverage rate is what makes the collapse visible.
+    from tests.unit.evals.eval_utils import SOUP_SOURCE, request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    provider = write_smoke_set(fixtures_root)
+    provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): stew_output()},
+        default_output=StructuredOutputResponse(
+            output_json=None,
+            parse_error="max_tokens truncation",
+            raw_text="",
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            provider="fake",
+            model="fake-model",
+        ),
+    )
+    assert SOUP_SOURCE  # the soup fixture is the one that gets rejected
+    run = await run_extraction_eval(
+        "smoke",
+        "survivor-eval",
+        llm_provider=provider,
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+    )
+    aggregate = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"][
+        "aggregate"
+    ]
+    assert aggregate["field_accuracy"]["title_normalized"] == pytest.approx(1.0)
+    assert aggregate["extraction_success_rate"] == pytest.approx(0.5)
+
+
 async def test_a_fixture_split_across_items_is_counted_not_collapsed(tmp_path: Path) -> None:
     # Each synthetic fixture holds exactly one recipe, so an extractor that
     # emits two items for it is a boundary failure the report must surface —
