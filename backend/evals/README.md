@@ -56,8 +56,10 @@ that dropped out of the top-k, or whose rank worsened by ≥ 3), and the biggest
 per-query NDCG@10 drops — and exits **1** when a regression was found (0
 otherwise, **2** for any input error), so it can gate a local check without
 being a CI gate. Exit 2 covers a missing path, malformed JSON, a run finalized
-`failed`, a `report_type` mismatch between the two sides, and two runs that
-are not comparable. Runs are only comparable when `query_set` / `mode` /
+`failed`, a `report_type` mismatch between the two sides, a payload that
+fails structural validation (missing/mistyped `run`, `aggregate`,
+`per_query`, comparability fields, non-finite metrics, or invalid
+`expected_item_ranks`), and two runs that are not comparable. Runs are only comparable when `query_set` / `mode` /
 `reranking_enabled` / `embedding_model` / `k` / `limit` all match; when they
 differ the diff prints a prominent warning and the full deltas but reports no
 quality verdict, so a run-config mismatch can never masquerade as a

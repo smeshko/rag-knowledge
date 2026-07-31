@@ -446,6 +446,19 @@ def test_non_integer_expected_item_rank_is_refused(tmp_path: Path) -> None:
         _diff_with_current(tmp_path, current)
 
 
+@pytest.mark.parametrize("bad_rank", [0, -5])
+def test_non_positive_expected_item_rank_is_refused(
+    tmp_path: Path, bad_rank: int
+) -> None:
+    # Ranks are 1-based; rank <= k reads as "inside the top-k", so a 0 or
+    # negative rank on the current side suppressed a dropped-from-top-k
+    # regression at exit 0.
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["per_query"]["q1"]["expected_item_ranks"]["a"] = bad_rank
+    with pytest.raises(ValueError, match="not a positive rank"):
+        _diff_with_current(tmp_path, current)
+
+
 def test_null_expected_item_rank_stays_valid(tmp_path: Path) -> None:
     # None is the legitimate "not retrieved" encoding — it must not be rejected.
     result = _diff_with_current(tmp_path, _payload({"q1": _query(0.9, {"a": None})}))

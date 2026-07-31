@@ -122,8 +122,9 @@ def diff(
     and the biggest NDCG@10 drops, and exit 1 when a regression past the
     threshold is found (extraction diffs land with Epic 15). Exit 2 covers
     every input error: missing paths, malformed JSON, a run finalized
-    ``failed``, a ``report_type`` mismatch between the two sides, or two runs
-    whose ``run`` blocks make them incomparable.
+    ``failed``, a ``report_type`` mismatch between the two sides, a payload
+    failing structural validation, or two runs whose ``run`` blocks make
+    them incomparable.
     """
     from evals.reports import diff_against_baseline
 

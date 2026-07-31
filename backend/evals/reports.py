@@ -692,6 +692,15 @@ def _validate_retrieval_payload(
                     f"{where}: per_query[{query_id!r}].expected_item_ranks[{item_id!r}] "
                     f"is neither an integer rank nor null ({rank!r})"
                 )
+            # Ranks are 1-based retrieved positions; `_query_regressions`
+            # treats `rank <= k` as "inside the top-k", so a zero/negative
+            # rank on the current side silently suppressed a
+            # dropped-from-top-k regression at exit 0.
+            if rank is not None and rank < 1:
+                raise ValueError(
+                    f"{where}: per_query[{query_id!r}].expected_item_ranks[{item_id!r}] "
+                    f"is not a positive rank ({rank!r})"
+                )
 
 
 def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
