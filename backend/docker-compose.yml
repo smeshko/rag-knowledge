@@ -1,5 +1,9 @@
 # Local-only dev stack. Compose reads credentials from the project `.env`.
 
+# Pinned so the project keeps its pre-backend/ name — without this, compose
+# would derive "backend" from the directory and orphan the existing volumes.
+name: rag-recipes
+
 services:
   postgres:
     image: pgvector/pgvector:pg17

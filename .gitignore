@@ -1,39 +1,6 @@
-# Python artifacts
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Virtualenvs
-.venv/
-venv/
-
-# IDE / OS
-.idea/
-.vscode/
-*.swp
+# OS
 .DS_Store
-
-# Secrets
-.env
-.env.*
-!.env.example
-
-# Local data subtrees
-data/storage/
-!data/storage/.gitkeep
-data/fixtures/private/
-
-# Eval reports (baselines stay committed)
-evals/reports/*
-!evals/reports/.gitkeep
-!evals/baselines/
 
 # Agents
 .claude/
 .pi/
-/docs
