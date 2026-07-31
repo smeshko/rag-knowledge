@@ -185,6 +185,26 @@ class TestScoreIngredientsDetail:
         assert breakdown.recall == pytest.approx(1.0)
         assert breakdown.f1 == pytest.approx(1.0)
 
+    def test_absent_identity_fields_do_not_align_unrelated_ingredients(self) -> None:
+        # A degraded extraction that normalized nothing must not be handed
+        # credit for the sub-fields that are absent on both sides.
+        salt = _ingredient("1 tsp salt", 1.0, None, None, None)
+        pepper = _ingredient("1 tsp black pepper", 1.0, None, None, None)
+        breakdown = score_ingredients_detail([salt], [pepper])
+        assert breakdown.matched == 0
+        assert breakdown.unmatched_actual == 1
+        assert breakdown.unmatched_expected == 1
+        assert breakdown.precision == pytest.approx(0.0)
+        assert breakdown.recall == pytest.approx(0.0)
+        assert breakdown.f1 == pytest.approx(0.0)
+
+    def test_raw_text_fallback_still_aligns_when_item_is_absent(self) -> None:
+        actual = _ingredient("1 tsp salt", 1.0, "teaspoon", None, None)
+        expected = _ingredient("1 tsp salt", 1.0, "teaspoon", "salt", None)
+        breakdown = score_ingredients_detail([actual], [expected])
+        assert breakdown.matched == 1
+        assert breakdown.sub_field_accuracy["item_normalized"] == pytest.approx(0.0)
+
     def test_both_empty(self) -> None:
         breakdown = score_ingredients_detail([], [])
         assert breakdown.matched == 0

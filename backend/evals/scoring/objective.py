@@ -201,11 +201,30 @@ def _sub_field_equal(field: str, actual: dict[str, Any], expected: dict[str, Any
     return bool(actual_value == expected_value)
 
 
+def _identity_key(field: str, ingredient: dict[str, Any]) -> str | None:
+    """A normalized, non-empty identity value for ``field``, else ``None``."""
+    value = ingredient.get(field)
+    if not isinstance(value, str):
+        return None
+    return _normalize_optional(value) or None
+
+
 def _ingredient_keys_match(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
-    """True when two ingredients denote the same line (item, or raw text, agrees)."""
-    return _sub_field_equal("item_normalized", actual, expected) or _sub_field_equal(
-        "raw_text", actual, expected
-    )
+    """True when two ingredients denote the same line (item, or raw text, agrees).
+
+    Both sides must carry a *non-empty* value for the identity field. Treating
+    two absent (``None``) ``item_normalized`` values as "equal" would align
+    unrelated lines — e.g. a degraded extraction that normalized nothing — and
+    then hand them credit for every other sub-field that is absent on both
+    sides, inflating precision/recall on exactly the outputs this harness
+    exists to catch.
+    """
+    for field in ("item_normalized", "raw_text"):
+        actual_key = _identity_key(field, actual)
+        expected_key = _identity_key(field, expected)
+        if actual_key is not None and actual_key == expected_key:
+            return True
+    return False
 
 
 def _align_ingredients(
