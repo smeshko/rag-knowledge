@@ -134,7 +134,28 @@ def test_context_manager_exit_guarantees_results_json(tmp_path: Path) -> None:
 def test_context_manager_does_not_overwrite_written_results(tmp_path: Path) -> None:
     with _run(tmp_path) as run:
         run.write_results({"accuracy": 0.9})
-    assert json.loads((run.path / "results.json").read_text())["results"] == {"accuracy": 0.9}
+    doc = json.loads((run.path / "results.json").read_text())
+    assert doc["results"] == {"accuracy": 0.9}
+    assert doc["status"] == "completed"
+
+
+def test_crashed_run_is_finalized_as_failed(tmp_path: Path) -> None:
+    run = _run(tmp_path)
+    with pytest.raises(RuntimeError), run:  # the exception is never swallowed
+        run.write_results({"accuracy": 0.9})
+        raise RuntimeError("provider blew up")
+    doc = json.loads((run.path / "results.json").read_text())
+    assert doc["status"] == "failed"
+    assert doc["error"] == "RuntimeError"
+    assert doc["results"] == {"accuracy": 0.9}  # partial results are kept, not erased
+
+
+def test_failed_run_cannot_be_promoted_to_a_baseline(tmp_path: Path) -> None:
+    run = _run(tmp_path / "reports")
+    with pytest.raises(RuntimeError), run:
+        raise RuntimeError("provider blew up")
+    with pytest.raises(ValueError, match="failed run"):
+        save_as_baseline(run.path, "extraction", baselines_root=tmp_path / "baselines")
 
 
 # --- metadata capture -------------------------------------------------------

@@ -34,6 +34,8 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 __all__ = [
+    "RUN_STATUS_COMPLETED",
+    "RUN_STATUS_FAILED",
     "DiffResult",
     "ReportRun",
     "RunMetadata",
@@ -42,6 +44,9 @@ __all__ = [
     "diff_against_baseline",
     "save_as_baseline",
 ]
+
+RUN_STATUS_COMPLETED = "completed"
+RUN_STATUS_FAILED = "failed"
 
 REPORTS_ROOT = Path(__file__).resolve().parents[1] / "evals" / "reports"
 BASELINES_ROOT = Path(__file__).resolve().parents[1] / "evals" / "baselines"
@@ -180,7 +185,9 @@ class ReportRun:
     On context exit the run directory is
     guaranteed to hold a ``results.json`` carrying at least the metadata, even
     if the caller never called :meth:`write_results`. Exceptions are never
-    swallowed.
+    swallowed — but they *are* recorded: a run whose body raised is finalized
+    with ``status="failed"``, so a crashed run cannot pass for an empty
+    successful one (and :func:`save_as_baseline` refuses to promote it).
     """
 
     def __init__(
@@ -195,6 +202,7 @@ class ReportRun:
         started_at = datetime.fromisoformat(self.metadata.timestamp)
         self.path = _create_run_dir(root, _run_dir_name(started_at, label))
         self._results_written = False
+        self._payload: dict[str, Any] = {}
 
     def write_summary(self, markdown: str) -> Path:
         """Write ``summary.md``; returns its path."""
@@ -205,14 +213,25 @@ class ReportRun:
     def write_results(self, results: dict[str, Any] | BaseModel) -> Path:
         """Write ``results.json`` with the run metadata embedded; returns its path.
 
-        The document shape is ``{"metadata": {...}, "results": {...}}`` so every
-        results file (and any baseline copied from it) is self-describing.
+        The document shape is ``{"metadata": {...}, "status": ..., "results":
+        {...}}`` so every results file (and any baseline copied from it) is
+        self-describing.
         """
-        payload = results.model_dump() if isinstance(results, BaseModel) else results
-        doc = {"metadata": self.metadata.model_dump(), "results": payload}
+        self._payload = results.model_dump() if isinstance(results, BaseModel) else results
+        path = self._write_doc(RUN_STATUS_COMPLETED)
+        self._results_written = True
+        return path
+
+    def _write_doc(self, status: str, *, error: str | None = None) -> Path:
+        doc: dict[str, Any] = {
+            "metadata": self.metadata.model_dump(),
+            "status": status,
+            "results": self._payload,
+        }
+        if error is not None:
+            doc["error"] = error
         path = self.path / "results.json"
         path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-        self._results_written = True
         return path
 
     def write_per_item_breakdowns(self, markdown: str) -> Path:
@@ -230,8 +249,12 @@ class ReportRun:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if not self._results_written:
-            self.write_results({})
+        if exc_type is not None:
+            # Keep whatever the caller managed to write, but mark the run failed:
+            # an aborted eval must never look like a clean run with no findings.
+            self._write_doc(RUN_STATUS_FAILED, error=exc_type.__name__)
+        elif not self._results_written:
+            self._write_doc(RUN_STATUS_COMPLETED)
 
 
 def save_as_baseline(
@@ -243,9 +266,18 @@ def save_as_baseline(
     the source metadata>, "source": <verbatim results.json doc>}`` — the header
     keys sit at top level and the entire source doc is nested under ``source``,
     so the copied provenance is never clobbered or duplicated by the header.
+
+    Refuses to promote a run finalized as ``failed``: a baseline is the
+    reference every later run is judged against, so silently blessing a crashed
+    run would turn its empty results into "the expected numbers".
     """
     root = BASELINES_ROOT if baselines_root is None else baselines_root
     source_doc = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
+    if source_doc.get("status") == RUN_STATUS_FAILED:
+        raise ValueError(
+            f"refusing to baseline a failed run: {report_path} "
+            f"(error: {source_doc.get('error', 'unknown')})"
+        )
     baseline = {
         "baseline_set_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "run_label": source_doc["metadata"]["run_label"],
