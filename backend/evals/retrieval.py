@@ -230,7 +230,7 @@ def _render_per_query_md(
         "item-level fused score.",
     ]
     for record in query_records:
-        expected = qrels.get(record["query_id"], {})
+        expected = _relevant_items(qrels.get(record["query_id"], {}))
         expected_ids = ", ".join(f"`{item_id}`" for item_id in expected) or "—"
         lines += [
             "",
@@ -255,12 +255,25 @@ def _render_per_query_md(
     return "\n".join(lines) + "\n"
 
 
+def _relevant_items(judged: dict[str, int]) -> list[str]:
+    """The judged items a query is actually *expected* to retrieve.
+
+    A qrels row with relevance ``0`` is an explicit "judged, not relevant"
+    verdict — pytrec_eval scores it as such, and the graded ``0/1/2/3`` scale
+    the metrics wrapper documents makes it a first-class value. Feeding it
+    into the expected-item set would label a non-relevant item "expected" in
+    ``per_query.md`` and, worse, make 16.2's diff flag it *leaving* the top-k
+    as a regression when that is an improvement.
+    """
+    return [item_id for item_id, relevance in judged.items() if relevance > 0]
+
+
 def _expected_item_ranks(
     expected: dict[str, int], retrieved_ids: list[str]
 ) -> dict[str, int | None]:
-    """Map each expected item to its 1-based retrieved rank, or ``None`` if absent."""
+    """Map each relevant item to its 1-based retrieved rank, or ``None`` if absent."""
     positions = {item_id: rank for rank, item_id in enumerate(retrieved_ids, start=1)}
-    return {item_id: positions.get(item_id) for item_id in expected}
+    return {item_id: positions.get(item_id) for item_id in _relevant_items(expected)}
 
 
 def _run_block(

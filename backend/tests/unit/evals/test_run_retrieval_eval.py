@@ -243,6 +243,35 @@ async def _run_skewed(tmp_path: Path, queries: str, qrels: str) -> None:
     )
 
 
+async def test_relevance_zero_qrels_are_not_expected_items(tmp_path: Path) -> None:
+    # A relevance-0 row is an explicit "judged, not relevant" verdict: it must
+    # not appear as an expected item (nor, therefore, as a 16.2 regression
+    # candidate when it drops out of the top-k).
+    settings = _SettingsStandIn()
+    fixtures_root = _write_fixture_set(
+        tmp_path, "q1\twhite bean soup\n", "q1\titem_stew\t1\nq1\titem_soup\t0\n"
+    )
+    report = await run_retrieval_eval(
+        "skewed",
+        k=10,
+        label="unit",
+        search=_FakeSearch(_ENVELOPES),
+        report_factory=lambda label: ReportRun(
+            label, reports_root=tmp_path / "reports", settings=settings
+        ),
+        settings=settings,
+        fixtures_root=fixtures_root,
+    )
+    payload = json.loads((report.path / "results.json").read_text(encoding="utf-8"))["results"]
+    assert payload["per_query"]["q1"]["expected_item_ranks"] == {"item_stew": 1}
+    per_query_md = (report.path / "per_query.md").read_text(encoding="utf-8")
+    expected_line = next(
+        line for line in per_query_md.splitlines() if line.startswith("Expected items")
+    )
+    assert "item_stew" in expected_line
+    assert "item_soup" not in expected_line
+
+
 async def test_query_without_a_qrels_row_is_rejected(tmp_path: Path) -> None:
     # q2 would otherwise be searched and then silently dropped from per_query
     # and from the aggregate denominator, leaving the headline falsely perfect.
