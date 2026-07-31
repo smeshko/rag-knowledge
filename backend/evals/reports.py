@@ -422,32 +422,24 @@ def _metric_direction(metric: str) -> str:
     return _DIRECTION_INFO if metric.startswith("count.") else _DIRECTION_HIGHER
 
 
-def _lost_coverage_is_a_regression(metric: str) -> bool:
-    """Whether a metric the baseline measured, and this run did not, is a drop.
-
-    Objective accuracy stops being measurable only when the fixtures it covers
-    stopped producing scores — e.g. every extraction was rejected or truncated,
-    which leaves the run ``completed`` with survivor-only (or no) accuracy. Left
-    as plain ``missing`` that scenario prints "No regressions detected" for a
-    total extraction collapse. Judge pass rate and judge-human agreement are
-    different: they are absent whenever the optional ``--judge`` /
-    ``judge-alignment`` steps simply were not run, so their absence stays
-    informational.
-    """
-    return metric.startswith("field_accuracy.")
-
-
 def _diff_extraction(
     current: dict[str, Any], baseline: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """Per-metric deltas between two unwrapped extraction ``results`` payloads.
 
-    Direction per DECISIONS #5: accuracy / pass-rate / agreement are
+    Direction per DECISIONS #5: accuracy / pass-rate / agreement / coverage are
     higher-is-better and flag ``[REGRESSION]`` on a drop beyond the tolerance;
-    counts are informational context. A metric present on only one side is
-    ``new`` / ``missing`` and never crashes — except that an *accuracy* metric
-    the baseline carried and this run cannot measure is a regression, not a
-    shrug (see :func:`_lost_coverage_is_a_regression`).
+    counts are informational context. A metric on only one side never crashes,
+    but "absent" and "null" are deliberately *not* the same thing:
+
+    - the metric **key is absent** from this run — the step that produces it
+      never ran (no ``--judge``, no ``judge-alignment``) — ``missing``,
+      informational;
+    - the metric **key is present with a null value** — the step ran and
+      measured nothing (every extraction rejected, every judge call unrated) —
+      ``[REGRESSION]``, because that is a total loss of a quality signal the
+      baseline had, and calling it ``missing`` printed "No regressions
+      detected" for exactly the collapses this gate exists to catch.
     """
     current_metrics = _scalar_metrics(current)
     baseline_metrics = _scalar_metrics(baseline)
@@ -462,7 +454,8 @@ def _diff_extraction(
         elif baseline_value is None:
             flag = "new"
         elif current_value is None:
-            flag = FLAG_REGRESSION if _lost_coverage_is_a_regression(metric) else "missing"
+            # Present-but-null means the step ran and measured nothing.
+            flag = FLAG_REGRESSION if metric in current_metrics else "missing"
         else:
             delta = current_value - baseline_value
             threshold = _DIFF_TOLERANCE + _TOLERANCE_SLACK

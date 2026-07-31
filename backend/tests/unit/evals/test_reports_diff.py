@@ -195,6 +195,23 @@ def test_accuracy_the_baseline_measured_and_this_run_cannot_is_a_regression(
     assert "2 regression(s) detected." in result.summary
 
 
+@pytest.mark.parametrize("section", ["judge", "agreement"])
+def test_a_step_that_ran_and_rated_nothing_is_a_regression(tmp_path: Path, section: str) -> None:
+    # `judge: null` means --judge was never passed (informational). A judge
+    # section that exists with `pass_rate: null` means every call errored — a
+    # total loss of the signal, not an omitted step.
+    kwargs: dict[str, Any] = {"with_judge": True, "judge_pass_rate": 0.9}
+    metric = "judge.pass_rate"
+    if section == "agreement":
+        kwargs = {"with_agreement": True, "agreement_rate": 0.9}
+        metric = "agreement.rate"
+    baseline = _write_baseline(tmp_path, _results(**kwargs))
+    run_dir = _write_run(tmp_path, _results(**{**kwargs, list(kwargs)[1]: None}))
+    result = diff_against_baseline(baseline, run_dir)
+    assert _change(result, metric)["flag"] == FLAG_REGRESSION
+    assert result.status == "regressions_detected"
+
+
 def test_metric_missing_from_current_is_missing_not_regression(tmp_path: Path) -> None:
     # e.g. the current run had no judge-alignment pass, so agreement is absent.
     baseline = _write_baseline(tmp_path, _results(with_agreement=True, agreement_rate=0.91))
