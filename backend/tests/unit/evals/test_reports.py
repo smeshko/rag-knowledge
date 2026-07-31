@@ -13,7 +13,10 @@ import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 import evals.reports
 import pytest
@@ -26,6 +29,7 @@ from evals.reports import (
     diff_against_baseline,
     save_as_baseline,
 )
+from pydantic import BaseModel
 
 RUN_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-")
 
@@ -156,6 +160,27 @@ def test_failed_run_cannot_be_promoted_to_a_baseline(tmp_path: Path) -> None:
         raise RuntimeError("provider blew up")
     with pytest.raises(ValueError, match="failed run"):
         save_as_baseline(run.path, "extraction", baselines_root=tmp_path / "baselines")
+
+
+def test_write_results_serializes_pydantic_models_in_json_mode(tmp_path: Path) -> None:
+    # Epic 15/16 results models carry datetimes/UUIDs; python-mode model_dump()
+    # would leave those as objects and blow up in json.dumps.
+    class _Results(BaseModel):
+        finished_at: datetime
+        run_id: UUID
+        score: Decimal
+
+    run = _run(tmp_path)
+    run.write_results(
+        _Results(
+            finished_at=datetime(2026, 5, 22, 12, 30, tzinfo=UTC),
+            run_id=UUID("00000000-0000-0000-0000-000000000001"),
+            score=Decimal("0.91"),
+        )
+    )
+    results = json.loads((run.path / "results.json").read_text())["results"]
+    assert results["finished_at"].startswith("2026-05-22T12:30:00")
+    assert results["run_id"] == "00000000-0000-0000-0000-000000000001"
 
 
 # --- metadata capture -------------------------------------------------------

@@ -215,9 +215,13 @@ class ReportRun:
 
         The document shape is ``{"metadata": {...}, "status": ..., "results":
         {...}}`` so every results file (and any baseline copied from it) is
-        self-describing.
+        self-describing. Pydantic results are serialized in JSON mode, so a
+        model carrying ``datetime``/``UUID``/``Decimal`` fields round-trips
+        instead of blowing up in ``json.dumps``.
         """
-        self._payload = results.model_dump() if isinstance(results, BaseModel) else results
+        self._payload = (
+            results.model_dump(mode="json") if isinstance(results, BaseModel) else results
+        )
         path = self._write_doc(RUN_STATUS_COMPLETED)
         self._results_written = True
         return path
