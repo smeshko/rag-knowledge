@@ -1473,6 +1473,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "pytrec-eval-terrier" },
     { name = "ruff" },
 ]
 
@@ -1507,6 +1508,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
     { name = "pytest-cov", specifier = ">=5.0" },
+    { name = "pytrec-eval-terrier", specifier = ">=0.5" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 

@@ -40,6 +40,7 @@ dev = [
     "polyfactory>=2.16",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pytrec-eval-terrier>=0.5",
 ]
 
 [build-system]
