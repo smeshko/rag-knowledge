@@ -4,7 +4,8 @@
 stubs that print ``not implemented yet`` and exit 0 until Epic 15. Importing
 this module issues no live call — but **running** ``retrieval`` builds the
 default in-process search caller, which reaches real providers and therefore
-needs operator credentials (see ``evals.retrieval._build_default_search``).
+needs operator credentials, a reachable database and Redis (see
+``evals.retrieval._default_search``).
 """
 
 from __future__ import annotations

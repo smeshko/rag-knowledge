@@ -9,18 +9,19 @@ retrieval metrics (``evals.metrics.retrieval``), and writes ``results.json`` +
 Injection seams (all keyword-only): ``search`` (the async search caller),
 ``report_factory`` (binds ``ReportRun`` to a custom root/settings), and
 ``settings``. Unit tests inject all three; only a real, credentialed live run
-uses the defaults — see :func:`_build_default_search`.
+uses the defaults — see :func:`_default_search`.
 """
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any, Protocol
 
 from evals.fixtures import load_query_fixtures
 from evals.metrics.retrieval import build_run_dict, compute_retrieval_metrics
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
     from evals.reports import ReportRun
@@ -63,8 +64,9 @@ class SearchCaller(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _build_default_search(settings: Any) -> SearchCaller:
-    """Build the in-process **live** search caller — real app, real providers.
+@asynccontextmanager
+async def _default_search(settings: Any) -> AsyncIterator[SearchCaller]:
+    """The in-process **live** search caller — real app, real providers.
 
     LIVE PATH — never exercised by automated tests. The unoverridden app's
     ``get_embedding_provider`` constructs a real ``OpenAIEmbeddingProvider``
@@ -72,17 +74,31 @@ def _build_default_search(settings: Any) -> SearchCaller:
     ``reranking_enabled``), so any hybrid/vector search through this caller is
     a real network call requiring operator-supplied credentials. Tests must
     inject a fake ``search`` instead.
+
+    A context manager because the app's **lifespan must run**: ``get_session``
+    reads ``request.app.state.session_factory``, which only the lifespan sets
+    (``api/app.py``) — ``httpx.ASGITransport`` does not run lifespan events, so
+    driving the app without it made every query 500 on ``AttributeError``.
+    Integration tests never hit this because they override ``get_session``.
+    Entering the lifespan also means a reachable Redis (the lifespan builds the
+    arq pool), same as serving the app under uvicorn.
+
+    Client and lifespan are entered **once per run**, not per query.
     """
     import httpx
 
     from rag_recipes.api.app import app
 
-    async def _search(query_text: str, *, mode: str, limit: int) -> dict[str, Any]:
-        transport = httpx.ASGITransport(app=app)
-        headers = {"Authorization": f"Bearer {settings.personal_api_token}"}
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://rag-evals", headers=headers
-        ) as client:
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://rag-evals",
+            headers={"Authorization": f"Bearer {settings.personal_api_token}"},
+        ) as client,
+    ):
+
+        async def _search(query_text: str, *, mode: str, limit: int) -> dict[str, Any]:
             response = await client.post(
                 "/api/v1/search",
                 json={
@@ -96,7 +112,7 @@ def _build_default_search(settings: Any) -> SearchCaller:
             body: dict[str, Any] = response.json()
             return body
 
-    return _search
+        yield _search
 
 
 def _fold_qrels(qrels: list[Any]) -> dict[str, dict[str, int]]:
@@ -285,8 +301,6 @@ async def run_retrieval_eval(
         from rag_recipes.config import get_settings
 
         settings = get_settings()
-    if search is None:
-        search = _build_default_search(settings)
     if report_factory is None:
         from evals.reports import ReportRun as _ReportRun
 
@@ -299,17 +313,22 @@ async def run_retrieval_eval(
     # Collect the *full* result objects per query (DECISIONS #4, Phase 16.2):
     # the per-query breakdown and the run dict share this one pass.
     query_records: list[dict[str, Any]] = []
-    for query in fixture_set.queries:
-        envelope = await search(query.query_text, mode=mode, limit=limit)
-        query_records.append(
-            {
-                "query_id": query.query_id,
-                "query_text": query.query_text,
-                "results": envelope["results"],
-                # .get(): merged routes/search.py pops the key when gating is off.
-                "debug": envelope.get("debug"),
-            }
-        )
+    async with AsyncExitStack() as stack:
+        if search is None:
+            # Live default: app lifespan + one HTTP client for the whole run.
+            # An injected `search` leaves the stack empty — nothing is entered.
+            search = await stack.enter_async_context(_default_search(settings))
+        for query in fixture_set.queries:
+            envelope = await search(query.query_text, mode=mode, limit=limit)
+            query_records.append(
+                {
+                    "query_id": query.query_id,
+                    "query_text": query.query_text,
+                    "results": envelope["results"],
+                    # .get(): merged routes/search.py pops the key when gating is off.
+                    "debug": envelope.get("debug"),
+                }
+            )
     retrieved_ids = {
         record["query_id"]: [result["item"]["id"] for result in record["results"]]
         for record in query_records
