@@ -177,6 +177,40 @@ def test_changes_shape_and_status_are_the_epic14_diffresult(tmp_path: Path) -> N
         assert set(change) == {"metric", "baseline", "current", "delta", "direction", "flag"}
 
 
+def test_failed_current_run_is_refused_not_reported_clean(tmp_path: Path) -> None:
+    # A crashed run unwraps to empty metrics, which read as "missing" — the
+    # diff must refuse rather than return "No regressions detected".
+    baseline = _write_baseline(tmp_path, _results())
+    run_dir = tmp_path / "report"
+    run_dir.mkdir()
+    doc = {
+        "metadata": {"run_label": "current"},
+        "status": "failed",
+        "error": "LLMTechnicalError",
+        "results": {},
+    }
+    (run_dir / "results.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="failed report"):
+        diff_against_baseline(baseline, run_dir)
+
+
+def test_failed_baseline_source_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "extraction.json"
+    path.write_text(
+        json.dumps(
+            {
+                "baseline_set_at": "2026-01-01T00:00:00+00:00",
+                "run_label": "baseline",
+                "source": {"metadata": {}, "status": "failed", "error": "boom", "results": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = _write_run(tmp_path, _results())
+    with pytest.raises(ValueError, match="failed baseline"):
+        diff_against_baseline(path, run_dir)
+
+
 def test_run_dir_without_results_json_raises(tmp_path: Path) -> None:
     baseline = _write_baseline(tmp_path, _results())
     empty_dir = tmp_path / "empty"

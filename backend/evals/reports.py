@@ -485,6 +485,21 @@ def _render_diff_summary(changes: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _refuse_failed(doc: dict[str, Any], path: Path, kind: str) -> None:
+    """Refuse to diff a run finalized as ``failed`` (mirrors ``save_as_baseline``).
+
+    A crashed run's ``results`` is empty or partial, so every metric would
+    unwrap to ``None`` — read as "missing", never a regression — and the diff
+    would return ``ok`` / "No regressions detected" for a run that never
+    produced numbers. A false green here is worse than no diff at all.
+    """
+    if doc.get("status") == RUN_STATUS_FAILED:
+        raise ValueError(
+            f"refusing to diff a failed {kind}: {path} "
+            f"(error: {doc.get('error', 'unknown')})"
+        )
+
+
 def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
     """Diff a run's extraction metrics against a committed baseline (doc 12 § 9).
 
@@ -495,7 +510,9 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
     ``baseline = doc["source"]["results"]`` (``save_as_baseline`` nests the
     whole results document under ``source``). Missing inputs raise
     ``FileNotFoundError`` — a diff against a nonexistent baseline or report is
-    a caller error, not a "no changes" result.
+    a caller error, not a "no changes" result — and a run finalized as
+    ``failed`` on either side raises ``ValueError`` rather than diffing its
+    empty metrics into a clean bill of health.
     """
     if not baseline_path.exists():
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
@@ -506,8 +523,11 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
         raise FileNotFoundError(f"report results not found: {current_results_path}")
     current_doc = json.loads(current_results_path.read_text(encoding="utf-8"))
     baseline_doc = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline_source = baseline_doc.get("source") or {}
+    _refuse_failed(current_doc, current_report_path, "report")
+    _refuse_failed(baseline_source, baseline_path, "baseline")
     current = current_doc.get("results") or {}
-    baseline = (baseline_doc.get("source") or {}).get("results") or {}
+    baseline = baseline_source.get("results") or {}
     changes = _diff_extraction(current, baseline)
     has_regressions = any(change["flag"] == FLAG_REGRESSION for change in changes)
     return DiffResult(

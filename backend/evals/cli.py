@@ -193,7 +193,7 @@ def diff(
 
     try:
         result = diff_against_baseline(baseline_path, new_report_path)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(result.summary)
