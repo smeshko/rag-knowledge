@@ -169,10 +169,28 @@ async def _extract_recipes(
     return items, None
 
 
+def _golden_structured(expected: dict[str, Any]) -> dict[str, Any]:
+    """The golden ``structured_data`` block, tolerating an absent-or-null key.
+
+    ``expected.json`` is an opaque dict (Epic-14 DECISIONS #3), so a fixture may
+    legitimately write ``"structured_data": null`` or ``"ingredients": null``.
+    ``dict.get(key, {})`` returns ``None`` for an explicit null, so every read
+    goes through ``or`` defaults — a malformed golden file must score as a miss,
+    never abort the whole run.
+    """
+    structured = expected.get("structured_data")
+    return structured if isinstance(structured, dict) else {}
+
+
+def _golden_list(structured: dict[str, Any], key: str) -> list[Any]:
+    value = structured.get(key)
+    return list(value) if isinstance(value, list) else []
+
+
 def _missing_fields(recipe: ExtractedRecipe, expected: dict[str, Any]) -> list[str]:
     """Fields present in the golden recipe but absent from the extraction."""
     structured = recipe.structured_data
-    expected_structured = expected.get("structured_data", {})
+    expected_structured = _golden_structured(expected)
     missing: list[str] = []
     if expected.get("title") and not recipe.title.strip():
         missing.append("title")
@@ -311,16 +329,17 @@ def _score_fixture(
     fact, not an extraction miss).
     """
     structured = recipe.structured_data
-    expected_structured = expected.get("structured_data", {})
+    expected_structured = _golden_structured(expected)
 
-    title = score_title(recipe.title, expected.get("title", ""))
+    expected_title = expected.get("title")
+    title = score_title(recipe.title, expected_title if isinstance(expected_title, str) else "")
     yield_match = score_yield(structured.yield_, expected_structured.get("yield"))
     times = {
         field: score_times(getattr(structured, field), expected_structured.get(field))
         for field in _TIME_FIELDS
     }
-    expected_ingredients = list(expected_structured.get("ingredients", []))
-    expected_steps = list(expected_structured.get("steps", []))
+    expected_ingredients = _golden_list(expected_structured, "ingredients")
+    expected_steps = _golden_list(expected_structured, "steps")
     ingredient_count = score_ingredient_count(
         len(structured.ingredients), len(expected_ingredients)
     )
@@ -329,9 +348,7 @@ def _score_fixture(
         [ingredient.model_dump() for ingredient in structured.ingredients],
         expected_ingredients,
     )
-    spans = score_source_span_ids(
-        recipe.source_span_ids, list(expected.get("source_span_ids", []))
-    )
+    spans = score_source_span_ids(recipe.source_span_ids, _golden_list(expected, "source_span_ids"))
 
     accuracy_values["title_exact"].append(float(title.exact))
     accuracy_values["title_normalized"].append(float(title.normalized))

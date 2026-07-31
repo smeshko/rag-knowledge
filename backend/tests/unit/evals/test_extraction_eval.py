@@ -170,6 +170,42 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
     assert aggregate["average_confidence"] is None
 
 
+async def test_explicit_nulls_in_expected_json_score_as_misses_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    # `expected.json` is an opaque dict, so a fixture may write explicit nulls;
+    # `.get(key, default)` returns None for those, which used to blow up in
+    # normalize_title / list().
+    fixtures_root = tmp_path / "fixtures"
+    provider = write_smoke_set(fixtures_root)
+    (fixtures_root / "synthetic_recipes" / "smoke" / "bean-stew" / "expected.json").write_text(
+        json.dumps(
+            {
+                "item_type": "recipe",
+                "title": None,
+                "source_span_ids": None,
+                "structured_data": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    run = await run_extraction_eval(
+        "smoke",
+        "null-eval",
+        llm_provider=provider,
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+    )
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    stew = next(entry for entry in results["per_fixture"] if entry["name"] == "bean-stew")
+    assert stew["status"] == "scored"
+    assert stew["scores"]["title"] == {"exact": False, "normalized": False}
+    assert stew["scores"]["ingredient_count"] is False
+    assert stew["missing_fields"] == []
+
+
 async def test_empty_fixture_set_raises_instead_of_writing_a_green_report(
     tmp_path: Path,
 ) -> None:
