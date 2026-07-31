@@ -1,19 +1,57 @@
-"""``rag-evals`` command-line interface (Epic 14 Phase 14.1).
+"""``rag-evals`` command-line interface (Epic 14 Phase 14.1, Epic 15).
 
-Scaffold stubs: every subcommand exists with its final argument shape but
-prints ``not implemented yet`` and exits 0. Extraction/judge subcommands gain
-real behaviour in Epic 15; retrieval metrics in Epic 16. The commands import no
-``Settings``, no provider, and no DB code — nothing here can issue a live call.
+``extraction`` runs the real extraction eval (Epic 15 Phase 15.1); the other
+subcommands are scaffold stubs that print ``not implemented yet`` and exit 0
+until Epics 15/16 fill them in. Provider/``Settings`` imports stay lazy inside
+the command bodies, so importing this module (and rendering ``--help``) can
+never issue a live call. ``_build_llm_provider`` below is the **only**
+live-provider construction site in the eval harness — the driver takes the
+provider injected, and tests monkeypatch this seam with ``FakeLLMProvider``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
+if TYPE_CHECKING:
+    from rag_recipes.config import Settings
+    from rag_recipes.providers.llm.base import LLMProvider
+
 app = typer.Typer(help="rag-recipes evaluation harness")
+
+
+def _build_llm_provider(settings: Settings) -> LLMProvider:
+    """Construct the live extraction LLM provider from settings.
+
+    Mirrors ``rag_recipes.ingestion.jobs._build_llm_provider`` (module-private,
+    so not imported): dispatch on ``settings.llm_provider`` — ``"anthropic"``
+    builds Claude on the Anthropic settings, anything else stays OpenAI. Not
+    ``api.dependencies.get_llm_provider``, which resolves the *answer* model.
+    Never exercised by tests (they monkeypatch this seam).
+    """
+    from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
+    from rag_recipes.providers.llm.openai import OpenAILLMProvider
+
+    if settings.llm_provider == "anthropic":
+        api_key = settings.anthropic_api_key
+        if api_key is None:
+            raise ValueError("anthropic_api_key is required when llm_provider == 'anthropic'")
+        return AnthropicLLMProvider(
+            api_key,
+            default_model=settings.anthropic_llm_model,
+            max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+            request_timeout=settings.llm_request_timeout_seconds,
+            max_tokens=settings.anthropic_max_tokens,
+        )
+    return OpenAILLMProvider(
+        settings.openai_api_key,
+        default_model=settings.llm_model,
+        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+        request_timeout=settings.llm_request_timeout_seconds,
+    )
 
 
 def _not_implemented(name: str) -> None:
@@ -26,13 +64,31 @@ def extraction(
         str,
         typer.Option(help="Recipe fixture set under data/fixtures/synthetic_recipes/."),
     ],
+    label: Annotated[
+        str,
+        typer.Option(help="Run label stamped into the report directory name and metadata."),
+    ],
     judge: Annotated[
         str | None,
         typer.Option(help="Judge prompt name under data/fixtures/judge_prompts/ (Epic 15)."),
     ] = None,
 ) -> None:
     """Evaluate extraction quality against golden fixtures (Epic 15)."""
-    _not_implemented("extraction")
+    import asyncio
+
+    from evals.extraction import run_extraction_eval
+    from rag_recipes.config import get_settings
+
+    settings = get_settings()
+    run = asyncio.run(
+        run_extraction_eval(
+            fixtures,
+            label,
+            llm_provider=_build_llm_provider(settings),
+            judge=judge,
+        )
+    )
+    typer.echo(f"report: {run.path}")
 
 
 @app.command("retrieval")

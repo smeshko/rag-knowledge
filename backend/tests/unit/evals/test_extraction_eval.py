@@ -11,8 +11,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+import evals.cli
+import evals.fixtures
+import evals.reports
 import pytest
+from evals.cli import app
 from evals.extraction import _build_synthetic_window, run_extraction_eval, synthetic_span_id
+from typer.testing import CliRunner
 
 from rag_recipes.ingestion.pipeline.extraction import (
     PROMPT_VERSION,
@@ -413,3 +418,53 @@ async def test_no_baseline_is_handled_without_error(tmp_path: Path) -> None:
         tmp_path, baseline_path=tmp_path / "baselines" / "extraction.json"
     )
     assert (run.path / "results.json").is_file()
+
+
+# --- CLI wiring (Epic 15 Phase 15.1 TASK-003) --------------------------------
+
+runner = CliRunner()
+
+
+class _CliSettingsStandIn(_SettingsStandIn):
+    """Extends the metadata stand-in with the soft-validation threshold fields."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.extraction_min_overall_confidence = 0.5
+        self.extraction_min_boundary_confidence = 0.5
+        self.extraction_min_normalization_confidence = 0.5
+        self.extraction_min_recipe_chars = 50
+        self.extraction_max_recipe_chars = 20_000
+
+
+def test_cli_extraction_runs_offline_with_injected_fake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixtures_root = tmp_path / "fixtures"
+    provider = _write_smoke_set(fixtures_root)
+    monkeypatch.setattr(evals.fixtures, "FIXTURES_ROOT", fixtures_root)
+    monkeypatch.setattr(evals.reports, "REPORTS_ROOT", tmp_path / "reports")
+    monkeypatch.setattr("rag_recipes.config.get_settings", _CliSettingsStandIn)
+    monkeypatch.setattr(evals.cli, "_build_llm_provider", lambda settings: provider)
+
+    result = runner.invoke(
+        app,
+        ["extraction", "--fixtures", "smoke", "--label", "smoke", "--judge", "completeness"],
+    )
+
+    assert result.exit_code == 0
+    assert "report: " in result.output
+    report_path = Path(result.output.split("report: ", 1)[1].strip())
+    assert report_path.parent == tmp_path / "reports"
+    assert (report_path / "results.json").is_file()
+    assert (report_path / "summary.md").is_file()
+
+
+def test_cli_extraction_help_shows_flags_as_options_not_positionals() -> None:
+    result = runner.invoke(app, ["extraction", "--help"])
+    assert result.exit_code == 0
+    for option in ("--fixtures", "--label", "--judge"):
+        assert option in result.output
+    # A bare-typed param would render as a positional metavar in the usage line.
+    assert "LABEL" not in result.output
+    assert "FIXTURES" not in result.output

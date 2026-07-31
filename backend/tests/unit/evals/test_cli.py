@@ -1,10 +1,11 @@
-"""Tests for the ``rag-evals`` CLI stubs (Epic 14 Phase 14.1).
+"""Tests for the ``rag-evals`` CLI shape (Epic 14 Phase 14.1, Epic 15).
 
-Every subcommand is a scaffold stub that prints ``not implemented yet`` and
-exits 0; real behaviour lands in Epics 15/16. These tests pin the CLI shape:
-the five hyphenated subcommand names, flag options (``--fixtures``,
-``--queries``, ``--k``, ``--judge``) vs the two positional ``diff`` arguments,
-and the ``--k`` default of 10.
+``extraction`` gained real behaviour in Epic 15 Phase 15.1 (covered offline in
+``test_extraction_eval.py``); the remaining subcommands are scaffold stubs that
+print ``not implemented yet`` and exit 0 until Epics 15/16 fill them in. These
+tests pin the CLI shape: the five hyphenated subcommand names, flag options
+(``--fixtures``, ``--label``, ``--queries``, ``--k``, ``--judge``) vs the two
+positional ``diff`` arguments, and the ``--k`` default of 10.
 """
 
 from __future__ import annotations
@@ -28,22 +29,14 @@ def test_help_lists_all_five_subcommands() -> None:
         assert name in result.output
 
 
-def test_extraction_stub_exits_zero_with_required_fixtures_flag() -> None:
-    result = runner.invoke(app, ["extraction", "--fixtures", "synthetic"])
-    assert result.exit_code == 0
-    assert "not implemented yet" in result.output
-
-
-def test_extraction_accepts_optional_judge_flag() -> None:
-    result = runner.invoke(
-        app, ["extraction", "--fixtures", "synthetic", "--judge", "extraction-judge"]
-    )
-    assert result.exit_code == 0
-    assert "not implemented yet" in result.output
-
-
 def test_extraction_without_required_fixtures_flag_fails() -> None:
-    result = runner.invoke(app, ["extraction"])
+    result = runner.invoke(app, ["extraction", "--label", "smoke"])
+    assert result.exit_code == 2
+
+
+def test_extraction_without_required_label_flag_fails() -> None:
+    # --label became a required option in Epic 15 Phase 15.1.
+    result = runner.invoke(app, ["extraction", "--fixtures", "synthetic"])
     assert result.exit_code == 2
 
 
