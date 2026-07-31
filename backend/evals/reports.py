@@ -374,7 +374,11 @@ class DiffResult(BaseModel):
 
 # Absolute tolerance for regression flagging (DECISIONS #5): suppresses LLM
 # nondeterminism / floating-point jitter so [REGRESSION] means a real drop.
+# Only a move *beyond* the tolerance counts, and binary floating point makes
+# nominally-exact boundary deltas overshoot (0.91 - 0.92 == -0.010000000000000009),
+# so the comparison carries a representation-error slack.
 _DIFF_TOLERANCE = 0.01
+_TOLERANCE_SLACK = 1e-9
 
 _COUNT_KEYS = ("fixtures", "recipes_extracted", "extraction_failures", "ready", "needs_review")
 
@@ -437,11 +441,12 @@ def _diff_extraction(
             flag = "missing"
         else:
             delta = current_value - baseline_value
+            threshold = _DIFF_TOLERANCE + _TOLERANCE_SLACK
             if direction == _DIRECTION_INFO:
                 flag = "info"
-            elif delta < -_DIFF_TOLERANCE:
+            elif delta < -threshold:
                 flag = FLAG_REGRESSION
-            elif delta > _DIFF_TOLERANCE:
+            elif delta > threshold:
                 flag = "improved"
             else:
                 flag = "unchanged"

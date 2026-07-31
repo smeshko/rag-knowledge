@@ -126,6 +126,29 @@ def test_improvement_and_sub_tolerance_moves_are_not_flagged(tmp_path: Path) -> 
     assert "No regressions detected." in result.summary
 
 
+@pytest.mark.parametrize(
+    ("baseline_value", "current_value"),
+    [(0.92, 0.91), (0.91, 0.92), (1.0, 0.99), (0.3, 0.29)],
+)
+def test_moves_of_exactly_the_tolerance_are_unchanged(
+    tmp_path: Path, baseline_value: float, current_value: float
+) -> None:
+    # 0.91 - 0.92 == -0.010000000000000009 in binary floating point, so a naive
+    # `delta < -0.01` flags a nominally on-tolerance move as a regression.
+    baseline = _write_baseline(tmp_path, _results(field_accuracy={"yield": baseline_value}))
+    run_dir = _write_run(tmp_path, _results(field_accuracy={"yield": current_value}))
+    result = diff_against_baseline(baseline, run_dir)
+    assert _change(result, "field_accuracy.yield")["flag"] == "unchanged"
+    assert result.status == "ok"
+
+
+def test_a_drop_just_beyond_the_tolerance_is_still_a_regression(tmp_path: Path) -> None:
+    baseline = _write_baseline(tmp_path, _results(field_accuracy={"yield": 0.92}))
+    run_dir = _write_run(tmp_path, _results(field_accuracy={"yield": 0.9}))
+    result = diff_against_baseline(baseline, run_dir)
+    assert _change(result, "field_accuracy.yield")["flag"] == FLAG_REGRESSION
+
+
 def test_counts_are_diffed_but_informational(tmp_path: Path) -> None:
     baseline = _write_baseline(tmp_path, _results(counts={"ready": 115, "needs_review": 3}))
     run_dir = _write_run(tmp_path, _results(counts={"ready": 100, "needs_review": 18}))
