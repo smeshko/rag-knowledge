@@ -637,10 +637,35 @@ def _validate_retrieval_payload(
     for field in ("run", "aggregate", "per_query"):
         if not isinstance(payload.get(field), dict):
             raise ValueError(f"{where}: {field!r} is missing or not an object")
+
+    run: dict[str, Any] = payload["run"]
+    for field in _COMPARABILITY_FIELDS:
+        if field not in run:
+            # Absent on *both* sides would compare equal and wave the runs
+            # through as comparable.
+            raise ValueError(f"{where}: run.{field} is missing")
+    for field in ("k", "limit"):
+        depth = run[field]
+        # `diff_retrieval` coerces with `int(...)`, which raises TypeError on a
+        # list — surfacing as exit 1, the regression code. A non-positive k
+        # also silences every rank-regression check, since each positive
+        # baseline rank then reads as already outside the top-k.
+        if isinstance(depth, bool) or not isinstance(depth, int):
+            raise ValueError(f"{where}: run.{field} is not an integer ({depth!r})")
+        if depth < 1:
+            raise ValueError(f"{where}: run.{field} is not positive ({depth!r})")
+
     aggregate: dict[str, Any] = payload["aggregate"]
     for measure, _ in _RETRIEVAL_METRIC_LABELS:
         _check_finite_metric(aggregate, measure, where)
+
     per_query: dict[str, Any] = payload["per_query"]
+    if not per_query:
+        # `run_retrieval_eval` cannot emit this — an empty fixture set is
+        # rejected up front — so it means truncation. With the aggregate left
+        # intact the diff would report `no_change` at exit 0 while every
+        # query had vanished.
+        raise ValueError(f"{where}: 'per_query' is empty")
     for query_id, entry in per_query.items():
         if not isinstance(entry, dict):
             raise ValueError(f"{where}: per_query[{query_id!r}] is not an object")
@@ -651,10 +676,15 @@ def _validate_retrieval_payload(
             )
         # Only NDCG@10 is read per query (the diff's per-query delta).
         _check_finite_metric(metrics, "ndcg_cut_10", f"{where}: per_query[{query_id!r}]")
-        ranks = entry.get("expected_item_ranks", {})
+        # Required, not defaulted: `_query_regressions` reads it through
+        # `.get(..., {})`, so an absent map fabricates dropped-item
+        # regressions on the current side and silently disables rank-drop
+        # detection on the baseline side.
+        ranks = entry.get("expected_item_ranks")
         if not isinstance(ranks, dict):
             raise ValueError(
-                f"{where}: per_query[{query_id!r}].expected_item_ranks is not an object"
+                f"{where}: per_query[{query_id!r}].expected_item_ranks "
+                f"is missing or not an object"
             )
         for item_id, rank in ranks.items():
             if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int)):

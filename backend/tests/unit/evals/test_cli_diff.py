@@ -141,6 +141,38 @@ def test_diff_of_incomparable_runs_exits_two_not_one(tmp_path: Path) -> None:
     assert "NDCG@10" in result.output  # the deltas are still printed
 
 
+def _mangle(payload: dict[str, Any], mutate: Any) -> dict[str, Any]:
+    mutate(payload)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate"),
+    [
+        ("missing aggregate", lambda p: p.pop("aggregate")),
+        ("empty per_query", lambda p: p.update(per_query={})),
+        ("run is a list", lambda p: p.update(run=[])),
+        ("k is a list", lambda p: p["run"].update(k=[])),
+        ("k is zero", lambda p: p["run"].update(k=0)),
+        ("mode missing", lambda p: p["run"].pop("mode")),
+        ("NaN metric", lambda p: p["aggregate"].update(ndcg_cut_10=float("nan"))),
+        (
+            "ranks missing",
+            lambda p: p["per_query"]["q1"].pop("expected_item_ranks"),
+        ),
+    ],
+)
+def test_malformed_retrieval_report_exits_two_without_a_traceback(
+    tmp_path: Path, case: str, mutate: Any
+) -> None:
+    baseline = _write_baseline(tmp_path, _payload(0.9, {"a": 1}))
+    report = _write_report(tmp_path, _mangle(_payload(0.9, {"a": 1}), mutate))
+    result = runner.invoke(app, ["diff", str(baseline), str(report)])
+    assert result.exit_code == 2, f"{case}: {result.output}"
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "malformed retrieval" in result.output
+
+
 def test_diff_of_a_failed_run_exits_two_not_zero(tmp_path: Path) -> None:
     payload = _payload(0.9, {"a": 1})
     baseline = _write_baseline(tmp_path, payload)

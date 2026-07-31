@@ -452,6 +452,49 @@ def test_null_expected_item_rank_stays_valid(tmp_path: Path) -> None:
     assert result.status == "regression"  # 'a' dropped out of the top-k
 
 
+def test_non_integer_k_is_refused_not_a_typeerror(tmp_path: Path) -> None:
+    # `int(k)` on a list raised TypeError, which the CLI surfaced as exit 1.
+    current = _payload({"q1": _query(0.9, {"a": 1})}, run=_run_block(k=[]))
+    with pytest.raises(ValueError, match="run.k is not an integer"):
+        _diff_with_current(tmp_path, current)
+
+
+@pytest.mark.parametrize("field", ["k", "limit"])
+def test_non_positive_run_depth_is_refused(tmp_path: Path, field: str) -> None:
+    # k <= 0 silences every rank-regression check: each positive baseline rank
+    # reads as already outside the top-k.
+    current = _payload({"q1": _query(0.9, {"a": 1})}, run=_run_block(**{field: 0}))
+    with pytest.raises(ValueError, match=f"run.{field} is not positive"):
+        _diff_with_current(tmp_path, current)
+
+
+@pytest.mark.parametrize("field", ["query_set", "mode", "reranking_enabled", "k"])
+def test_missing_comparability_field_is_refused(tmp_path: Path, field: str) -> None:
+    # Absent on both sides, these compare equal and wave incomparable runs
+    # through as comparable.
+    run = _run_block()
+    del run[field]
+    current = _payload({"q1": _query(0.9, {"a": 1})}, run=run)
+    with pytest.raises(ValueError, match=f"run.{field} is missing"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_empty_per_query_is_refused_not_reported_as_no_change(tmp_path: Path) -> None:
+    # Truncation: with the aggregate intact the diff read "no change" at exit 0
+    # while every query had vanished.
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["per_query"] = {}
+    with pytest.raises(ValueError, match="'per_query' is empty"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_missing_expected_item_ranks_is_refused(tmp_path: Path) -> None:
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    del current["per_query"]["q1"]["expected_item_ranks"]
+    with pytest.raises(ValueError, match="expected_item_ranks is missing"):
+        _diff_with_current(tmp_path, current)
+
+
 def test_malformed_json_raises_a_caller_facing_error(tmp_path: Path) -> None:
     baseline_file, report_dir = _write_pair(
         tmp_path,
