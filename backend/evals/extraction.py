@@ -28,12 +28,13 @@ computed over rated fixtures only.
       "results": {
         "fixture_set": str,
         "per_fixture": [            # one entry per fixture, keyed by name
-          {"name", "status": "scored", "review_status", "warnings",
-           "confidence_overall", "missing_fields", "scores": {...}},
+          {"name", "status": "scored", "recipes_returned", "review_status",
+           "warnings", "confidence_overall", "missing_fields", "scores": {...}},
           {"name", "status": "extraction_failed", "error"},
         ],
         "aggregate": {
           "fixtures", "recipes_extracted", "extraction_failures",
+          "over_split_fixtures",      # fixtures the extractor split into >1 item
           "ready", "needs_review", "average_confidence",
           "field_accuracy": {...},  # per-field means (None when ineligible)
           "missing_field_counts": {...},
@@ -294,6 +295,7 @@ def _render_summary(
         f"Fixture set: {fixture_set} ({aggregate['fixtures']} fixtures)",
         f"Recipes extracted: {aggregate['recipes_extracted']}",
         f"Extraction failures: {aggregate['extraction_failures']}",
+        f"Fixtures split across items: {aggregate['over_split_fixtures']}",
         f"Ready: {aggregate['ready']}",
         f"Needs review: {aggregate['needs_review']}",
         f"Average confidence: {fmt(aggregate['average_confidence'])}",
@@ -440,6 +442,8 @@ async def run_extraction_eval(
         ready = 0
         needs_review = 0
         extraction_failures = 0
+        recipes_extracted = 0
+        over_split = 0
 
         for fixture in fixtures:
             window = _build_synthetic_window(fixture.name, fixture.source_md)
@@ -452,6 +456,13 @@ async def run_extraction_eval(
                 if judge_section is not None:
                     judge_section.skip(fixture.name, "extraction failed")
                 continue
+            # Each synthetic fixture holds exactly one recipe (DECISIONS #1), so
+            # the first item is the one scored — but the *count* is recorded so
+            # an extractor that splits one recipe across items is visible in the
+            # report rather than silently collapsing to "1 recipe extracted".
+            recipes_extracted += len(recipes)
+            if len(recipes) > 1:
+                over_split += 1
             recipe = recipes[0]
             if judge_section is not None:
                 await judge_section.rate(fixture, recipe)
@@ -467,6 +478,7 @@ async def run_extraction_eval(
                 {
                     "name": fixture.name,
                     "status": "scored",
+                    "recipes_returned": len(recipes),
                     "review_status": "needs_review" if warnings else "ready",
                     "warnings": [warning.code for warning in warnings],
                     "confidence_overall": recipe.confidence.overall,
@@ -487,8 +499,9 @@ async def run_extraction_eval(
         )
         aggregate = {
             "fixtures": len(fixtures),
-            "recipes_extracted": len(fixtures) - extraction_failures,
+            "recipes_extracted": recipes_extracted,
             "extraction_failures": extraction_failures,
+            "over_split_fixtures": over_split,
             "ready": ready,
             "needs_review": needs_review,
             "average_confidence": _mean(confidences),

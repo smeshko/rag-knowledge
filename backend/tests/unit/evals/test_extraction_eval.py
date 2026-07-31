@@ -170,6 +170,36 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
     assert aggregate["average_confidence"] is None
 
 
+async def test_a_fixture_split_across_items_is_counted_not_collapsed(tmp_path: Path) -> None:
+    # Each synthetic fixture holds exactly one recipe, so an extractor that
+    # emits two items for it is a boundary failure the report must surface —
+    # not silently collapse to "1 recipe extracted".
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    split = stew_output()
+    split["items"].append(json.loads(json.dumps(split["items"][0])))
+    provider = FakeLLMProvider({request_hash("bean-stew", STEW_SOURCE): split})
+    run = await run_extraction_eval(
+        "smoke",
+        "split-eval",
+        llm_provider=provider,
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+    )
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    assert results["per_fixture"][0]["recipes_returned"] == 2
+    assert results["aggregate"]["recipes_extracted"] == 2
+    assert results["aggregate"]["fixtures"] == 1
+    assert results["aggregate"]["over_split_fixtures"] == 1
+    assert "Fixtures split across items: 1" in (run.path / "summary.md").read_text(
+        encoding="utf-8"
+    )
+
+
 async def test_explicit_nulls_in_expected_json_score_as_misses_not_a_crash(
     tmp_path: Path,
 ) -> None:

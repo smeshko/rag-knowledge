@@ -380,7 +380,14 @@ class DiffResult(BaseModel):
 _DIFF_TOLERANCE = 0.01
 _TOLERANCE_SLACK = 1e-9
 
-_COUNT_KEYS = ("fixtures", "recipes_extracted", "extraction_failures", "ready", "needs_review")
+_COUNT_KEYS = (
+    "fixtures",
+    "recipes_extracted",
+    "extraction_failures",
+    "over_split_fixtures",
+    "ready",
+    "needs_review",
+)
 
 _DIRECTION_HIGHER = "higher_is_better"
 _DIRECTION_INFO = "informational"
