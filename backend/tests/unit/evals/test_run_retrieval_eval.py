@@ -293,6 +293,32 @@ async def test_relevance_zero_qrels_are_not_expected_items(tmp_path: Path) -> No
     assert "item_soup" not in expected_line
 
 
+async def test_absent_query_set_is_rejected_not_scored_as_zero(tmp_path: Path) -> None:
+    # `load_query_fixtures` degrades an absent set to an empty one, so a
+    # typo'd --queries would otherwise write a complete report reading
+    # NDCG@10 0.0000 and be promotable to a baseline.
+    with pytest.raises(ValueError, match="empty query fixture set 'no-such-set'"):
+        class _Boom:
+            async def __call__(
+                self, query_text: str, *, mode: str, limit: int
+            ) -> dict[str, Any]:
+                raise AssertionError("search must not run for an absent query set")
+
+        settings = _SettingsStandIn()
+        await run_retrieval_eval(
+            "no-such-set",
+            k=10,
+            label="unit",
+            search=_Boom(),
+            report_factory=lambda label: ReportRun(
+                label, reports_root=tmp_path / "reports", settings=settings
+            ),
+            settings=settings,
+            fixtures_root=tmp_path / "fixtures",
+        )
+    assert not (tmp_path / "reports").exists()  # no report was written
+
+
 async def test_query_without_a_qrels_row_is_rejected(tmp_path: Path) -> None:
     # q2 would otherwise be searched and then silently dropped from per_query
     # and from the aggregate denominator, leaving the headline falsely perfect.

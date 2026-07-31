@@ -149,10 +149,19 @@ def _check_query_ids_align(
       searched, so it scores a permanent ``0.0`` and drags the headline down.
 
     Both are fixture bugs rather than retrieval signal, and neither is visible
-    in the report, so fail loudly before spending any search call. Two empty
-    sides stay the legitimate empty-dataset case ``load_query_fixtures``
-    allows.
+    in the report, so fail loudly before spending any search call. An entirely
+    empty set — what a typo'd set name degrades to — is rejected too.
     """
+    if not queries and not qrels:
+        # `load_query_fixtures` degrades an absent set to an empty one (Epic 14
+        # DECISIONS #4), which is harmless for a list loader but not here: a
+        # typo'd `--queries` name would search nothing and still write a
+        # complete report reading NDCG@10 0.0000 — indistinguishable from
+        # total retrieval failure, and promotable to a baseline.
+        raise ValueError(
+            f"empty query fixture set {query_set!r} — expected "
+            f"data/fixtures/queries/{query_set}/{{queries,qrels}}.tsv"
+        )
     query_ids = {query.query_id for query in queries}
     unjudged = sorted(query_ids - set(qrels))
     orphaned = sorted(set(qrels) - query_ids)
