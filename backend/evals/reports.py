@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -38,10 +39,12 @@ __all__ = [
     "RUN_STATUS_FAILED",
     "DiffResult",
     "ReportRun",
+    "RetrievalDiff",
     "RunMetadata",
     "SettingsLike",
     "build_metadata",
     "diff_against_baseline",
+    "diff_retrieval",
     "save_as_baseline",
 ]
 
@@ -323,10 +326,234 @@ class DiffResult(BaseModel):
     changes: list[dict[str, Any]] = []
 
 
-def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
-    """Skeleton diff: validates the inputs, returns a placeholder result.
+# --- retrieval regression diff (Epic 16 Phase 16.2) --------------------------
 
-    Real metric/field comparison is Epics 15/16 (doc 12 § 9). Missing inputs
+#: Display labels for the four retrieval measures, in headline order.
+_RETRIEVAL_METRIC_LABELS = (
+    ("ndcg_cut_10", "NDCG@10"),
+    ("recall_5", "Recall@5"),
+    ("recall_10", "Recall@10"),
+    ("recip_rank", "MRR"),
+)
+
+#: ``run``-block fields that make two runs incomparable when they differ
+#: (Epic 18's rerank stage changes item ordering materially).
+_COMPARABILITY_FIELDS = ("query_set", "mode", "reranking_enabled", "embedding_model")
+
+#: Per-query regression thresholds (fixed by the epic): an expected item that
+#: dropped out of the top-k, or whose rank worsened by at least this much.
+_RANK_DROP_THRESHOLD = 3
+
+
+@dataclass(frozen=True)
+class RetrievalDiff:
+    """Pure diff of two unwrapped retrieval results payloads.
+
+    ``diff_against_baseline`` projects this onto :class:`DiffResult`; keeping
+    the rich shape separate leaves ``DiffResult`` (shared with Epic 15)
+    untouched.
+    """
+
+    overall: dict[str, dict[str, float]]
+    per_query_ndcg_delta: dict[str, float]
+    added_query_ids: list[str]
+    removed_query_ids: list[str]
+    regressions: list[dict[str, Any]]
+    worst_queries: list[dict[str, Any]]
+    warnings: list[str]
+    headline: str
+    status: str
+
+
+def _unwrap(doc: dict[str, Any]) -> dict[str, Any]:
+    """Normalise either diff input to the inner results payload.
+
+    The two inputs are differently-shaped envelopes: a baseline file is
+    ``{"baseline_set_at", "run_label", "source": {"metadata", ..., "results"}}``
+    while a report's ``results.json`` is ``{"metadata", ..., "results"}`` —
+    and ``report_type`` lives *inside* the inner payload, so top-level reads
+    would silently dispatch nothing. A bare payload passes through unchanged.
+    """
+    if "baseline_set_at" in doc and isinstance(doc.get("source"), dict):
+        source = doc["source"]
+        results = source.get("results")
+        return results if isinstance(results, dict) else source
+    if "metadata" in doc and isinstance(doc.get("results"), dict):
+        results_doc: dict[str, Any] = doc["results"]
+        return results_doc
+    return doc
+
+
+def _headline_tag(delta: float, threshold: float) -> str:
+    # Strictly past the threshold tags; |delta| == threshold is "no change".
+    # The epsilon keeps float noise (0.595 - 0.600 != -0.005 exactly) from
+    # flipping the boundary case.
+    epsilon = 1e-9
+    if delta < -(threshold + epsilon):
+        return f"[REGRESSION {delta:+.2f}]"
+    if delta > threshold + epsilon:
+        return f"[IMPROVEMENT {delta:+.2f}]"
+    return "[no change]"
+
+
+def _query_regressions(
+    query_id: str,
+    baseline_ranks: dict[str, Any],
+    current_ranks: dict[str, Any],
+    *,
+    baseline_k: int,
+    current_k: int,
+) -> list[dict[str, Any]]:
+    """Flag expected items that left the top-k or dropped ≥ 3 ranks."""
+    entries: list[dict[str, Any]] = []
+    for item_id, baseline_rank in baseline_ranks.items():
+        if baseline_rank is None or baseline_rank > baseline_k:
+            continue  # was not in the baseline top-k: nothing to regress from
+        current_rank = current_ranks.get(item_id)
+        if current_rank is None or current_rank > current_k:
+            reason = "dropped_from_top_k"
+        elif current_rank - baseline_rank >= _RANK_DROP_THRESHOLD:
+            reason = "rank_drop"
+        else:
+            continue
+        entries.append(
+            {
+                "query_id": query_id,
+                "item_id": item_id,
+                "baseline_rank": baseline_rank,
+                "current_rank": current_rank,
+                "reason": reason,
+            }
+        )
+    return entries
+
+
+def diff_retrieval(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    headline_threshold: float = 0.005,
+    top_n: int = 5,
+) -> RetrievalDiff:
+    """Diff two **unwrapped** retrieval payloads; pure, no I/O.
+
+    Overall deltas are ``current − baseline`` per measure; per-query NDCG@10
+    deltas cover the baseline∩current query-id intersection (ids present in
+    only one run are reported as added/removed, never as a delta against
+    zero). The headline tags a metric only strictly past
+    ``headline_threshold``; per-query regression thresholds are fixed
+    (dropped from top-k, or rank-drop ≥ 3). A ``run``-block mismatch on
+    query_set / mode / reranking_enabled / embedding_model prepends a
+    prominent warning — such runs are not comparable.
+    """
+    baseline_run = baseline.get("run", {})
+    current_run = current.get("run", {})
+    warnings = [
+        f"WARNING: runs are not comparable — {field} differs "
+        f"(baseline={baseline_run.get(field)!r}, current={current_run.get(field)!r})"
+        for field in _COMPARABILITY_FIELDS
+        if baseline_run.get(field) != current_run.get(field)
+    ]
+
+    overall: dict[str, dict[str, float]] = {}
+    headline_lines = list(warnings)
+    tags: dict[str, str] = {}
+    for measure, label in _RETRIEVAL_METRIC_LABELS:
+        baseline_value = float(baseline.get("aggregate", {}).get(measure, 0.0))
+        current_value = float(current.get("aggregate", {}).get(measure, 0.0))
+        delta = current_value - baseline_value
+        overall[measure] = {
+            "baseline": baseline_value,
+            "current": current_value,
+            "delta": delta,
+        }
+        tag = _headline_tag(delta, headline_threshold)
+        tags[measure] = tag
+        headline_lines.append(f"{label}: {baseline_value:.2f} → {current_value:.2f} {tag}")
+
+    baseline_queries = baseline.get("per_query", {})
+    current_queries = current.get("per_query", {})
+    shared_ids = sorted(set(baseline_queries) & set(current_queries))
+    added = sorted(set(current_queries) - set(baseline_queries))
+    removed = sorted(set(baseline_queries) - set(current_queries))
+
+    per_query_ndcg_delta: dict[str, float] = {}
+    regressions: list[dict[str, Any]] = []
+    baseline_k = int(baseline_run.get("k", 10))
+    current_k = int(current_run.get("k", 10))
+    for query_id in shared_ids:
+        baseline_query = baseline_queries[query_id]
+        current_query = current_queries[query_id]
+        per_query_ndcg_delta[query_id] = float(
+            current_query["metrics"]["ndcg_cut_10"]
+        ) - float(baseline_query["metrics"]["ndcg_cut_10"])
+        regressions.extend(
+            _query_regressions(
+                query_id,
+                baseline_query.get("expected_item_ranks", {}),
+                current_query.get("expected_item_ranks", {}),
+                baseline_k=baseline_k,
+                current_k=current_k,
+            )
+        )
+
+    worst_queries = [
+        {"query_id": query_id, "delta": delta}
+        for query_id, delta in sorted(per_query_ndcg_delta.items(), key=lambda entry: entry[1])
+        if delta < 0
+    ][:top_n]
+
+    if regressions or any(tag.startswith("[REGRESSION") for tag in tags.values()):
+        status = "regression"
+    elif any(tag.startswith("[IMPROVEMENT") for tag in tags.values()):
+        status = "improvement"
+    else:
+        status = "no_change"
+
+    return RetrievalDiff(
+        overall=overall,
+        per_query_ndcg_delta=per_query_ndcg_delta,
+        added_query_ids=added,
+        removed_query_ids=removed,
+        regressions=regressions,
+        worst_queries=worst_queries,
+        warnings=warnings,
+        headline="\n".join(headline_lines),
+        status=status,
+    )
+
+
+def _render_retrieval_summary(diff: RetrievalDiff) -> str:
+    """The full printable diff block: headline, regressions, worst queries."""
+    lines = [diff.headline]
+    if diff.regressions:
+        lines += ["", "Per-query regressions:"]
+        lines += [
+            f"- {entry['query_id']}: {entry['item_id']} "
+            f"rank {entry['baseline_rank']} → {entry['current_rank']} ({entry['reason']})"
+            for entry in diff.regressions
+        ]
+    if diff.worst_queries:
+        lines += ["", "Biggest NDCG@10 drops:"]
+        lines += [
+            f"- {entry['query_id']}: {entry['delta']:+.4f}" for entry in diff.worst_queries
+        ]
+    if diff.added_query_ids:
+        lines += ["", f"Queries only in current run: {', '.join(diff.added_query_ids)}"]
+    if diff.removed_query_ids:
+        lines += ["", f"Queries only in baseline run: {', '.join(diff.removed_query_ids)}"]
+    return "\n".join(lines)
+
+
+def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
+    """Diff a report run against a committed baseline, dispatching by type.
+
+    The signature is asymmetric by design: ``baseline_path`` is a JSON
+    **file** (``save_as_baseline`` output) while ``current_report_path`` is a
+    report **directory** whose ``results.json`` is loaded. Both envelopes are
+    normalised via :func:`_unwrap` before dispatch on the inner payload's
+    ``report_type`` — retrieval pairs route to :func:`diff_retrieval`; other
+    types (extraction is Epic 15) keep the placeholder result. Missing inputs
     raise ``FileNotFoundError`` — a diff against a nonexistent baseline or
     report is a caller error, not a "no changes" result.
     """
@@ -334,6 +561,24 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
     if not current_report_path.exists():
         raise FileNotFoundError(f"report not found: {current_report_path}")
+    baseline_payload = _unwrap(
+        json.loads(baseline_path.read_text(encoding="utf-8"))
+    )
+    current_payload = _unwrap(
+        json.loads((current_report_path / "results.json").read_text(encoding="utf-8"))
+    )
+    if (
+        baseline_payload.get("report_type") == "retrieval"
+        and current_payload.get("report_type") == "retrieval"
+    ):
+        diff = diff_retrieval(baseline_payload, current_payload)
+        return DiffResult(
+            baseline_path=str(baseline_path),
+            current_path=str(current_report_path),
+            status=diff.status,
+            summary=_render_retrieval_summary(diff),
+            changes=diff.regressions,
+        )
     return DiffResult(
         baseline_path=str(baseline_path),
         current_path=str(current_report_path),

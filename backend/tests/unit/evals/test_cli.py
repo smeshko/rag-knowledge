@@ -74,12 +74,14 @@ def test_confidence_review_stub_takes_no_args_and_exits_zero() -> None:
 
 
 def test_diff_accepts_two_positional_paths_and_prints_placeholder(tmp_path: Path) -> None:
-    # Wired to the diff_against_baseline skeleton in Phase 14.2: both paths must
-    # exist; the command prints the placeholder summary and exits 0.
+    # Wired through diff_against_baseline (Phase 14.2 skeleton, Epic 16 real
+    # dispatch): both paths must exist and the report directory must hold a
+    # results.json. An untyped payload keeps the placeholder summary + exit 0.
     baseline = tmp_path / "b.json"
     baseline.write_text("{}")
     report_dir = tmp_path / "report"
     report_dir.mkdir()
+    (report_dir / "results.json").write_text("{}")
     result = runner.invoke(app, ["diff", str(baseline), str(report_dir)])
     assert result.exit_code == 0
     assert "not implemented" in result.output
