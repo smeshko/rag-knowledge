@@ -215,6 +215,27 @@ async def test_invalid_mode_raises_before_any_search_call(tmp_path: Path) -> Non
     assert list(tmp_path.iterdir()) == []  # no report dir was created either
 
 
+@pytest.mark.parametrize("k", [0, -1])
+async def test_non_positive_k_raises_before_any_search_call(tmp_path: Path, k: int) -> None:
+    class _Boom:
+        async def __call__(self, query_text: str, *, mode: str, limit: int) -> dict[str, Any]:
+            raise AssertionError("search must not be called for a non-positive k")
+
+    settings = _SettingsStandIn()
+    with pytest.raises(ValueError, match="invalid k"):
+        await run_retrieval_eval(
+            "tests",
+            k=k,
+            label="unit",
+            search=_Boom(),
+            report_factory=lambda label: ReportRun(
+                label, reports_root=tmp_path, settings=settings
+            ),
+            settings=settings,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
 def _write_fixture_set(tmp_path: Path, queries: str, qrels: str) -> Path:
     root = tmp_path / "fixtures"
     set_dir = root / "queries" / "skewed"

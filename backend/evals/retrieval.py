@@ -351,6 +351,12 @@ async def run_retrieval_eval(
     """
     if mode not in VALID_MODES:
         raise ValueError(f"invalid mode {mode!r}: expected one of {sorted(VALID_MODES)}")
+    if k < 1:
+        # k reaches a bare slice (`results[:k]`) and the diff's top-k cutoff:
+        # k=0 renders an empty breakdown and makes every expected item look
+        # dropped-from-top-k, and a negative k silently trims the *tail* of
+        # each result list instead of erroring.
+        raise ValueError(f"invalid k {k!r}: expected a positive integer")
     if settings is None:
         from rag_recipes.config import get_settings
 

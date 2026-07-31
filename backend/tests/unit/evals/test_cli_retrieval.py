@@ -79,6 +79,20 @@ def test_invalid_mode_exits_nonzero_before_running(
     assert result.exit_code == 2
 
 
+@pytest.mark.parametrize("k", ["0", "-1"])
+def test_non_positive_k_exits_two_before_running(
+    monkeypatch: pytest.MonkeyPatch, k: str
+) -> None:
+    # k reaches a bare `results[:k]` slice and the diff's top-k cutoff, so a
+    # negative k would silently trim each result list's tail.
+    async def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("run_retrieval_eval must not run for a non-positive k")
+
+    monkeypatch.setattr("evals.cli.run_retrieval_eval", boom)
+    result = runner.invoke(app, ["retrieval", "--queries", "tests", "--k", k])
+    assert result.exit_code == 2
+
+
 def test_missing_required_queries_flag_fails() -> None:
     result = runner.invoke(app, ["retrieval"])
     assert result.exit_code == 2

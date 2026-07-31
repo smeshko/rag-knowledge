@@ -46,7 +46,17 @@ def retrieval(
         str,
         typer.Option(help="Query fixture set under data/fixtures/queries/."),
     ],
-    k: Annotated[int, typer.Option(help="Rank cutoff for retrieval metrics.")] = 10,
+    k: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "Top-k cutoff for the per-query breakdown and the baseline "
+                "diff's dropped-from-top-k check, and the minimum search "
+                "depth. The metric set itself is fixed: NDCG@10, Recall@5, "
+                "Recall@10, MRR."
+            )
+        ),
+    ] = 10,
     mode: Annotated[
         str,
         typer.Option(help="Retrieval mode: hybrid, keyword, or vector."),
@@ -58,9 +68,9 @@ def retrieval(
 ) -> None:
     """Evaluate retrieval quality against golden queries/qrels (Epic 16).
 
-    Exits 2 for a bad input — an unknown mode, or a fixture set that is
-    missing, half-present, or whose queries.tsv and qrels.tsv disagree on
-    query ids.
+    Exits 2 for a bad input — an unknown mode, a non-positive ``--k``, or a
+    fixture set that is missing, half-present, or whose queries.tsv and
+    qrels.tsv disagree on query ids.
     """
     # Validated here as well as in the runner so a typo dies with a clean CLI
     # error before any Settings/search construction.
@@ -68,6 +78,9 @@ def retrieval(
         typer.echo(
             f"error: invalid mode {mode!r}: expected one of {sorted(VALID_MODES)}", err=True
         )
+        raise typer.Exit(2)
+    if k < 1:
+        typer.echo(f"error: invalid k {k!r}: expected a positive integer", err=True)
         raise typer.Exit(2)
     try:
         report = asyncio.run(
