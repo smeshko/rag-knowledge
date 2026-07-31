@@ -1,7 +1,8 @@
 # Local-only dev stack. Compose reads credentials from the project `.env`.
 
-# Pinned so the project keeps its pre-backend/ name — without this, compose
-# would derive "backend" from the directory and orphan the existing volumes.
+# Pinned to the original project name — the checkout directory is `backend`
+# (sibling of the separate frontend repo), which compose would otherwise use,
+# orphaning the existing volumes.
 name: rag-recipes
 
 services:
