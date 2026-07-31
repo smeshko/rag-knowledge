@@ -152,9 +152,27 @@ def judge_alignment(
 
 
 @app.command("confidence-review")
-def confidence_review() -> None:
-    """Review low-confidence extractions for judge calibration (Epic 15)."""
-    _not_implemented("confidence-review")
+def confidence_review(
+    report: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Extraction run directory to review "
+                "(default: the latest run under evals/reports/)."
+            )
+        ),
+    ] = None,
+) -> None:
+    """Review confidence calibration of the latest extraction eval (Epic 15)."""
+    from evals.calibration import _render_block, run_confidence_review
+
+    try:
+        result = run_confidence_review(report)
+    except FileNotFoundError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_render_block(result))
+    typer.echo(f"calibration recorded in: {result.report_path}")
 
 
 @app.command("diff")

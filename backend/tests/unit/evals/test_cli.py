@@ -69,10 +69,11 @@ def test_judge_alignment_requires_judge_and_fixtures_flags() -> None:
     assert result.exit_code == 2
 
 
-def test_confidence_review_stub_takes_no_args_and_exits_zero() -> None:
-    result = runner.invoke(app, ["confidence-review"])
-    assert result.exit_code == 0
-    assert "not implemented yet" in result.output
+def test_confidence_review_with_missing_report_dir_exits_with_error(tmp_path: Path) -> None:
+    # Real behaviour since Epic 15 Phase 15.3 (happy path is covered offline in
+    # test_calibration.py); a nonexistent run dir is a caller error.
+    result = runner.invoke(app, ["confidence-review", "--report", str(tmp_path / "missing")])
+    assert result.exit_code == 2
 
 
 def test_diff_accepts_two_positional_paths_and_prints_placeholder(tmp_path: Path) -> None:
