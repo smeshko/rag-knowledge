@@ -314,3 +314,59 @@ def test_extraction_typed_payload_is_not_routed_to_retrieval_diff(tmp_path: Path
 def test_missing_inputs_still_raise_file_not_found(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         diff_against_baseline(tmp_path / "missing.json", tmp_path)
+
+
+def test_report_directory_without_results_json_raises(tmp_path: Path) -> None:
+    baseline_file, report_dir = _write_pair(
+        tmp_path, _payload({"q1": _query(0.9, {"a": 1})}), _payload({})
+    )
+    (report_dir / "results.json").unlink()
+    with pytest.raises(FileNotFoundError, match="report results not found"):
+        diff_against_baseline(baseline_file, report_dir)
+
+
+def test_pointing_at_results_json_instead_of_its_directory_raises(tmp_path: Path) -> None:
+    # Previously died with an unhandled NotADirectoryError, which the CLI let
+    # through as exit 1 — indistinguishable from "a regression was found".
+    baseline_file, report_dir = _write_pair(
+        tmp_path,
+        _payload({"q1": _query(0.9, {"a": 1})}),
+        _payload({"q1": _query(0.9, {"a": 1})}),
+    )
+    with pytest.raises(FileNotFoundError, match="report directory not found"):
+        diff_against_baseline(baseline_file, report_dir / "results.json")
+
+
+def test_failed_run_is_refused_rather_than_diffed_clean(tmp_path: Path) -> None:
+    # A failed run keeps whatever partial payload it wrote; diffing it would
+    # report a confident "no change" over results that were never produced.
+    payload = _payload({"q1": _query(0.9, {"a": 1})})
+    baseline_file, report_dir = _write_pair(tmp_path, payload, payload)
+    doc = json.loads((report_dir / "results.json").read_text(encoding="utf-8"))
+    doc["status"] = "failed"
+    (report_dir / "results.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match="failed run"):
+        diff_against_baseline(baseline_file, report_dir)
+
+
+def test_report_type_mismatch_is_refused(tmp_path: Path) -> None:
+    # Retrieval baseline vs extraction report previously fell through to the
+    # placeholder and exited 0 — a silently green-passed invalid comparison.
+    baseline_file, report_dir = _write_pair(
+        tmp_path,
+        _payload({"q1": _query(0.9, {"a": 1})}),
+        {"report_type": "extraction", "results_by_fixture": {}},
+    )
+    with pytest.raises(ValueError, match="report type mismatch"):
+        diff_against_baseline(baseline_file, report_dir)
+
+
+def test_malformed_json_raises_a_caller_facing_error(tmp_path: Path) -> None:
+    baseline_file, report_dir = _write_pair(
+        tmp_path,
+        _payload({"q1": _query(0.9, {"a": 1})}),
+        _payload({"q1": _query(0.9, {"a": 1})}),
+    )
+    baseline_file.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed JSON"):
+        diff_against_baseline(baseline_file, report_dir)

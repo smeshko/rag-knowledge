@@ -130,6 +130,40 @@ def test_save_baseline_writes_named_baseline(
     assert doc["source"]["results"]["report_type"] == "retrieval"
 
 
+def test_diff_of_a_failed_run_exits_two_not_zero(tmp_path: Path) -> None:
+    payload = _payload(0.9, {"a": 1})
+    baseline = _write_baseline(tmp_path, payload)
+    report = _write_report(tmp_path, payload)
+    doc = json.loads((report / "results.json").read_text(encoding="utf-8"))
+    doc["status"] = "failed"
+    (report / "results.json").write_text(json.dumps(doc), encoding="utf-8")
+    result = runner.invoke(app, ["diff", str(baseline), str(report)])
+    assert result.exit_code == 2
+
+
+def test_diff_of_mismatched_report_types_exits_two(tmp_path: Path) -> None:
+    baseline = _write_baseline(tmp_path, _payload(0.9, {"a": 1}))
+    report = _write_report(tmp_path, {"report_type": "extraction", "results_by_fixture": {}})
+    result = runner.invoke(app, ["diff", str(baseline), str(report)])
+    assert result.exit_code == 2
+
+
+def test_diff_pointed_at_results_json_exits_two(tmp_path: Path) -> None:
+    payload = _payload(0.9, {"a": 1})
+    baseline = _write_baseline(tmp_path, payload)
+    report = _write_report(tmp_path, payload)
+    result = runner.invoke(app, ["diff", str(baseline), str(report / "results.json")])
+    assert result.exit_code == 2
+
+
+def test_save_baseline_pointed_at_results_json_exits_two(tmp_path: Path) -> None:
+    report = _write_report(tmp_path, _payload(0.9, {"a": 1}))
+    result = runner.invoke(
+        app, ["save-baseline", str(report / "results.json"), "--name", "retrieval"]
+    )
+    assert result.exit_code == 2
+
+
 def test_save_baseline_rejects_unsafe_name(tmp_path: Path) -> None:
     report = _write_report(tmp_path, _payload(0.9, {"a": 1}))
     result = runner.invoke(app, ["save-baseline", str(report), "--name", "../escape"])

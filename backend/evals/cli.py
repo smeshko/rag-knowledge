@@ -107,14 +107,15 @@ def diff(
 
     Retrieval reports print the per-metric headline, per-query regressions,
     and the biggest NDCG@10 drops, and exit 1 when a regression past the
-    threshold is found (extraction diffs land with Epic 15). Missing inputs
-    exit 2.
+    threshold is found (extraction diffs land with Epic 15). Exit 2 covers
+    every input error: missing paths, malformed JSON, a run finalized
+    ``failed``, or a ``report_type`` mismatch between the two sides.
     """
     from evals.reports import diff_against_baseline
 
     try:
         result = diff_against_baseline(baseline_path, new_report_path)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(result.summary)

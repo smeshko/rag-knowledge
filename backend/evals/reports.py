@@ -299,7 +299,12 @@ def save_as_baseline(
             f"of letters, digits, '.', '_' or '-'"
         )
     root = BASELINES_ROOT if baselines_root is None else baselines_root
-    source_doc = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
+    results_path = report_path / "results.json"
+    if not results_path.is_file():
+        # A report *directory* is the contract; pointing at results.json itself
+        # would otherwise die with an unhandled NotADirectoryError.
+        raise FileNotFoundError(f"report results not found: {results_path}")
+    source_doc = _load_json_object(results_path, "report")
     if source_doc.get("status") == RUN_STATUS_FAILED:
         raise ValueError(
             f"refusing to baseline a failed run: {report_path} "
@@ -381,6 +386,34 @@ def _unwrap(doc: dict[str, Any]) -> dict[str, Any]:
     if "metadata" in doc and isinstance(doc.get("results"), dict):
         results_doc: dict[str, Any] = doc["results"]
         return results_doc
+    return doc
+
+
+def _run_status(doc: dict[str, Any]) -> str | None:
+    """The finalized run status carried by either diff-input envelope shape.
+
+    ``_unwrap`` deliberately discards the envelope, but ``status`` is the one
+    envelope field the diff must not ignore: a run finalized as ``failed``
+    keeps whatever partial payload it had managed to write, so diffing it
+    would report a confident "no change" (or a fabricated regression) over
+    results that were never produced.
+    """
+    if "baseline_set_at" in doc and isinstance(doc.get("source"), dict):
+        doc = doc["source"]
+    status = doc.get("status")
+    return status if isinstance(status, str) else None
+
+
+def _load_json_object(path: Path, label: str) -> dict[str, Any]:
+    """Read a JSON **object** from ``path``, or raise a caller-facing ``ValueError``."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed JSON in {label} {path}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"expected a JSON object in {label} {path}, got {type(doc).__name__}"
+        )
     return doc
 
 
@@ -556,21 +589,41 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
     types (extraction is Epic 15) keep the placeholder result. Missing inputs
     raise ``FileNotFoundError`` — a diff against a nonexistent baseline or
     report is a caller error, not a "no changes" result.
+
+    Three further input errors raise instead of falling through to the
+    placeholder — each would otherwise be reported as a clean, exit-0 diff:
+    a run finalized ``failed`` on either side, a ``report_type`` mismatch
+    between the two sides, and malformed / non-object JSON.
     """
-    if not baseline_path.exists():
+    if not baseline_path.is_file():
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
-    if not current_report_path.exists():
-        raise FileNotFoundError(f"report not found: {current_report_path}")
-    baseline_payload = _unwrap(
-        json.loads(baseline_path.read_text(encoding="utf-8"))
-    )
-    current_payload = _unwrap(
-        json.loads((current_report_path / "results.json").read_text(encoding="utf-8"))
-    )
-    if (
-        baseline_payload.get("report_type") == "retrieval"
-        and current_payload.get("report_type") == "retrieval"
+    if not current_report_path.is_dir():
+        # A report *directory* is the contract; pointing at results.json
+        # itself would otherwise die with an unhandled NotADirectoryError.
+        raise FileNotFoundError(f"report directory not found: {current_report_path}")
+    results_path = current_report_path / "results.json"
+    if not results_path.is_file():
+        raise FileNotFoundError(f"report results not found: {results_path}")
+
+    baseline_doc = _load_json_object(baseline_path, "baseline")
+    current_doc = _load_json_object(results_path, "report")
+    for label, path, doc in (
+        ("baseline", baseline_path, baseline_doc),
+        ("report", results_path, current_doc),
     ):
+        if _run_status(doc) == RUN_STATUS_FAILED:
+            raise ValueError(f"refusing to diff a failed run: {label} {path}")
+
+    baseline_payload = _unwrap(baseline_doc)
+    current_payload = _unwrap(current_doc)
+    baseline_type = baseline_payload.get("report_type")
+    current_type = current_payload.get("report_type")
+    if baseline_type != current_type:
+        raise ValueError(
+            f"report type mismatch: baseline is {baseline_type!r}, "
+            f"report is {current_type!r}"
+        )
+    if baseline_type == "retrieval":
         diff = diff_retrieval(baseline_payload, current_payload)
         return DiffResult(
             baseline_path=str(baseline_path),
