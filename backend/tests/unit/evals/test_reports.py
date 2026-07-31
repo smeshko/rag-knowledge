@@ -298,7 +298,9 @@ def test_save_as_baseline_creates_baselines_root(tmp_path: Path) -> None:
 # --- diff_against_baseline --------------------------------------------------
 
 
-def test_diff_returns_not_implemented_placeholder(tmp_path: Path) -> None:
+def test_diff_of_identical_empty_results_reports_no_regressions(tmp_path: Path) -> None:
+    # The extraction diff itself is exercised in test_reports_diff.py; this
+    # pins the wiring: real DiffResult, real paths, no placeholder status.
     run = _run(tmp_path / "reports")
     run.write_results({})
     baseline = save_as_baseline(run.path, "extraction", baselines_root=tmp_path / "baselines")
@@ -306,11 +308,11 @@ def test_diff_returns_not_implemented_placeholder(tmp_path: Path) -> None:
     result = diff_against_baseline(baseline, run.path)
 
     assert isinstance(result, DiffResult)
-    assert result.status == "not_implemented"
+    assert result.status == "ok"
     assert result.baseline_path == str(baseline)
     assert result.current_path == str(run.path)
     assert result.changes == []
-    assert "not implemented" in result.summary
+    assert "No regressions" in result.summary
 
 
 def test_diff_missing_path_raises_file_not_found(tmp_path: Path) -> None:

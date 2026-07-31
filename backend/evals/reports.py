@@ -27,6 +27,7 @@ import math
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,7 @@ __all__ = [
     "build_metadata",
     "diff_against_baseline",
     "diff_retrieval",
+    "latest_run_dir",
     "save_as_baseline",
 ]
 
@@ -275,6 +277,49 @@ class ReportRun:
             self._write_doc(RUN_STATUS_COMPLETED)
 
 
+def latest_run_dir(reports_root: Path | None = None) -> Path | None:
+    """The most recent run directory under ``reports_root``, or ``None``.
+
+    Run directory names start with a colon-free ISO timestamp, so plain
+    lexicographic order is chronological. Dot-prefixed entries (e.g. the
+    ``.judge_cache`` directory) are not run dirs and are skipped.
+    """
+    root = REPORTS_ROOT if reports_root is None else reports_root
+    if not root.is_dir():
+        return None
+    candidates = sorted(
+        entry for entry in root.iterdir() if entry.is_dir() and not entry.name.startswith(".")
+    )
+    return candidates[-1] if candidates else None
+
+
+def _update_run_results(run_dir: Path, mutate: Callable[[dict[str, Any]], None]) -> Path:
+    """Read-modify-write an *existing* run's ``results.json`` (DECISIONS #7).
+
+    ``judge-alignment`` and ``confidence-review`` run after ``extraction``
+    against the run dir it created; constructing a ``ReportRun`` would mint a
+    new empty timestamped dir and orphan their sections. ``mutate`` receives
+    the ``results`` payload (inside the ``{"metadata", "results"}`` envelope)
+    and edits it in place; ``metadata``/``status`` and the sections other
+    phases own are preserved untouched.
+    """
+    path = run_dir / "results.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    mutate(doc["results"])
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _append_run_summary(run_dir: Path, block: str) -> Path:
+    """Append a block to an existing run's ``summary.md`` (creates it if absent)."""
+    path = run_dir / "summary.md"
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    path.write_text(existing + block.rstrip("\n") + "\n", encoding="utf-8")
+    return path
+
+
 def save_as_baseline(
     report_path: Path, baseline_name: str, *, baselines_root: Path | None = None
 ) -> Path:
@@ -323,13 +368,192 @@ def save_as_baseline(
 
 
 class DiffResult(BaseModel):
-    """Placeholder regression-diff result; Epics 15/16 fill ``changes``/metrics."""
+    """Regression-diff result shared by both diff paths (Epics 15 & 16).
+
+    The extraction path fills ``changes`` with per-metric delta dicts and sets
+    ``status`` to ``ok``/``regressions_detected``; the retrieval path projects
+    a :class:`RetrievalDiff` onto it (``changes`` carries the per-query
+    regression entries, ``status`` one of ``no_change``/``improvement``/
+    ``regression``/``incomparable``). The field set is fixed — callers fill
+    it, they do not reshape it.
+    """
 
     baseline_path: str
     current_path: str
     status: str = "not_implemented"
     summary: str
     changes: list[dict[str, Any]] = []
+
+
+# --- extraction regression diff (Epic 15 Phase 15.3) -------------------------
+
+# Absolute tolerance for regression flagging (DECISIONS #5): suppresses LLM
+# nondeterminism / floating-point jitter so [REGRESSION] means a real drop.
+# Only a move *beyond* the tolerance counts, and binary floating point makes
+# nominally-exact boundary deltas overshoot (0.91 - 0.92 == -0.010000000000000009),
+# so the comparison carries a representation-error slack.
+_DIFF_TOLERANCE = 0.01
+_TOLERANCE_SLACK = 1e-9
+
+_COUNT_KEYS = (
+    "fixtures",
+    "recipes_extracted",
+    "extraction_failures",
+    "hard_validation_failures",
+    "over_split_fixtures",
+    "ready",
+    "needs_review",
+)
+
+# Rate metrics that live in `aggregate` alongside the raw counts. Unlike the
+# counts they are quality signals, so they are regression-gated (DECISIONS #5).
+_RATE_KEYS = ("extraction_success_rate",)
+
+_DIRECTION_HIGHER = "higher_is_better"
+_DIRECTION_INFO = "informational"
+
+FLAG_REGRESSION = "[REGRESSION]"
+
+
+def _scalar_metrics(results: dict[str, Any]) -> dict[str, float | int | None]:
+    """Flatten an extraction ``results`` payload to its comparable scalar metrics.
+
+    Per-field objective accuracy (15.1), item counts (15.1), extraction
+    coverage (15.1), judge pass rate (15.2), and judge-human agreement (15.3).
+    Calibration is deliberately a review view, not a diffed metric (see
+    ``confidence-review``).
+    """
+    metrics: dict[str, float | int | None] = {}
+    aggregate = results.get("aggregate") or {}
+    for field, value in (aggregate.get("field_accuracy") or {}).items():
+        metrics[f"field_accuracy.{field}"] = value
+    for count_key in _COUNT_KEYS:
+        if count_key in aggregate:
+            metrics[f"count.{count_key}"] = aggregate[count_key]
+    for rate_key in _RATE_KEYS:
+        if rate_key in aggregate:
+            metrics[f"coverage.{rate_key}"] = aggregate[rate_key]
+    judge = results.get("judge") or {}
+    if judge:
+        metrics["judge.pass_rate"] = judge.get("pass_rate")
+    agreement = results.get("agreement") or {}
+    if agreement:
+        metrics["agreement.rate"] = agreement.get("agreement_rate")
+    return metrics
+
+
+def _metric_direction(metric: str) -> str:
+    return _DIRECTION_INFO if metric.startswith("count.") else _DIRECTION_HIGHER
+
+
+def _diff_extraction(
+    current: dict[str, Any], baseline: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Per-metric deltas between two unwrapped extraction ``results`` payloads.
+
+    Direction per DECISIONS #5: accuracy / pass-rate / agreement / coverage are
+    higher-is-better and flag ``[REGRESSION]`` on a drop beyond the tolerance;
+    counts are informational context. A metric on only one side never crashes,
+    but "absent" and "null" are deliberately *not* the same thing:
+
+    - the metric **key is absent** from this run — the step that produces it
+      never ran (no ``--judge``, no ``judge-alignment``) — ``missing``,
+      informational;
+    - the metric **key is present with a null value** — the step ran and
+      measured nothing (every extraction rejected, every judge call unrated) —
+      ``[REGRESSION]``, because that is a total loss of a quality signal the
+      baseline had, and calling it ``missing`` printed "No regressions
+      detected" for exactly the collapses this gate exists to catch.
+    """
+    current_metrics = _scalar_metrics(current)
+    baseline_metrics = _scalar_metrics(baseline)
+    changes: list[dict[str, Any]] = []
+    for metric in sorted(set(current_metrics) | set(baseline_metrics)):
+        baseline_value = baseline_metrics.get(metric)
+        current_value = current_metrics.get(metric)
+        direction = _metric_direction(metric)
+        delta: float | None = None
+        if baseline_value is None and current_value is None:
+            flag = "missing"
+        elif baseline_value is None:
+            flag = "new"
+        elif current_value is None:
+            # Present-but-null means the step ran and measured nothing.
+            flag = FLAG_REGRESSION if metric in current_metrics else "missing"
+        else:
+            delta = current_value - baseline_value
+            threshold = _DIFF_TOLERANCE + _TOLERANCE_SLACK
+            if direction == _DIRECTION_INFO:
+                flag = "info"
+            elif delta < -threshold:
+                flag = FLAG_REGRESSION
+            elif delta > threshold:
+                flag = "improved"
+            else:
+                flag = "unchanged"
+        changes.append(
+            {
+                "metric": metric,
+                "baseline": baseline_value,
+                "current": current_value,
+                "delta": delta,
+                "direction": direction,
+                "flag": flag,
+            }
+        )
+    return changes
+
+
+def _render_diff_summary(changes: list[dict[str, Any]]) -> str:
+    def fmt(value: float | int | None) -> str:
+        if value is None:
+            return "n/a"
+        if isinstance(value, int):
+            return str(value)
+        return f"{value:.2f}"
+
+    lines = ["Extraction diff vs baseline:"]
+    for change in changes:
+        rendered = f"{change['metric']}: {fmt(change['baseline'])} -> {fmt(change['current'])}"
+        if change["delta"] is not None and change["direction"] == _DIRECTION_HIGHER:
+            rendered += f" (delta {change['delta']:+.2f})"
+        if change["flag"] == FLAG_REGRESSION:
+            if change["current"] is None:
+                rendered += " (no longer measured)"
+            rendered = f"{FLAG_REGRESSION} {rendered}"
+        elif change["flag"] in ("new", "missing", "improved"):
+            rendered += f" ({change['flag']})"
+        lines.append(f"  {rendered}")
+    regressions = [change for change in changes if change["flag"] == FLAG_REGRESSION]
+    lines.append(
+        f"{len(regressions)} regression(s) detected."
+        if regressions
+        else "No regressions detected."
+    )
+    return "\n".join(lines)
+
+
+def _refuse_failed(doc: dict[str, Any], path: Path, kind: str) -> None:
+    """Refuse to diff a run finalized as ``failed`` (mirrors ``save_as_baseline``).
+
+    Shared by both diff paths (extraction and retrieval). A crashed run's
+    ``results`` is empty or partial, so every metric would unwrap to ``None``
+    (read as "missing", never a regression) or default to a fabricated zero —
+    and the diff would report a confident "no change" for a run that never
+    produced numbers. A false green here is worse than no diff at all. ``doc``
+    is either envelope shape — a baseline file or a report's ``results.json``
+    — and :func:`_run_status` digs the finalized status out of it.
+    """
+    if _run_status(doc) == RUN_STATUS_FAILED:
+        inner = (
+            doc["source"]
+            if "baseline_set_at" in doc and isinstance(doc.get("source"), dict)
+            else doc
+        )
+        raise ValueError(
+            f"refusing to diff a failed {kind}: {path} — a failed run's metrics "
+            f"were never produced (error: {inner.get('error', 'unknown')})"
+        )
 
 
 # --- retrieval regression diff (Epic 16 Phase 16.2) --------------------------
@@ -710,16 +934,17 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
     **file** (``save_as_baseline`` output) while ``current_report_path`` is a
     report **directory** whose ``results.json`` is loaded. Both envelopes are
     normalised via :func:`_unwrap` before dispatch on the inner payload's
-    ``report_type`` — retrieval pairs route to :func:`diff_retrieval`; other
-    types (extraction is Epic 15) keep the placeholder result. Missing inputs
-    raise ``FileNotFoundError`` — a diff against a nonexistent baseline or
-    report is a caller error, not a "no changes" result.
+    ``report_type`` — retrieval pairs route to :func:`diff_retrieval`;
+    extraction pairs (``report_type`` absent, as Epic 15 runs write, or
+    ``"extraction"``) route to :func:`_diff_extraction` (doc 12 § 9). Missing
+    inputs raise ``FileNotFoundError`` — a diff against a nonexistent baseline
+    or report is a caller error, not a "no changes" result.
 
-    Four further input errors raise instead of falling through to the
-    placeholder — each would otherwise be reported as a clean, exit-0 diff:
-    a run finalized ``failed`` on either side, a ``report_type`` mismatch
-    between the two sides, malformed / non-object JSON, and a retrieval
-    payload that fails :func:`_validate_retrieval_payload`.
+    Four further input errors raise ``ValueError`` instead of diffing — each
+    would otherwise be reported as a clean, exit-0 diff: a run finalized
+    ``failed`` on either side, a ``report_type`` mismatch between the two
+    sides, malformed / non-object JSON, and a retrieval payload that fails
+    :func:`_validate_retrieval_payload`.
     """
     if not baseline_path.is_file():
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
@@ -733,12 +958,8 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
 
     baseline_doc = _load_json_object(baseline_path, "baseline")
     current_doc = _load_json_object(results_path, "report")
-    for label, path, doc in (
-        ("baseline", baseline_path, baseline_doc),
-        ("report", results_path, current_doc),
-    ):
-        if _run_status(doc) == RUN_STATUS_FAILED:
-            raise ValueError(f"refusing to diff a failed run: {label} {path}")
+    _refuse_failed(baseline_doc, baseline_path, "baseline")
+    _refuse_failed(current_doc, results_path, "report")
 
     baseline_payload = _unwrap(baseline_doc)
     current_payload = _unwrap(current_doc)
@@ -760,8 +981,12 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
             summary=_render_retrieval_summary(diff),
             changes=diff.regressions,
         )
+    changes = _diff_extraction(current_payload, baseline_payload)
+    has_regressions = any(change["flag"] == FLAG_REGRESSION for change in changes)
     return DiffResult(
         baseline_path=str(baseline_path),
         current_path=str(current_report_path),
-        summary="diff not implemented yet — Epics 15/16 fill this in",
+        status="regressions_detected" if has_regressions else "ok",
+        summary=_render_diff_summary(changes),
+        changes=changes,
     )

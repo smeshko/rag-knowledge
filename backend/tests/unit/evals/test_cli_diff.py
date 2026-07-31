@@ -96,13 +96,16 @@ def test_clean_pair_exits_zero(tmp_path: Path) -> None:
     assert "[no change]" in result.output
 
 
-def test_extraction_pair_keeps_placeholder_path(tmp_path: Path) -> None:
+def test_extraction_pair_routes_to_extraction_diff(tmp_path: Path) -> None:
+    # An extraction-typed pair never reaches the retrieval differ — it routes
+    # to the extraction diff (Epic 15) and exits 0 when nothing regressed.
     extraction = {"report_type": "extraction", "results_by_fixture": {}}
     baseline = _write_baseline(tmp_path, extraction)
     report = _write_report(tmp_path, extraction)
     result = runner.invoke(app, ["diff", str(baseline), str(report)])
     assert result.exit_code == 0
-    assert "not implemented" in result.output
+    assert "Extraction diff vs baseline:" in result.output
+    assert "No regressions detected." in result.output
     assert "NDCG" not in result.output
 
 

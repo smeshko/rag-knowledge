@@ -327,10 +327,13 @@ def test_diff_against_baseline_no_change_pair(tmp_path: Path) -> None:
 
 
 def test_extraction_typed_payload_is_not_routed_to_retrieval_diff(tmp_path: Path) -> None:
+    # Routes to the extraction differ (Epic 15), never the retrieval one:
+    # no retrieval metrics appear and no retrieval validation is applied.
     extraction = {"report_type": "extraction", "results_by_fixture": {}}
     baseline_file, report_dir = _write_pair(tmp_path, extraction, extraction)
     result = diff_against_baseline(baseline_file, report_dir)
-    assert result.status == "not_implemented"
+    assert result.status == "ok"
+    assert "Extraction diff vs baseline:" in result.summary
     assert "NDCG" not in result.summary
 
 
