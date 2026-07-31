@@ -34,13 +34,17 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 __all__ = [
+    "DiffResult",
     "ReportRun",
     "RunMetadata",
     "SettingsLike",
     "build_metadata",
+    "diff_against_baseline",
+    "save_as_baseline",
 ]
 
 REPORTS_ROOT = Path(__file__).resolve().parents[1] / "evals" / "reports"
+BASELINES_ROOT = Path(__file__).resolve().parents[1] / "evals" / "baselines"
 
 
 class SettingsLike(Protocol):
@@ -197,3 +201,54 @@ class ReportRun:
     ) -> None:
         if not self._results_written:
             self.write_results({})
+
+
+def save_as_baseline(
+    report_path: Path, baseline_name: str, *, baselines_root: Path | None = None
+) -> Path:
+    """Copy a run's ``results.json`` into the committed baselines dir.
+
+    Fixed baseline shape: ``{"baseline_set_at": <ISO now>, "run_label": <from
+    the source metadata>, "source": <verbatim results.json doc>}`` — the header
+    keys sit at top level and the entire source doc is nested under ``source``,
+    so the copied provenance is never clobbered or duplicated by the header.
+    """
+    root = BASELINES_ROOT if baselines_root is None else baselines_root
+    source_doc = json.loads((report_path / "results.json").read_text())
+    baseline = {
+        "baseline_set_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "run_label": source_doc["metadata"]["run_label"],
+        "source": source_doc,
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{baseline_name}.json"
+    path.write_text(json.dumps(baseline, indent=2) + "\n")
+    return path
+
+
+class DiffResult(BaseModel):
+    """Placeholder regression-diff result; Epics 15/16 fill ``changes``/metrics."""
+
+    baseline_path: str
+    current_path: str
+    status: str = "not_implemented"
+    summary: str
+    changes: list[dict[str, Any]] = []
+
+
+def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
+    """Skeleton diff: validates the inputs, returns a placeholder result.
+
+    Real metric/field comparison is Epics 15/16 (doc 12 § 9). Missing inputs
+    raise ``FileNotFoundError`` — a diff against a nonexistent baseline or
+    report is a caller error, not a "no changes" result.
+    """
+    if not baseline_path.exists():
+        raise FileNotFoundError(f"baseline not found: {baseline_path}")
+    if not current_report_path.exists():
+        raise FileNotFoundError(f"report not found: {current_report_path}")
+    return DiffResult(
+        baseline_path=str(baseline_path),
+        current_path=str(current_report_path),
+        summary="diff not implemented yet — Epics 15/16 fill this in",
+    )

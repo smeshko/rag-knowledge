@@ -9,6 +9,8 @@ and the ``--k`` default of 10.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import click
 from evals.cli import app
 from typer.main import get_command
@@ -77,7 +79,19 @@ def test_confidence_review_stub_takes_no_args_and_exits_zero() -> None:
     assert "not implemented yet" in result.output
 
 
-def test_diff_stub_accepts_two_positional_paths_and_exits_zero() -> None:
-    result = runner.invoke(app, ["diff", "b.json", "r.json"])
+def test_diff_accepts_two_positional_paths_and_prints_placeholder(tmp_path: Path) -> None:
+    # Wired to the diff_against_baseline skeleton in Phase 14.2: both paths must
+    # exist; the command prints the placeholder summary and exits 0.
+    baseline = tmp_path / "b.json"
+    baseline.write_text("{}")
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    result = runner.invoke(app, ["diff", str(baseline), str(report_dir)])
     assert result.exit_code == 0
-    assert "not implemented yet" in result.output
+    assert "not implemented" in result.output
+
+
+def test_diff_missing_path_exits_with_error(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["diff", str(tmp_path / "missing.json"), str(tmp_path)])
+    assert result.exit_code == 2
+    assert "not implemented" not in result.output

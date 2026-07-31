@@ -69,8 +69,15 @@ def diff(
     baseline_path: Annotated[Path, typer.Argument(help="Committed baseline JSON file.")],
     new_report_path: Annotated[Path, typer.Argument(help="New report run directory.")],
 ) -> None:
-    """Diff a new report run against a committed baseline (Phase 14.2 + Epics 15/16)."""
-    _not_implemented("diff")
+    """Diff a new report run against a committed baseline (skeleton — Epics 15/16)."""
+    from evals.reports import diff_against_baseline
+
+    try:
+        result = diff_against_baseline(baseline_path, new_report_path)
+    except FileNotFoundError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(result.summary)
 
 
 if __name__ == "__main__":

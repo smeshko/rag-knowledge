@@ -17,7 +17,14 @@ from pathlib import Path
 
 import evals.reports
 import pytest
-from evals.reports import ReportRun, _git_commit, build_metadata
+from evals.reports import (
+    DiffResult,
+    ReportRun,
+    _git_commit,
+    build_metadata,
+    diff_against_baseline,
+    save_as_baseline,
+)
 
 RUN_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-")
 
@@ -155,6 +162,58 @@ def test_git_commit_returns_none_when_git_is_absent(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(evals.reports.subprocess, "run", _raise)
     assert _git_commit() is None
+
+
+# --- save_as_baseline -------------------------------------------------------
+
+
+def test_save_as_baseline_writes_fixed_shape(tmp_path: Path) -> None:
+    run = _run(tmp_path / "reports")
+    run.write_results({"accuracy": 0.9})
+    source_doc = json.loads((run.path / "results.json").read_text())
+
+    baseline_path = save_as_baseline(run.path, "extraction", baselines_root=tmp_path / "baselines")
+
+    assert baseline_path == tmp_path / "baselines" / "extraction.json"
+    baseline = json.loads(baseline_path.read_text())
+    # Header keys at top level; the verbatim source doc nested under "source".
+    assert set(baseline) == {"baseline_set_at", "run_label", "source"}
+    assert baseline["run_label"] == "extraction-gpt4-prompt-v3"
+    assert baseline["baseline_set_at"]
+    assert baseline["source"] == source_doc
+    assert baseline["source"]["metadata"]["run_label"] == "extraction-gpt4-prompt-v3"
+    assert baseline["source"]["results"] == {"accuracy": 0.9}
+
+
+def test_save_as_baseline_creates_baselines_root(tmp_path: Path) -> None:
+    run = _run(tmp_path / "reports")
+    run.write_results({})
+    baselines_root = tmp_path / "nested" / "baselines"
+    path = save_as_baseline(run.path, "extraction", baselines_root=baselines_root)
+    assert path.is_file()
+
+
+# --- diff_against_baseline --------------------------------------------------
+
+
+def test_diff_returns_not_implemented_placeholder(tmp_path: Path) -> None:
+    run = _run(tmp_path / "reports")
+    run.write_results({})
+    baseline = save_as_baseline(run.path, "extraction", baselines_root=tmp_path / "baselines")
+
+    result = diff_against_baseline(baseline, run.path)
+
+    assert isinstance(result, DiffResult)
+    assert result.status == "not_implemented"
+    assert result.baseline_path == str(baseline)
+    assert result.current_path == str(run.path)
+    assert result.changes == []
+    assert "not implemented" in result.summary
+
+
+def test_diff_missing_path_raises_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="baseline"):
+        diff_against_baseline(tmp_path / "missing.json", tmp_path)
 
 
 # --- module identity --------------------------------------------------------
