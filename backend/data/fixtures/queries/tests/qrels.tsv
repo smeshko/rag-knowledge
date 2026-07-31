@@ -1,0 +1,6 @@
+# Synthetic relevance judgements for the eval-harness unit tests (Epic 16).
+# query_id <TAB> knowledge_item_id <TAB> relevance
+# q1 deliberately has two qrels rows so tests cover the list -> dict fold.
+q1	item_soup	1
+q1	item_stew	1
+q2	item_basil	1

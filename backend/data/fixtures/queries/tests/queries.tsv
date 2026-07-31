@@ -1,0 +1,5 @@
+# Synthetic golden queries for the eval-harness unit tests (Epic 16).
+# query_id <TAB> query_text — item ids in qrels.tsv are synthetic and never
+# matched against a real corpus.
+q1	white bean soup
+q2	thai basil chicken
