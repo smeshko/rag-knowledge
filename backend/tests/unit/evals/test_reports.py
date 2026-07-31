@@ -20,6 +20,7 @@ import pytest
 from evals.reports import (
     DiffResult,
     ReportRun,
+    _create_run_dir,
     _git_commit,
     build_metadata,
     diff_against_baseline,
@@ -65,6 +66,29 @@ def test_unsafe_label_is_slugified(tmp_path: Path) -> None:
     for forbidden in (" ", ":", "/", "(", ")"):
         assert forbidden not in label_segment
     assert label_segment  # the label did not slugify away to nothing
+
+
+def test_colliding_run_dir_name_is_suffixed(tmp_path: Path) -> None:
+    # The dir name resolves only to the second, so same-label runs inside one
+    # second collide; each must still get its own directory.
+    first = _create_run_dir(tmp_path, "2026-05-22T12-30-00-extraction")
+    second = _create_run_dir(tmp_path, "2026-05-22T12-30-00-extraction")
+    third = _create_run_dir(tmp_path, "2026-05-22T12-30-00-extraction")
+    assert [p.name for p in (first, second, third)] == [
+        "2026-05-22T12-30-00-extraction",
+        "2026-05-22T12-30-00-extraction-2",
+        "2026-05-22T12-30-00-extraction-3",
+    ]
+
+
+def test_same_second_runs_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    first = _run(tmp_path)
+    second = _run(tmp_path)
+    assert first.path != second.path
+    first.write_results({"run": 1})
+    second.write_results({"run": 2})
+    assert json.loads((first.path / "results.json").read_text())["results"] == {"run": 1}
+    assert json.loads((second.path / "results.json").read_text())["results"] == {"run": 2}
 
 
 # --- file writes ------------------------------------------------------------

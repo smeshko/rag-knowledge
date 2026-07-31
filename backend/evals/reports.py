@@ -114,6 +114,28 @@ def _run_dir_name(timestamp: datetime, label: str) -> str:
     return f"{timestamp.strftime('%Y-%m-%dT%H-%M-%S')}-{_slugify(label)}"
 
 
+def _create_run_dir(root: Path, name: str) -> Path:
+    """Create a *fresh* run directory, disambiguating same-second collisions.
+
+    The directory name only resolves to the second, so two runs sharing a label
+    inside the same second (a retry, a loop over fixture sets, two concurrent
+    invocations) would otherwise land in one directory and overwrite each
+    other's ``results.json``. Claim the name with ``mkdir()`` — which is atomic
+    — and fall back to ``<name>-2``, ``<name>-3``, … on ``FileExistsError``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    candidate = root / name
+    attempt = 1
+    while True:
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            attempt += 1
+            candidate = root / f"{name}-{attempt}"
+        else:
+            return candidate
+
+
 def build_metadata(label: str, *, settings: SettingsLike | None = None) -> RunMetadata:
     """Capture run metadata; resolves the LLM model through the provider.
 
@@ -152,8 +174,10 @@ def build_metadata(label: str, *, settings: SettingsLike | None = None) -> RunMe
 class ReportRun:
     """A single evaluation run's output directory, usable as a context manager.
 
-    Creates ``<reports_root>/<ISO>-<slug(label)>/`` eagerly and captures
-    ``metadata`` once at construction. On context exit the run directory is
+    Creates ``<reports_root>/<ISO>-<slug(label)>/`` eagerly (with a ``-2``,
+    ``-3``, … suffix if that name is already taken, so a run never writes into
+    another run's directory) and captures ``metadata`` once at construction.
+    On context exit the run directory is
     guaranteed to hold a ``results.json`` carrying at least the metadata, even
     if the caller never called :meth:`write_results`. Exceptions are never
     swallowed.
@@ -169,8 +193,7 @@ class ReportRun:
         root = REPORTS_ROOT if reports_root is None else reports_root
         self.metadata = build_metadata(label, settings=settings)
         started_at = datetime.fromisoformat(self.metadata.timestamp)
-        self.path = root / _run_dir_name(started_at, label)
-        self.path.mkdir(parents=True, exist_ok=True)
+        self.path = _create_run_dir(root, _run_dir_name(started_at, label))
         self._results_written = False
 
     def write_summary(self, markdown: str) -> Path:
