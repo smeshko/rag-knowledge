@@ -154,6 +154,18 @@ def test_crashed_run_is_finalized_as_failed(tmp_path: Path) -> None:
     assert doc["results"] == {"accuracy": 0.9}  # partial results are kept, not erased
 
 
+def test_unserializable_results_do_not_mask_the_caller_error(tmp_path: Path) -> None:
+    # The payload that broke write_results is the same one __exit__ would retry;
+    # finalization must degrade instead of raising over the caller's exception.
+    run = _run(tmp_path)
+    with pytest.raises(TypeError), run:
+        run.write_results({"opaque": object()})
+    doc = json.loads((run.path / "results.json").read_text())
+    assert doc["status"] == "failed"
+    assert doc["error"] == "TypeError"
+    assert doc["results"] == {}
+
+
 def test_failed_run_cannot_be_promoted_to_a_baseline(tmp_path: Path) -> None:
     run = _run(tmp_path / "reports")
     with pytest.raises(RuntimeError), run:

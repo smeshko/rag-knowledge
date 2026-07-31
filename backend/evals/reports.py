@@ -258,7 +258,15 @@ class ReportRun:
         if exc_type is not None:
             # Keep whatever the caller managed to write, but mark the run failed:
             # an aborted eval must never look like a clean run with no findings.
-            self._write_doc(RUN_STATUS_FAILED, error=exc_type.__name__)
+            try:
+                self._write_doc(RUN_STATUS_FAILED, error=exc_type.__name__)
+            except (TypeError, ValueError):
+                # The retained payload is what could not be serialized. Drop it
+                # rather than raise out of __exit__ — an exception here would
+                # replace the caller's real exception *and* leave a stale
+                # results.json still claiming the run completed.
+                self._payload = {}
+                self._write_doc(RUN_STATUS_FAILED, error=exc_type.__name__)
         elif not self._results_written:
             self._write_doc(RUN_STATUS_COMPLETED)
 
