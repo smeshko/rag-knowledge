@@ -343,8 +343,9 @@ async def run_retrieval_eval(
 ) -> ReportRun:
     """Run the retrieval eval for ``query_set`` and write the report.
 
-    Validates ``mode`` before any search call, folds the list-shaped
-    ``QueryFixtureSet`` into pytrec_eval qrels, drives one search per query at
+    Validates ``mode``, ``k``, and the fixture set's query-id consistency
+    before any search call, folds the list-shaped ``QueryFixtureSet`` into
+    pytrec_eval qrels, drives one search per query at
     ``limit = max(k, settings.search_default_limit)``, and writes the payload
     ``{"report_type": "retrieval", "run": ..., "aggregate": ..., "per_query":
     ...}`` (nested by ``ReportRun.write_results`` under the ``"results"`` key).
