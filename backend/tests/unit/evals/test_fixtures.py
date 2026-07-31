@@ -78,6 +78,20 @@ def test_recipe_fixtures_multiple_sorted_by_name(tmp_path: Path) -> None:
     assert fixtures[1].notes == "tricky boundaries\n"
 
 
+def test_recipe_fixture_source_is_read_as_utf8(tmp_path: Path) -> None:
+    # Recipe sources are prose ("sauté", "crème brûlée", "180 °C") — the loader
+    # must not depend on the ambient locale encoding.
+    fixture_dir = tmp_path / "synthetic_recipes" / "synthetic" / "creme-brulee"
+    fixture_dir.mkdir(parents=True)
+    (fixture_dir / "source.md").write_text("Sauté, then bake at 180 °C.\n", encoding="utf-8")
+    (fixture_dir / "expected.json").write_text(
+        json.dumps({"title": "Crème brûlée"}, ensure_ascii=False), encoding="utf-8"
+    )
+    fixture = load_recipe_fixtures("synthetic", root=tmp_path)[0]
+    assert "Sauté" in fixture.source_md
+    assert fixture.expected == {"title": "Crème brûlée"}
+
+
 # --- load_query_fixtures ----------------------------------------------------
 
 

@@ -199,7 +199,7 @@ class ReportRun:
     def write_summary(self, markdown: str) -> Path:
         """Write ``summary.md``; returns its path."""
         path = self.path / "summary.md"
-        path.write_text(markdown)
+        path.write_text(markdown, encoding="utf-8")
         return path
 
     def write_results(self, results: dict[str, Any] | BaseModel) -> Path:
@@ -211,14 +211,14 @@ class ReportRun:
         payload = results.model_dump() if isinstance(results, BaseModel) else results
         doc = {"metadata": self.metadata.model_dump(), "results": payload}
         path = self.path / "results.json"
-        path.write_text(json.dumps(doc, indent=2) + "\n")
+        path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
         self._results_written = True
         return path
 
     def write_per_item_breakdowns(self, markdown: str) -> Path:
         """Write the optional ``per_item_breakdowns.md``; returns its path."""
         path = self.path / "per_item_breakdowns.md"
-        path.write_text(markdown)
+        path.write_text(markdown, encoding="utf-8")
         return path
 
     def __enter__(self) -> ReportRun:
@@ -245,7 +245,7 @@ def save_as_baseline(
     so the copied provenance is never clobbered or duplicated by the header.
     """
     root = BASELINES_ROOT if baselines_root is None else baselines_root
-    source_doc = json.loads((report_path / "results.json").read_text())
+    source_doc = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
     baseline = {
         "baseline_set_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "run_label": source_doc["metadata"]["run_label"],
@@ -253,7 +253,7 @@ def save_as_baseline(
     }
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{baseline_name}.json"
-    path.write_text(json.dumps(baseline, indent=2) + "\n")
+    path.write_text(json.dumps(baseline, indent=2) + "\n", encoding="utf-8")
     return path
 
 

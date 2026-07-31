@@ -54,7 +54,7 @@ def _read_tsv(path: Path, *, columns: int) -> list[list[str]]:
     if not path.is_file():
         return []
     rows: list[list[str]] = []
-    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -81,9 +81,9 @@ def load_recipe_fixtures(fixture_set: str, *, root: Path | None = None) -> list[
         fixtures.append(
             RecipeFixture(
                 name=fixture_dir.name,
-                source_md=(fixture_dir / "source.md").read_text(),
-                expected=json.loads((fixture_dir / "expected.json").read_text()),
-                notes=notes_path.read_text() if notes_path.is_file() else None,
+                source_md=(fixture_dir / "source.md").read_text(encoding="utf-8"),
+                expected=json.loads((fixture_dir / "expected.json").read_text(encoding="utf-8")),
+                notes=notes_path.read_text(encoding="utf-8") if notes_path.is_file() else None,
             )
         )
     return fixtures
@@ -135,7 +135,7 @@ def load_judge_prompt(name: str, *, root: Path | None = None) -> JudgePrompt:
     ``---`` front-matter fence) is parsed into ``version``; otherwise ``None``.
     """
     path = _resolve_root(root) / "judge_prompts" / f"{name}.md"
-    text = path.read_text()  # raises FileNotFoundError for a missing named prompt
+    text = path.read_text(encoding="utf-8")  # raises FileNotFoundError for a missing named prompt
     return JudgePrompt(name=name, version=_parse_version(text), text=text)
 
 
@@ -152,7 +152,7 @@ def load_judge_alignment(
     path = _resolve_root(root) / "judge_alignment" / f"{fixture_id}.json"
     if not path.is_file():
         return None
-    return JudgeAlignmentRecord.model_validate_json(path.read_text())
+    return JudgeAlignmentRecord.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def save_judge_alignment(record: JudgeAlignmentRecord, *, root: Path | None = None) -> Path:
@@ -160,5 +160,5 @@ def save_judge_alignment(record: JudgeAlignmentRecord, *, root: Path | None = No
     directory = _resolve_root(root) / "judge_alignment"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{record.fixture_id}.json"
-    path.write_text(record.model_dump_json(indent=2) + "\n")
+    path.write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
     return path
