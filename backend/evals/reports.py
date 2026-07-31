@@ -359,7 +359,11 @@ def save_as_baseline(
 
 
 class DiffResult(BaseModel):
-    """Placeholder regression-diff result; Epics 15/16 fill ``changes``/metrics."""
+    """Regression-diff result; the extraction branch fills ``changes`` (Epic 15).
+
+    Retrieval metrics join in Epic 16. The field set is fixed — downstream
+    phases fill it, they do not reshape it.
+    """
 
     baseline_path: str
     current_path: str
@@ -368,19 +372,148 @@ class DiffResult(BaseModel):
     changes: list[dict[str, Any]] = []
 
 
-def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
-    """Skeleton diff: validates the inputs, returns a placeholder result.
+# Absolute tolerance for regression flagging (DECISIONS #5): suppresses LLM
+# nondeterminism / floating-point jitter so [REGRESSION] means a real drop.
+_DIFF_TOLERANCE = 0.01
 
-    Real metric/field comparison is Epics 15/16 (doc 12 § 9). Missing inputs
-    raise ``FileNotFoundError`` — a diff against a nonexistent baseline or
-    report is a caller error, not a "no changes" result.
+_COUNT_KEYS = ("fixtures", "recipes_extracted", "extraction_failures", "ready", "needs_review")
+
+_DIRECTION_HIGHER = "higher_is_better"
+_DIRECTION_INFO = "informational"
+
+FLAG_REGRESSION = "[REGRESSION]"
+
+
+def _scalar_metrics(results: dict[str, Any]) -> dict[str, float | int | None]:
+    """Flatten an extraction ``results`` payload to its comparable scalar metrics.
+
+    Per-field objective accuracy (15.1), item counts (15.1), judge pass rate
+    (15.2), and judge-human agreement (15.3). Calibration is deliberately a
+    review view, not a diffed metric (see ``confidence-review``).
+    """
+    metrics: dict[str, float | int | None] = {}
+    aggregate = results.get("aggregate") or {}
+    for field, value in (aggregate.get("field_accuracy") or {}).items():
+        metrics[f"field_accuracy.{field}"] = value
+    for count_key in _COUNT_KEYS:
+        if count_key in aggregate:
+            metrics[f"count.{count_key}"] = aggregate[count_key]
+    judge = results.get("judge") or {}
+    if judge:
+        metrics["judge.pass_rate"] = judge.get("pass_rate")
+    agreement = results.get("agreement") or {}
+    if agreement:
+        metrics["agreement.rate"] = agreement.get("agreement_rate")
+    return metrics
+
+
+def _metric_direction(metric: str) -> str:
+    return _DIRECTION_INFO if metric.startswith("count.") else _DIRECTION_HIGHER
+
+
+def _diff_extraction(
+    current: dict[str, Any], baseline: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Per-metric deltas between two unwrapped extraction ``results`` payloads.
+
+    Direction per DECISIONS #5: accuracy / pass-rate / agreement are
+    higher-is-better and flag ``[REGRESSION]`` on a drop beyond the tolerance;
+    counts are informational context. A metric present on only one side is
+    ``new`` / ``missing`` — never a regression, never a crash.
+    """
+    current_metrics = _scalar_metrics(current)
+    baseline_metrics = _scalar_metrics(baseline)
+    changes: list[dict[str, Any]] = []
+    for metric in sorted(set(current_metrics) | set(baseline_metrics)):
+        baseline_value = baseline_metrics.get(metric)
+        current_value = current_metrics.get(metric)
+        direction = _metric_direction(metric)
+        delta: float | None = None
+        if baseline_value is None and current_value is None:
+            flag = "missing"
+        elif baseline_value is None:
+            flag = "new"
+        elif current_value is None:
+            flag = "missing"
+        else:
+            delta = current_value - baseline_value
+            if direction == _DIRECTION_INFO:
+                flag = "info"
+            elif delta < -_DIFF_TOLERANCE:
+                flag = FLAG_REGRESSION
+            elif delta > _DIFF_TOLERANCE:
+                flag = "improved"
+            else:
+                flag = "unchanged"
+        changes.append(
+            {
+                "metric": metric,
+                "baseline": baseline_value,
+                "current": current_value,
+                "delta": delta,
+                "direction": direction,
+                "flag": flag,
+            }
+        )
+    return changes
+
+
+def _render_diff_summary(changes: list[dict[str, Any]]) -> str:
+    def fmt(value: float | int | None) -> str:
+        if value is None:
+            return "n/a"
+        if isinstance(value, int):
+            return str(value)
+        return f"{value:.2f}"
+
+    lines = ["Extraction diff vs baseline:"]
+    for change in changes:
+        rendered = f"{change['metric']}: {fmt(change['baseline'])} -> {fmt(change['current'])}"
+        if change["delta"] is not None and change["direction"] == _DIRECTION_HIGHER:
+            rendered += f" (delta {change['delta']:+.2f})"
+        if change["flag"] == FLAG_REGRESSION:
+            rendered = f"{FLAG_REGRESSION} {rendered}"
+        elif change["flag"] in ("new", "missing", "improved"):
+            rendered += f" ({change['flag']})"
+        lines.append(f"  {rendered}")
+    regressions = [change for change in changes if change["flag"] == FLAG_REGRESSION]
+    lines.append(
+        f"{len(regressions)} regression(s) detected."
+        if regressions
+        else "No regressions detected."
+    )
+    return "\n".join(lines)
+
+
+def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
+    """Diff a run's extraction metrics against a committed baseline (doc 12 § 9).
+
+    ``current_report_path`` is the run *directory* (mirroring
+    ``save_as_baseline``, which reads ``report_path / "results.json"``). The two
+    inputs are wrapped differently and are unwrapped before comparing:
+    ``current = doc["results"]`` (the ``{"metadata", "results"}`` envelope) but
+    ``baseline = doc["source"]["results"]`` (``save_as_baseline`` nests the
+    whole results document under ``source``). Missing inputs raise
+    ``FileNotFoundError`` — a diff against a nonexistent baseline or report is
+    a caller error, not a "no changes" result.
     """
     if not baseline_path.exists():
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
     if not current_report_path.exists():
         raise FileNotFoundError(f"report not found: {current_report_path}")
+    current_results_path = current_report_path / "results.json"
+    if not current_results_path.is_file():
+        raise FileNotFoundError(f"report results not found: {current_results_path}")
+    current_doc = json.loads(current_results_path.read_text(encoding="utf-8"))
+    baseline_doc = json.loads(baseline_path.read_text(encoding="utf-8"))
+    current = current_doc.get("results") or {}
+    baseline = (baseline_doc.get("source") or {}).get("results") or {}
+    changes = _diff_extraction(current, baseline)
+    has_regressions = any(change["flag"] == FLAG_REGRESSION for change in changes)
     return DiffResult(
         baseline_path=str(baseline_path),
         current_path=str(current_report_path),
-        summary="diff not implemented yet — Epics 15/16 fill this in",
+        status="regressions_detected" if has_regressions else "ok",
+        summary=_render_diff_summary(changes),
+        changes=changes,
     )
