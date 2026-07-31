@@ -134,6 +134,40 @@ def _fold_qrels(qrels: list[Any]) -> dict[str, dict[str, int]]:
     return folded
 
 
+def _check_query_ids_align(
+    query_set: str, queries: list[Any], qrels: dict[str, dict[str, int]]
+) -> None:
+    """Reject a fixture set whose ``queries.tsv`` and ``qrels.tsv`` disagree.
+
+    Metrics aggregate over the **qrels** query ids (DECISIONS #5), so the two
+    sides diverge silently and in opposite directions:
+
+    - a query with no qrels row is searched, then dropped from ``per_query``
+      and from the aggregate denominator entirely — a hard, unjudged query
+      vanishes while the headline stays falsely perfect;
+    - a qrels row naming a query id that ``queries.tsv`` never lists is never
+      searched, so it scores a permanent ``0.0`` and drags the headline down.
+
+    Both are fixture bugs rather than retrieval signal, and neither is visible
+    in the report, so fail loudly before spending any search call. Two empty
+    sides stay the legitimate empty-dataset case ``load_query_fixtures``
+    allows.
+    """
+    query_ids = {query.query_id for query in queries}
+    unjudged = sorted(query_ids - set(qrels))
+    orphaned = sorted(set(qrels) - query_ids)
+    if not unjudged and not orphaned:
+        return
+    problems = []
+    if unjudged:
+        problems.append(f"queries with no qrels row: {', '.join(unjudged)}")
+    if orphaned:
+        problems.append(f"qrels rows for unknown query ids: {', '.join(orphaned)}")
+    raise ValueError(
+        f"inconsistent query fixture set {query_set!r} — {'; '.join(problems)}"
+    )
+
+
 #: The merged ``RetrievalDebugInfo`` keys (``api/schemas/search.py``) — the
 #: only keys the per-query debug section may render. ``filters_applied`` and
 #: ``chunk_type_boosts`` do not exist on the wire schema.
@@ -315,6 +349,7 @@ async def run_retrieval_eval(
 
     fixture_set = load_query_fixtures(query_set, root=fixtures_root)
     qrels = _fold_qrels(fixture_set.qrels)
+    _check_query_ids_align(query_set, fixture_set.queries, qrels)
     limit = max(k, settings.search_default_limit)
 
     # Collect the *full* result objects per query (DECISIONS #4, Phase 16.2):

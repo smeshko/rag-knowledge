@@ -213,3 +213,47 @@ async def test_invalid_mode_raises_before_any_search_call(tmp_path: Path) -> Non
             settings=settings,
         )
     assert list(tmp_path.iterdir()) == []  # no report dir was created either
+
+
+def _write_fixture_set(tmp_path: Path, queries: str, qrels: str) -> Path:
+    root = tmp_path / "fixtures"
+    set_dir = root / "queries" / "skewed"
+    set_dir.mkdir(parents=True)
+    (set_dir / "queries.tsv").write_text(queries, encoding="utf-8")
+    (set_dir / "qrels.tsv").write_text(qrels, encoding="utf-8")
+    return root
+
+
+async def _run_skewed(tmp_path: Path, queries: str, qrels: str) -> None:
+    class _Boom:
+        async def __call__(self, query_text: str, *, mode: str, limit: int) -> dict[str, Any]:
+            raise AssertionError("search must not run on an inconsistent fixture set")
+
+    settings = _SettingsStandIn()
+    await run_retrieval_eval(
+        "skewed",
+        k=10,
+        label="unit",
+        search=_Boom(),
+        report_factory=lambda label: ReportRun(
+            label, reports_root=tmp_path / "reports", settings=settings
+        ),
+        settings=settings,
+        fixtures_root=_write_fixture_set(tmp_path, queries, qrels),
+    )
+
+
+async def test_query_without_a_qrels_row_is_rejected(tmp_path: Path) -> None:
+    # q2 would otherwise be searched and then silently dropped from per_query
+    # and from the aggregate denominator, leaving the headline falsely perfect.
+    with pytest.raises(ValueError, match="queries with no qrels row: q2"):
+        await _run_skewed(tmp_path, "q1\tsoup\nq2\tcurry\n", "q1\titem_soup\t1\n")
+
+
+async def test_qrels_row_for_an_unknown_query_id_is_rejected(tmp_path: Path) -> None:
+    # q9 is never searched, so it would score a permanent 0.0 and drag the
+    # headline down for a fixture typo.
+    with pytest.raises(ValueError, match="qrels rows for unknown query ids: q9"):
+        await _run_skewed(
+            tmp_path, "q1\tsoup\n", "q1\titem_soup\t1\nq9\titem_ghost\t1\n"
+        )

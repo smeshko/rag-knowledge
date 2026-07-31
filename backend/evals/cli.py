@@ -56,7 +56,12 @@ def retrieval(
         typer.Option(help="Run label used in the report directory name."),
     ] = "retrieval",
 ) -> None:
-    """Evaluate retrieval quality against golden queries/qrels (Epic 16)."""
+    """Evaluate retrieval quality against golden queries/qrels (Epic 16).
+
+    Exits 2 for a bad input — an unknown mode, or a fixture set that is
+    missing, half-present, or whose queries.tsv and qrels.tsv disagree on
+    query ids.
+    """
     # Validated here as well as in the runner so a typo dies with a clean CLI
     # error before any Settings/search construction.
     if mode not in VALID_MODES:
@@ -64,7 +69,15 @@ def retrieval(
             f"error: invalid mode {mode!r}: expected one of {sorted(VALID_MODES)}", err=True
         )
         raise typer.Exit(2)
-    report = asyncio.run(run_retrieval_eval(query_set=queries, k=k, label=label, mode=mode))
+    try:
+        report = asyncio.run(
+            run_retrieval_eval(query_set=queries, k=k, label=label, mode=mode)
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        # Fixture problems are caller errors, not eval results: surface them as
+        # exit 2 instead of an unhandled traceback exiting 1.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     typer.echo(str(report.path))
 
 
