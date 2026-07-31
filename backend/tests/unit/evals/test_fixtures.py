@@ -132,6 +132,27 @@ def test_query_fixtures_half_present_set_raises(tmp_path: Path, present: str) ->
         load_query_fixtures("golden", root=tmp_path)
 
 
+def test_query_fixtures_one_empty_file_raises(tmp_path: Path) -> None:
+    # Present but comment-only: same false-zero regression as an absent file.
+    _write_queries(tmp_path, "golden", "# query_id\tquery_text\n", "q1\tki_01\t1\n")
+    with pytest.raises(ValueError, match="queries.tsv has no rows"):
+        load_query_fixtures("golden", root=tmp_path)
+
+
+def test_query_fixtures_both_empty_files_yield_empty_set(tmp_path: Path) -> None:
+    _write_queries(tmp_path, "golden", "", "")
+    fixture_set = load_query_fixtures("golden", root=tmp_path)
+    assert fixture_set.queries == []
+    assert fixture_set.qrels == []
+
+
+def test_query_fixtures_duplicate_query_id_raises(tmp_path: Path) -> None:
+    # Consumers key queries by id, so a duplicate silently drops one query.
+    _write_queries(tmp_path, "golden", "q1\tpasta\nq1\tvegan pasta\n", "q1\tki_01\t1\n")
+    with pytest.raises(ValueError, match="duplicate query_id"):
+        load_query_fixtures("golden", root=tmp_path)
+
+
 def test_query_fixtures_malformed_row_raises(tmp_path: Path) -> None:
     _write_queries(tmp_path, "broken", "q1\tonly\textra\n", "")
     with pytest.raises(ValueError, match="expected 2 tab-separated fields"):

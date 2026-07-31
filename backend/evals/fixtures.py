@@ -96,7 +96,11 @@ def load_query_fixtures(fixture_set: str, *, root: Path | None = None) -> QueryF
     A *half*-present set raises: retrieval metrics aggregate over the qrels
     query ids, so qrels without their queries would score every query ``0.0``
     and report a total regression that is really just a missing file — and
-    queries without qrels would silently measure nothing.
+    queries without qrels would silently measure nothing. The same holds when a
+    file is present but parses to no rows, and for a duplicated ``query_id``
+    (consumers fold queries into a dict keyed by id, so a duplicate silently
+    drops one query's text). Both sides empty stays the legitimate
+    empty-dataset case.
     """
     set_dir = _resolve_root(root) / "queries" / fixture_set
     queries_path = set_dir / "queries.tsv"
@@ -112,6 +116,13 @@ def load_query_fixtures(fixture_set: str, *, root: Path | None = None) -> QueryF
         Qrel(query_id=query_id, knowledge_item_id=item_id, relevance=int(relevance))
         for query_id, item_id, relevance in _read_tsv(qrels_path, columns=3)
     ]
+    if bool(queries) != bool(qrels):
+        empty = "queries.tsv" if not queries else "qrels.tsv"
+        raise ValueError(f"incomplete query fixture set {fixture_set!r}: {empty} has no rows")
+    query_ids = [query.query_id for query in queries]
+    duplicates = sorted({query_id for query_id in query_ids if query_ids.count(query_id) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate query_id(s) in {queries_path}: {', '.join(duplicates)}")
     return QueryFixtureSet(name=fixture_set, queries=queries, qrels=qrels)
 
 
