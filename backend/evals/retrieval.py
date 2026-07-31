@@ -110,6 +110,93 @@ def _fold_qrels(qrels: list[Any]) -> dict[str, dict[str, int]]:
     return folded
 
 
+#: The merged ``RetrievalDebugInfo`` keys (``api/schemas/search.py``) — the
+#: only keys the per-query debug section may render. ``filters_applied`` and
+#: ``chunk_type_boosts`` do not exist on the wire schema.
+_DEBUG_KEYS = (
+    "retrieval_mode",
+    "normalized_query",
+    "embedding_model",
+    "keyword_top_k",
+    "vector_top_k",
+    "keyword_candidates",
+    "vector_candidates",
+    "merged_candidates",
+    "grouped_items",
+    "rerank_applied",
+)
+
+
+def _chunk_types(result: dict[str, Any]) -> str:
+    """Comma-join the matched chunk types, first-occurrence order, de-duplicated."""
+    seen: dict[str, None] = {}
+    for chunk in result.get("matched_chunks", []):
+        seen.setdefault(chunk["chunk_type"], None)
+    return ", ".join(seen) or "—"
+
+
+def _result_score(result: dict[str, Any]) -> str:
+    """``max(matched_chunks[].score)`` — the envelope has no item-level score."""
+    scores = [chunk["score"] for chunk in result.get("matched_chunks", [])]
+    return f"{max(scores):.4f}" if scores else "—"
+
+
+def _citations(result: dict[str, Any]) -> str:
+    labels = [citation["label"] for citation in result.get("source_citations", [])]
+    return "; ".join(labels) or "—"
+
+
+def _render_per_query_md(
+    *,
+    run_block: dict[str, Any],
+    query_records: list[dict[str, Any]],
+    qrels: dict[str, dict[str, int]],
+    k: int,
+) -> str:
+    """Per-query breakdown: query text, expected items, top-k table, debug.
+
+    The ``score`` column is ``max(matched_chunks[].score)`` — merged Epic 13
+    projects no item-level score into the API envelope. The ``debug`` section
+    is rendered only when the envelope carried the key (``envelope.get`` —
+    merged ``routes/search.py`` pops it entirely when gating is off) and only
+    with keys that exist on the merged ``RetrievalDebugInfo`` schema.
+    """
+    rerank_state = "on" if run_block["reranking_enabled"] else "off"
+    lines = [
+        "# Per-query retrieval breakdown",
+        "",
+        f"Query set: `{run_block['query_set']}` · mode: `{run_block['mode']}` · "
+        f"k={k} · reranking: {rerank_state}",
+        "",
+        "`score` is `max(matched_chunks[].score)` — the search envelope exposes no "
+        "item-level fused score.",
+    ]
+    for record in query_records:
+        expected = qrels.get(record["query_id"], {})
+        expected_ids = ", ".join(f"`{item_id}`" for item_id in expected) or "—"
+        lines += [
+            "",
+            f"## {record['query_id']} — \"{record['query_text']}\"",
+            "",
+            f"Expected items (qrels): {expected_ids}",
+            "",
+            "| rank | item_id | score | matched chunk types | citations |",
+            "|---|---|---|---|---|",
+        ]
+        for rank, result in enumerate(record["results"][:k], start=1):
+            lines.append(
+                f"| {rank} | {result['item']['id']} | {_result_score(result)} "
+                f"| {_chunk_types(result)} | {_citations(result)} |"
+            )
+        debug = record["debug"]
+        if debug is not None:
+            lines += ["", "### Debug", ""]
+            lines += [
+                f"- {key}: {debug[key]}" for key in _DEBUG_KEYS if key in debug
+            ]
+    return "\n".join(lines) + "\n"
+
+
 def _expected_item_ranks(
     expected: dict[str, int], retrieved_ids: list[str]
 ) -> dict[str, int | None]:
@@ -207,12 +294,24 @@ async def run_retrieval_eval(
     qrels = _fold_qrels(fixture_set.qrels)
     limit = max(k, settings.search_default_limit)
 
-    retrieved_ids: dict[str, list[str]] = {}
+    # Collect the *full* result objects per query (DECISIONS #4, Phase 16.2):
+    # the per-query breakdown and the run dict share this one pass.
+    query_records: list[dict[str, Any]] = []
     for query in fixture_set.queries:
         envelope = await search(query.query_text, mode=mode, limit=limit)
-        retrieved_ids[query.query_id] = [
-            result["item"]["id"] for result in envelope["results"]
-        ]
+        query_records.append(
+            {
+                "query_id": query.query_id,
+                "query_text": query.query_text,
+                "results": envelope["results"],
+                # .get(): merged routes/search.py pops the key when gating is off.
+                "debug": envelope.get("debug"),
+            }
+        )
+    retrieved_ids = {
+        record["query_id"]: [result["item"]["id"] for result in record["results"]]
+        for record in query_records
+    }
 
     run = {query_id: build_run_dict(ids) for query_id, ids in retrieved_ids.items()}
     metrics = compute_retrieval_metrics(qrels, run)
@@ -243,5 +342,13 @@ async def run_retrieval_eval(
                 aggregate=metrics.aggregate,
                 per_query=metrics.per_query,
             )
+        )
+        # ReportRun has no per_query.md writer (its writers are summary.md /
+        # results.json / per_item_breakdowns.md), so write via run.path.
+        (report.path / "per_query.md").write_text(
+            _render_per_query_md(
+                run_block=run_block, query_records=query_records, qrels=qrels, k=k
+            ),
+            encoding="utf-8",
         )
     return report
