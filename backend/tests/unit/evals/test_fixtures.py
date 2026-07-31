@@ -121,6 +121,17 @@ def test_query_fixtures_parses_rows_skipping_comments_and_blanks(tmp_path: Path)
     assert all(isinstance(r.relevance, int) for r in fixture_set.qrels)
 
 
+@pytest.mark.parametrize("present", ["queries.tsv", "qrels.tsv"])
+def test_query_fixtures_half_present_set_raises(tmp_path: Path, present: str) -> None:
+    # Only one of the two files: Epic 16 would otherwise score every query 0.0
+    # and report a total regression that is really a missing file.
+    set_dir = tmp_path / "queries" / "golden"
+    set_dir.mkdir(parents=True)
+    (set_dir / present).write_text("q1\tki_01\t1\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="incomplete query fixture set"):
+        load_query_fixtures("golden", root=tmp_path)
+
+
 def test_query_fixtures_malformed_row_raises(tmp_path: Path) -> None:
     _write_queries(tmp_path, "broken", "q1\tonly\textra\n", "")
     with pytest.raises(ValueError, match="expected 2 tab-separated fields"):
