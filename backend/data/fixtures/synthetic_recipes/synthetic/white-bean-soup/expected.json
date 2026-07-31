@@ -1,0 +1,47 @@
+{
+  "item_type": "recipe",
+  "title": "White Bean Soup",
+  "source_span_ids": ["span_eval_white-bean-soup"],
+  "structured_data": {
+    "schema": "recipe.v1",
+    "yield": "serves 4",
+    "prep_time": "15 minutes",
+    "cook_time": "30 minutes",
+    "total_time": "45 minutes",
+    "ingredients": [
+      {
+        "raw_text": "1 onion, diced",
+        "quantity_value": 1.0,
+        "unit_normalized": null,
+        "item_normalized": "onion",
+        "preparation": "diced"
+      },
+      {
+        "raw_text": "2 tbsp olive oil",
+        "quantity_value": 2.0,
+        "unit_normalized": "tablespoon",
+        "item_normalized": "olive oil",
+        "preparation": null
+      },
+      {
+        "raw_text": "2 cups white beans, cooked",
+        "quantity_value": 2.0,
+        "unit_normalized": "cup",
+        "item_normalized": "white beans",
+        "preparation": "cooked"
+      },
+      {
+        "raw_text": "4 cups vegetable stock",
+        "quantity_value": 4.0,
+        "unit_normalized": "cup",
+        "item_normalized": "vegetable stock",
+        "preparation": null
+      }
+    ],
+    "steps": [
+      {"text": "Warm the olive oil in a heavy pot and soften the diced onion over medium heat until translucent, about 8 minutes."},
+      {"text": "Add the white beans and vegetable stock, bring to a gentle simmer, and cook for 20 minutes so the flavours come together."},
+      {"text": "Blend half the soup until smooth, stir it back in, season to taste, and serve hot."}
+    ]
+  }
+}
