@@ -10,7 +10,7 @@ setup:
     uv run alembic upgrade head
     just smoke-langfuse
     @echo ""
-    @echo "Langfuse UI: http://localhost:3001"
+    @echo "Langfuse UI: http://localhost:3002"
     @echo "Login:       dev@rag-recipes.local / devdevdev (seeded in .env)"
 
 # Submit a trace via the Langfuse SDK and verify it lands in the UI (web → Redis → worker → ClickHouse).
@@ -29,8 +29,9 @@ dev:
     wait
 
 # Run the FastAPI app under uvicorn with autoreload.
+# Host port 8001 (not 8000) to avoid clashing with other local dev servers.
 dev-api:
-    uv run uvicorn rag_recipes.api.app:app --reload
+    uv run uvicorn rag_recipes.api.app:app --reload --port 8001
 
 # Run the arq worker against compose Redis. Reads .env via uv run.
 # `--watch src/` autoreloads on source changes (mirrors uvicorn --reload).

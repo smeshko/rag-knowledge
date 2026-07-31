@@ -162,10 +162,11 @@ services:
         condition: service_healthy
       langfuse-minio:
         condition: service_healthy
-    # Host port 3001 (not 3000) to avoid clashing with frontend dev servers,
-    # and bound to loopback because Langfuse is seeded with committed dev creds.
+    # Host port 3002 (not 3000) to avoid clashing with frontend dev servers,
+    # and not 3001 which is used locally by Mockoon. Bound to loopback because
+    # Langfuse is seeded with committed dev creds.
     ports:
-      - "127.0.0.1:3001:3000"
+      - "127.0.0.1:3002:3000"
     environment:
       DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER}:${LANGFUSE_POSTGRES_PASSWORD}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB}
       CLICKHOUSE_URL: http://langfuse-clickhouse:8123
@@ -182,7 +183,7 @@ services:
       LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD}
       LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
-      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_URL: http://localhost:3002
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
       SALT: ${LANGFUSE_SALT}
       REDIS_HOST: redis
