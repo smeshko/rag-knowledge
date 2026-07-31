@@ -342,8 +342,20 @@ _RETRIEVAL_METRIC_LABELS = (
 )
 
 #: ``run``-block fields that make two runs incomparable when they differ
-#: (Epic 18's rerank stage changes item ordering materially).
-_COMPARABILITY_FIELDS = ("query_set", "mode", "reranking_enabled", "embedding_model")
+#: (Epic 18's rerank stage changes item ordering materially). ``k`` and
+#: ``limit`` belong here too: ``k`` is the top-k cutoff the per-query
+#: regression checks apply, so a ``--k 5`` run against a ``--k 10`` baseline
+#: manufactures ``dropped_from_top_k`` entries for ranks 6-10, and ``limit``
+#: bounds how deep the run was collected at all, so a shallower re-run
+#: depresses Recall@10 for reasons that have nothing to do with ranking.
+_COMPARABILITY_FIELDS = (
+    "query_set",
+    "mode",
+    "reranking_enabled",
+    "embedding_model",
+    "k",
+    "limit",
+)
 
 #: Per-query regression thresholds (fixed by the epic): an expected item that
 #: dropped out of the top-k, or whose rank worsened by at least this much.
@@ -475,9 +487,10 @@ def diff_retrieval(
     only one run are reported as added/removed, never as a delta against
     zero). The headline tags a metric only strictly past
     ``headline_threshold``; per-query regression thresholds are fixed
-    (dropped from top-k, or rank-drop ≥ 3). A ``run``-block mismatch on
-    query_set / mode / reranking_enabled / embedding_model prepends a
-    prominent warning — such runs are not comparable.
+    (dropped from top-k, or rank-drop ≥ 3). A ``run``-block mismatch on any
+    of :data:`_COMPARABILITY_FIELDS` prepends a prominent warning and forces
+    ``status="incomparable"`` — such runs are not comparable, so no quality
+    verdict is reported for them.
     """
     baseline_run = baseline.get("run", {})
     current_run = current.get("run", {})
@@ -536,7 +549,14 @@ def diff_retrieval(
         if delta < 0
     ][:top_n]
 
-    if regressions or any(tag.startswith("[REGRESSION") for tag in tags.values()):
+    if warnings:
+        # The deltas above are still printed — they are the evidence for *why*
+        # the runs disagree — but a run-config mismatch is an input error, not
+        # a quality verdict. Returning "regression" here would emit exactly the
+        # fake regression the comparability warning exists to prevent, and the
+        # CLI would exit 1 for a comparison the code itself declared invalid.
+        status = "incomparable"
+    elif regressions or any(tag.startswith("[REGRESSION") for tag in tags.values()):
         status = "regression"
     elif any(tag.startswith("[IMPROVEMENT") for tag in tags.values()):
         status = "improvement"

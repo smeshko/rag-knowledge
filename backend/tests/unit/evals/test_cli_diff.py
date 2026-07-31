@@ -130,6 +130,17 @@ def test_save_baseline_writes_named_baseline(
     assert doc["source"]["results"]["report_type"] == "retrieval"
 
 
+def test_diff_of_incomparable_runs_exits_two_not_one(tmp_path: Path) -> None:
+    baseline = _write_baseline(tmp_path, _payload(0.61, {"a": 1}))
+    current = _payload(0.57, {"a": 5})
+    current["run"]["mode"] = "vector"
+    report = _write_report(tmp_path, current)
+    result = runner.invoke(app, ["diff", str(baseline), str(report)])
+    assert result.exit_code == 2
+    assert "not comparable" in result.output
+    assert "NDCG@10" in result.output  # the deltas are still printed
+
+
 def test_diff_of_a_failed_run_exits_two_not_zero(tmp_path: Path) -> None:
     payload = _payload(0.9, {"a": 1})
     baseline = _write_baseline(tmp_path, payload)

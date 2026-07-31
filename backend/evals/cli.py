@@ -109,7 +109,8 @@ def diff(
     and the biggest NDCG@10 drops, and exit 1 when a regression past the
     threshold is found (extraction diffs land with Epic 15). Exit 2 covers
     every input error: missing paths, malformed JSON, a run finalized
-    ``failed``, or a ``report_type`` mismatch between the two sides.
+    ``failed``, a ``report_type`` mismatch between the two sides, or two runs
+    whose ``run`` blocks make them incomparable.
     """
     from evals.reports import diff_against_baseline
 
@@ -119,6 +120,10 @@ def diff(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(result.summary)
+    if result.status == "incomparable":
+        # Printed in full above (the warning plus the deltas), but a run-config
+        # mismatch is an input error, not a quality regression: exit 2, not 1.
+        raise typer.Exit(2)
     if result.status == "regression":
         raise typer.Exit(1)
 

@@ -54,10 +54,14 @@ uv run rag-evals diff evals/baselines/retrieval.json evals/reports/<new-run-dir>
 past a small delta threshold), the per-query regression list (an expected item
 that dropped out of the top-k, or whose rank worsened by ≥ 3), and the biggest
 per-query NDCG@10 drops — and exits **1** when a regression was found (0
-otherwise, 2 for missing inputs), so it can gate a local check without being a
-CI gate. Runs are only comparable when `query_set` / `mode` /
-`reranking_enabled` / `embedding_model` match; the diff prints a prominent
-warning when they differ instead of reporting a fake regression. Commit the
+otherwise, **2** for any input error), so it can gate a local check without
+being a CI gate. Exit 2 covers a missing path, malformed JSON, a run finalized
+`failed`, a `report_type` mismatch between the two sides, and two runs that
+are not comparable. Runs are only comparable when `query_set` / `mode` /
+`reranking_enabled` / `embedding_model` / `k` / `limit` all match; when they
+differ the diff prints a prominent warning and the full deltas but reports no
+quality verdict, so a run-config mismatch can never masquerade as a
+regression. Commit the
 updated `evals/baselines/retrieval.json` when a new baseline is intended —
 per-run report directories stay gitignored.
 

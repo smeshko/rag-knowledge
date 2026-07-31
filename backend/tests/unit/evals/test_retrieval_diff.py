@@ -206,6 +206,29 @@ def test_warns_when_rerank_state_differs() -> None:
     assert "not comparable" in diff.headline
 
 
+def test_incomparable_runs_report_no_quality_verdict() -> None:
+    # A rank drop *and* a metric drop are present, but the run blocks differ:
+    # the verdict must be "incomparable", never the fake regression the
+    # warning exists to prevent. The deltas are still computed and printed.
+    baseline = _payload({"q1": _query(0.9, {"a": 1})})
+    current = _payload({"q1": _query(0.5, {"a": 8})}, run=_run_block(mode="vector"))
+    diff = diff_retrieval(baseline, current)
+    assert diff.status == "incomparable"
+    assert diff.regressions  # still surfaced as evidence
+    assert diff.per_query_ndcg_delta["q1"] == pytest.approx(-0.4)
+
+
+@pytest.mark.parametrize(("field", "value"), [("k", 5), ("limit", 50)])
+def test_k_and_limit_are_comparability_fields(field: str, value: int) -> None:
+    # A --k 5 run against a --k 10 baseline manufactures dropped_from_top_k
+    # entries for ranks 6-10; a shallower limit depresses Recall@10 outright.
+    baseline = _payload({"q1": _query(0.9, {"a": 1})})
+    current = _payload({"q1": _query(0.9, {"a": 1})}, run=_run_block(**{field: value}))
+    diff = diff_retrieval(baseline, current)
+    assert any(field in warning for warning in diff.warnings)
+    assert diff.status == "incomparable"
+
+
 def test_no_warning_when_run_blocks_match() -> None:
     baseline = _payload({"q1": _query(0.9, {"a": 1})})
     current = _payload({"q1": _query(0.9, {"a": 1})})
