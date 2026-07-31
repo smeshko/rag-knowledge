@@ -43,7 +43,7 @@ data/fixtures/
 ├── queries/<set>/
 │   ├── queries.tsv                   # query_id <TAB> query_text
 │   └── qrels.tsv                     # query_id <TAB> knowledge_item_id <TAB> relevance
-├── judge_prompts/<name>.md           # LLM-judge prompt (optional leading "version:" line)
+├── judge_prompts/<name>.md           # LLM-judge prompt (optional "# version: v1" header)
 ├── judge_alignment/<fixture_id>.json # human-vs-judge agreement records
 └── private/                          # gitignored — personal/copyrighted material
 ```
@@ -61,16 +61,40 @@ for a *named* prompt that does not exist is a caller error.
   JSON). Add `notes.md` if the fixture targets a specific failure mode.
 - **Query set**: create `data/fixtures/queries/<set>/` with `queries.tsv` and
   `qrels.tsv` (tab-separated; blank lines and `#`-prefixed comment lines are
-  skipped; `relevance` is an int, `1` for binary relevance today).
+  skipped; `relevance` is an int, `1` for binary relevance today). Commit
+  **both** files — a set with only one of them is rejected, because half a set
+  silently scores every query `0.0`.
 - **Judge prompt**: add `data/fixtures/judge_prompts/<name>.md`. An optional
-  leading `version:` line (bare or inside `---` front-matter) is parsed into
-  `JudgePrompt.version`.
+  version declaration in the header block — `# version: v1` (the form the judge
+  prompts use), a bare `version: v1`, `<!-- version: v1 -->`, or a `version:`
+  key inside a `---` front-matter fence — is parsed into `JudgePrompt.version`.
+  The prompt body is never scanned.
 - **Judge alignment record**: written programmatically via
   `evals.fixtures.save_judge_alignment(record)` — one
   `judge_alignment/<fixture_id>.json` per fixture with
   `{fixture_id, human_rating, judge_rating, agreement_status, run_metadata}`.
 
 Fixture shapes are the Pydantic models in `evals/models.py`.
+
+## Reports and baselines
+
+`evals/reports.py` writes one directory per run under `evals/reports/`, named
+`<YYYY-MM-DDTHH-MM-SS>-<slug>` (with a `-2`, `-3`, … suffix if that name is
+already taken, so runs never overwrite each other):
+
+```
+evals/reports/2026-05-22T12-30-00-extraction-v3/
+├── results.json             # {"metadata": {...}, "status": ..., "results": {...}}
+├── summary.md
+└── per_item_breakdowns.md   # optional
+```
+
+`metadata` is provenance captured automatically (timestamp, git commit,
+embedding/LLM provider + model, prompt/schema version, argv, run label) — only
+those named fields, never a `Settings` dump, because baselines are committed.
+`status` is `completed`, or `failed` (plus an `error` key) when the run raised;
+`save_as_baseline(report_path, name)` refuses to promote a failed run, and
+`name` must be a single path segment (letters, digits, `.`, `_`, `-`).
 
 ## What to commit vs gitignore
 
