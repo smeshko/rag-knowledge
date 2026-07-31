@@ -1,17 +1,21 @@
-"""``rag-evals`` command-line interface (Epic 14 Phase 14.1).
+"""``rag-evals`` command-line interface (Epic 14 Phase 14.1, Epic 16).
 
-Scaffold stubs: every subcommand exists with its final argument shape but
-prints ``not implemented yet`` and exits 0. Extraction/judge subcommands gain
-real behaviour in Epic 15; retrieval metrics in Epic 16. The commands import no
-``Settings``, no provider, and no DB code — nothing here can issue a live call.
+``retrieval`` is real (Epic 16); extraction/judge subcommands remain scaffold
+stubs that print ``not implemented yet`` and exit 0 until Epic 15. Importing
+this module issues no live call — but **running** ``retrieval`` builds the
+default in-process search caller, which reaches real providers and therefore
+needs operator credentials (see ``evals.retrieval._build_default_search``).
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Annotated
 
 import typer
+
+from evals.retrieval import VALID_MODES, run_retrieval_eval
 
 app = typer.Typer(help="rag-recipes evaluation harness")
 
@@ -42,9 +46,25 @@ def retrieval(
         typer.Option(help="Query fixture set under data/fixtures/queries/."),
     ],
     k: Annotated[int, typer.Option(help="Rank cutoff for retrieval metrics.")] = 10,
+    mode: Annotated[
+        str,
+        typer.Option(help="Retrieval mode: hybrid, keyword, or vector."),
+    ] = "hybrid",
+    label: Annotated[
+        str,
+        typer.Option(help="Run label used in the report directory name."),
+    ] = "retrieval",
 ) -> None:
     """Evaluate retrieval quality against golden queries/qrels (Epic 16)."""
-    _not_implemented("retrieval")
+    # Validated here as well as in the runner so a typo dies with a clean CLI
+    # error before any Settings/search construction.
+    if mode not in VALID_MODES:
+        typer.echo(
+            f"error: invalid mode {mode!r}: expected one of {sorted(VALID_MODES)}", err=True
+        )
+        raise typer.Exit(2)
+    report = asyncio.run(run_retrieval_eval(query_set=queries, k=k, label=label, mode=mode))
+    typer.echo(str(report.path))
 
 
 @app.command("judge-alignment")
