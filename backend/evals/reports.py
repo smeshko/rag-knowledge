@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -42,6 +43,7 @@ __all__ = [
     "SettingsLike",
     "build_metadata",
     "diff_against_baseline",
+    "latest_run_dir",
     "save_as_baseline",
 ]
 
@@ -269,6 +271,49 @@ class ReportRun:
                 self._write_doc(RUN_STATUS_FAILED, error=exc_type.__name__)
         elif not self._results_written:
             self._write_doc(RUN_STATUS_COMPLETED)
+
+
+def latest_run_dir(reports_root: Path | None = None) -> Path | None:
+    """The most recent run directory under ``reports_root``, or ``None``.
+
+    Run directory names start with a colon-free ISO timestamp, so plain
+    lexicographic order is chronological. Dot-prefixed entries (e.g. the
+    ``.judge_cache`` directory) are not run dirs and are skipped.
+    """
+    root = REPORTS_ROOT if reports_root is None else reports_root
+    if not root.is_dir():
+        return None
+    candidates = sorted(
+        entry for entry in root.iterdir() if entry.is_dir() and not entry.name.startswith(".")
+    )
+    return candidates[-1] if candidates else None
+
+
+def _update_run_results(run_dir: Path, mutate: Callable[[dict[str, Any]], None]) -> Path:
+    """Read-modify-write an *existing* run's ``results.json`` (DECISIONS #7).
+
+    ``judge-alignment`` and ``confidence-review`` run after ``extraction``
+    against the run dir it created; constructing a ``ReportRun`` would mint a
+    new empty timestamped dir and orphan their sections. ``mutate`` receives
+    the ``results`` payload (inside the ``{"metadata", "results"}`` envelope)
+    and edits it in place; ``metadata``/``status`` and the sections other
+    phases own are preserved untouched.
+    """
+    path = run_dir / "results.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    mutate(doc["results"])
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _append_run_summary(run_dir: Path, block: str) -> Path:
+    """Append a block to an existing run's ``summary.md`` (creates it if absent)."""
+    path = run_dir / "summary.md"
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    path.write_text(existing + block.rstrip("\n") + "\n", encoding="utf-8")
+    return path
 
 
 def save_as_baseline(

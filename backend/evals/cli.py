@@ -109,9 +109,46 @@ def judge_alignment(
         str,
         typer.Option(help="Judge prompt name under data/fixtures/judge_prompts/."),
     ],
+    fixtures: Annotated[
+        str,
+        typer.Option(help="Recipe fixture set under data/fixtures/synthetic_recipes/."),
+    ],
+    report: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Extraction run directory to record the agreement metric into "
+                "(default: the latest run under evals/reports/)."
+            )
+        ),
+    ] = None,
 ) -> None:
     """Measure LLM-judge vs human-rating agreement (Epic 15)."""
-    _not_implemented("judge-alignment")
+    import asyncio
+
+    from evals.alignment import run_judge_alignment
+    from evals.reports import latest_run_dir
+    from rag_recipes.config import get_settings
+
+    run_dir = report if report is not None else latest_run_dir()
+    result = asyncio.run(
+        run_judge_alignment(
+            judge,
+            fixtures,
+            llm_provider=_build_llm_provider(get_settings()),
+            report_path=run_dir,
+        )
+    )
+    rate = "n/a" if result.agreement_rate is None else f"{result.agreement_rate:.2f}"
+    typer.echo(f"Judge-human agreement ({result.judge_name}, {result.judge_version}): {rate}")
+    for item in result.disagreements:
+        typer.echo(f"DISAGREE {item.fixture_name}:")
+        typer.echo(f"  human ({item.human_rating}): {item.human_critique}")
+        typer.echo(f"  judge ({item.judge_rating}): {item.judge_critique}")
+    if result.unrated:
+        typer.echo(f"Unrated (judge error): {', '.join(result.unrated)}")
+    if run_dir is not None:
+        typer.echo(f"agreement recorded in: {run_dir}")
 
 
 @app.command("confidence-review")

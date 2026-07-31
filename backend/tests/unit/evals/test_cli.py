@@ -60,10 +60,13 @@ def test_retrieval_accepts_explicit_k_flag() -> None:
     assert "not implemented yet" in result.output
 
 
-def test_judge_alignment_stub_exits_zero_with_required_judge_flag() -> None:
+def test_judge_alignment_requires_judge_and_fixtures_flags() -> None:
+    # Both became required options in Epic 15 Phase 15.3 (behaviour is covered
+    # offline in test_alignment.py).
     result = runner.invoke(app, ["judge-alignment", "--judge", "extraction-judge"])
-    assert result.exit_code == 0
-    assert "not implemented yet" in result.output
+    assert result.exit_code == 2
+    result = runner.invoke(app, ["judge-alignment", "--fixtures", "smoke"])
+    assert result.exit_code == 2
 
 
 def test_confidence_review_stub_takes_no_args_and_exits_zero() -> None:
