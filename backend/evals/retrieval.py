@@ -106,6 +106,13 @@ async def _default_search(settings: Any) -> AsyncIterator[SearchCaller]:
                     "mode": mode,
                     "limit": limit,
                     "filters": {"exclude_needs_review": True},
+                    # `SearchRequestBody.include_debug` defaults to False, so
+                    # without this the per-query breakdown's debug section is
+                    # unreachable on the live path. The route ANDs it with
+                    # `Settings.debug_endpoints_enabled` and pops the key when
+                    # gated off, which is exactly the "included when dev mode
+                    # is enabled" contract (Phase 16.2 acceptance).
+                    "include_debug": True,
                 },
             )
             response.raise_for_status()
