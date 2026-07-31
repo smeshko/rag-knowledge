@@ -89,7 +89,13 @@ def diff(
     baseline_path: Annotated[Path, typer.Argument(help="Committed baseline JSON file.")],
     new_report_path: Annotated[Path, typer.Argument(help="New report run directory.")],
 ) -> None:
-    """Diff a new report run against a committed baseline (skeleton — Epics 15/16)."""
+    """Diff a new report run against a committed baseline.
+
+    Retrieval reports print the per-metric headline, per-query regressions,
+    and the biggest NDCG@10 drops, and exit 1 when a regression past the
+    threshold is found (extraction diffs land with Epic 15). Missing inputs
+    exit 2.
+    """
     from evals.reports import diff_against_baseline
 
     try:
@@ -98,6 +104,32 @@ def diff(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(result.summary)
+    if result.status == "regression":
+        raise typer.Exit(1)
+
+
+@app.command("save-baseline")
+def save_baseline(
+    report_path: Annotated[
+        Path, typer.Argument(help="Report run directory containing results.json.")
+    ],
+    name: Annotated[
+        str,
+        typer.Option(help="Baseline name; written to evals/baselines/<name>.json."),
+    ],
+) -> None:
+    """Promote a report run's results.json to a committed baseline."""
+    from evals.reports import save_as_baseline
+
+    try:
+        path = save_as_baseline(report_path, name)
+    except FileNotFoundError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(str(path))
 
 
 if __name__ == "__main__":

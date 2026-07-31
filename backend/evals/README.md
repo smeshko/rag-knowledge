@@ -18,17 +18,48 @@ The CLI is installed as the `rag-evals` console script (`uv sync` links it):
 ```bash
 uv run rag-evals --help
 uv run rag-evals extraction --fixtures <set> [--judge <name>]   # stub — Epic 15
-uv run rag-evals retrieval --queries <set> [--k 10]             # stub — Epic 16
+uv run rag-evals retrieval --queries <set> [--k 10] [--mode hybrid] [--label <label>]
 uv run rag-evals judge-alignment --judge <name>                 # stub — Epic 15
 uv run rag-evals confidence-review                              # stub — Epic 15
-uv run rag-evals diff <baseline_path> <new_report_path>         # skeleton — Epics 15/16
+uv run rag-evals diff <baseline_path> <new_report_path>
+uv run rag-evals save-baseline <report_path> --name <name>
 ```
 
-**Every subcommand is currently a scaffold.** Epic 14 ships the workflow
-skeleton (CLI shape, fixture loaders, report/baseline plumbing); the commands print
-`not implemented yet` and exit 0. Extraction scoring and judge tooling land in
-Epic 15, retrieval metrics (`pytrec_eval`) in Epic 16. Nothing here calls an
-LLM or embedding API today.
+Extraction scoring and judge tooling are still Epic 15 scaffold stubs
+(`not implemented yet`, exit 0). `retrieval`, `diff`, and `save-baseline` are
+real (Epic 16). **`rag-evals retrieval` performs live searches**: it drives
+`POST /api/v1/search` in-process through the real app, whose dependencies
+construct the real embedding (and, when `reranking_enabled`, reranker)
+providers — running it needs a reachable database and provider credentials.
+`diff` and `save-baseline` are offline (files only).
+
+## Retrieval eval workflow: run → save baseline → change → re-run → diff
+
+```bash
+# 1. Run the eval and note the printed report directory.
+uv run rag-evals retrieval --queries golden --k 10 --mode hybrid --label before
+
+# 2. Promote that run to the committed baseline (refuses failed runs).
+uv run rag-evals save-baseline evals/reports/<run-dir> --name retrieval
+
+# 3. Change something (prompt, boost knob, reranker, embedding model, ...),
+#    then re-run with a fresh label.
+uv run rag-evals retrieval --queries golden --k 10 --mode hybrid --label after
+
+# 4. Diff the new run against the committed baseline.
+uv run rag-evals diff evals/baselines/retrieval.json evals/reports/<new-run-dir>
+```
+
+`diff` prints a per-metric headline (`NDCG@10: 0.61 → 0.57 [REGRESSION -0.04]`
+past a small delta threshold), the per-query regression list (an expected item
+that dropped out of the top-k, or whose rank worsened by ≥ 3), and the biggest
+per-query NDCG@10 drops — and exits **1** when a regression was found (0
+otherwise, 2 for missing inputs), so it can gate a local check without being a
+CI gate. Runs are only comparable when `query_set` / `mode` /
+`reranking_enabled` / `embedding_model` match; the diff prints a prominent
+warning when they differ instead of reporting a fake regression. Commit the
+updated `evals/baselines/retrieval.json` when a new baseline is intended —
+per-run report directories stay gitignored.
 
 ## Fixture layout
 

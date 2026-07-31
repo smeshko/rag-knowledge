@@ -21,6 +21,7 @@ from evals.metrics.retrieval import build_run_dict, compute_retrieval_metrics
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from evals.reports import ReportRun
 
@@ -268,6 +269,7 @@ async def run_retrieval_eval(
     search: SearchCaller | None = None,
     report_factory: Callable[[str], ReportRun] | None = None,
     settings: RetrievalSettingsLike | None = None,
+    fixtures_root: Path | None = None,
 ) -> ReportRun:
     """Run the retrieval eval for ``query_set`` and write the report.
 
@@ -290,7 +292,7 @@ async def run_retrieval_eval(
 
         report_factory = lambda run_label: _ReportRun(run_label)  # noqa: E731
 
-    fixture_set = load_query_fixtures(query_set)
+    fixture_set = load_query_fixtures(query_set, root=fixtures_root)
     qrels = _fold_qrels(fixture_set.qrels)
     limit = max(k, settings.search_default_limit)
 
