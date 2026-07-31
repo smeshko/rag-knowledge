@@ -146,6 +146,14 @@ def test_git_commit_returns_head_sha_inside_repo() -> None:
     assert re.fullmatch(r"[0-9a-f]{40}", sha)
 
 
+def test_git_commit_is_cwd_independent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The console script runs detached from the repo; the recorded sha must be
+    # this checkout's HEAD, not that of whatever repo the cwd happens to be in.
+    from_repo = _git_commit()
+    monkeypatch.chdir(tmp_path)
+    assert _git_commit() == from_repo
+
+
 def test_git_commit_returns_none_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fail(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args=["git"], returncode=128, stdout="", stderr="fatal:")

@@ -82,12 +82,20 @@ class RunMetadata(BaseModel):
 
 
 def _git_commit() -> str | None:
-    """Return the current ``HEAD`` sha, or ``None`` outside a repo / without git."""
+    """Return the current ``HEAD`` sha, or ``None`` outside a repo / without git.
+
+    Resolved against *this package's* directory rather than the process cwd: the
+    ``rag-evals`` console script is cwd-independent by design (DECISIONS #1), so
+    keying off cwd would record the sha of whatever unrelated repo the user
+    happened to be standing in — silently wrong provenance in a committed
+    baseline — or ``None`` when they stand outside a repo at all.
+    """
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
+            cwd=Path(__file__).resolve().parent,
         )
     except FileNotFoundError:
         return None
