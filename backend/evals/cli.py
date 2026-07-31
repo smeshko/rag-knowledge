@@ -80,14 +80,18 @@ def extraction(
     from rag_recipes.config import get_settings
 
     settings = get_settings()
-    run = asyncio.run(
-        run_extraction_eval(
-            fixtures,
-            label,
-            llm_provider=_build_llm_provider(settings),
-            judge=judge,
+    try:
+        run = asyncio.run(
+            run_extraction_eval(
+                fixtures,
+                label,
+                llm_provider=_build_llm_provider(settings),
+                judge=judge,
+            )
         )
-    )
+    except ValueError as exc:  # empty/unknown fixture set — a caller error
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     typer.echo(f"report: {run.path}")
 
 
@@ -131,14 +135,18 @@ def judge_alignment(
     from rag_recipes.config import get_settings
 
     run_dir = report if report is not None else latest_run_dir()
-    result = asyncio.run(
-        run_judge_alignment(
-            judge,
-            fixtures,
-            llm_provider=_build_llm_provider(get_settings()),
-            report_path=run_dir,
+    try:
+        result = asyncio.run(
+            run_judge_alignment(
+                judge,
+                fixtures,
+                llm_provider=_build_llm_provider(get_settings()),
+                report_path=run_dir,
+            )
         )
-    )
+    except ValueError as exc:  # empty/unknown fixture set — a caller error
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
     rate = "n/a" if result.agreement_rate is None else f"{result.agreement_rate:.2f}"
     typer.echo(f"Judge-human agreement ({result.judge_name}, {result.judge_version}): {rate}")
     for item in result.disagreements:

@@ -170,6 +170,39 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
     assert aggregate["average_confidence"] is None
 
 
+async def test_empty_fixture_set_raises_instead_of_writing_a_green_report(
+    tmp_path: Path,
+) -> None:
+    # A mistyped --fixtures must not produce a completed report with zero
+    # fixtures whose baseline diff then prints "No regressions detected".
+    reports_root = tmp_path / "reports"
+    with pytest.raises(ValueError, match="empty or does not exist"):
+        await run_extraction_eval(
+            "typo",
+            "empty-eval",
+            llm_provider=FakeLLMProvider(),
+            fixtures_root=tmp_path / "fixtures",
+            reports_root=reports_root,
+            thresholds=THRESHOLDS,
+            settings=SettingsStandIn(),
+        )
+    assert not reports_root.exists()
+
+
+def test_cli_extraction_exits_non_zero_on_an_unknown_fixture_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(evals.fixtures, "FIXTURES_ROOT", tmp_path / "fixtures")
+    monkeypatch.setattr(evals.reports, "REPORTS_ROOT", tmp_path / "reports")
+    monkeypatch.setattr("rag_recipes.config.get_settings", _CliSettingsStandIn)
+    monkeypatch.setattr(evals.cli, "_build_llm_provider", lambda settings: FakeLLMProvider())
+
+    result = runner.invoke(app, ["extraction", "--fixtures", "typo", "--label", "smoke"])
+
+    assert result.exit_code == 2
+    assert "report: " not in result.output
+
+
 async def test_baseline_diff_is_invoked_and_printed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

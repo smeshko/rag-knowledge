@@ -405,6 +405,15 @@ async def run_extraction_eval(
             )
 
     fixtures = load_recipe_fixtures(fixture_set, root=fixtures_root)
+    if not fixtures:
+        # The Epic-14 loader returns [] for an absent *or* empty set. Writing a
+        # completed report anyway would produce zero fixtures, all-``None``
+        # accuracy, and a baseline diff whose every metric is "missing" — i.e.
+        # a mistyped --fixtures would print "No regressions detected".
+        raise ValueError(
+            f"recipe fixture set {fixture_set!r} is empty or does not exist; "
+            f"nothing to evaluate"
+        )
 
     with ReportRun(label, reports_root=reports_root, settings=settings) as run:
         per_fixture: list[dict[str, Any]] = []

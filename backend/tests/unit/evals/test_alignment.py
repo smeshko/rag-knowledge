@@ -280,6 +280,21 @@ async def test_cache_miss_extracts_judges_and_caches(tmp_path: Path) -> None:
     assert cached.critique == "judged live"
 
 
+async def test_empty_fixture_set_raises_instead_of_writing_an_empty_agreement(
+    tmp_path: Path,
+) -> None:
+    root = _seed(tmp_path)
+    with pytest.raises(ValueError, match="empty or does not exist"):
+        await run_judge_alignment(
+            "summary_quality",
+            "typo",
+            llm_provider=FakeLLMProvider(),
+            prompt_human=_ScriptedPrompt({}),
+            root=root,
+            judge_cache_root=tmp_path / "cache",
+        )
+
+
 async def test_agreement_section_merges_into_existing_run_results(tmp_path: Path) -> None:
     fixtures_root = tmp_path / "fixtures"
     provider = write_smoke_set(

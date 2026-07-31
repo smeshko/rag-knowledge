@@ -184,6 +184,13 @@ async def run_judge_alignment(
     judge_runner = load_judge(judge, llm_provider, root=root)
     cache = JudgeCache(root=judge_cache_root)
     fixtures = load_recipe_fixtures(fixture_set, root=root)
+    if not fixtures:
+        # Same false-green as the driver: an absent/mistyped set would silently
+        # write an empty `agreement` section (rate n/a) over the run's real one.
+        raise ValueError(
+            f"recipe fixture set {fixture_set!r} is empty or does not exist; "
+            f"nothing to align"
+        )
 
     records: list[JudgeAlignmentRecord] = []
     disagreements: list[AlignmentDisagreement] = []
