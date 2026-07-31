@@ -13,10 +13,12 @@ from typing import Any
 
 import evals.cli
 import evals.fixtures
+import evals.judge_cache
 import evals.reports
 import pytest
 from evals.cli import app
 from evals.extraction import _build_synthetic_window, run_extraction_eval, synthetic_span_id
+from evals.judges import JUDGE_SCHEMA_VERSION
 from typer.testing import CliRunner
 
 from rag_recipes.ingestion.pipeline.extraction import (
@@ -238,8 +240,16 @@ _SOUP_EXPECTED = {
 }
 
 
-def _write_smoke_set(fixtures_root: Path) -> FakeLLMProvider:
-    """Two fixtures: a clean ``ready`` stew and a step-less ``needs_review`` soup."""
+def _write_smoke_set(
+    fixtures_root: Path, judge_output: dict[str, Any] | None = None
+) -> FakeLLMProvider:
+    """Two fixtures: a clean ``ready`` stew and a step-less ``needs_review`` soup.
+
+    Extraction responses are keyed by request hash; ``judge_output`` (if given)
+    becomes the fake's ``default_output``, served to any non-extraction request
+    — i.e. the judge calls, whose distinct ``prompt_version``/``schema_version``
+    guarantee their hashes never collide with the extraction ones.
+    """
     _write_fixture(fixtures_root, "smoke", "bean-stew", _STEW_SOURCE, _STEW_EXPECTED)
     _write_fixture(fixtures_root, "smoke", "tomato-soup", _SOUP_SOURCE, _SOUP_EXPECTED)
     stew_output = _recipe_output(
@@ -270,7 +280,8 @@ def _write_smoke_set(fixtures_root: Path) -> FakeLLMProvider:
         {
             _request_hash("bean-stew", _STEW_SOURCE): stew_output,
             _request_hash("tomato-soup", _SOUP_SOURCE): soup_output,
-        }
+        },
+        default_output=judge_output,
     )
 
 
@@ -362,10 +373,17 @@ async def test_summary_renders_doc12_extraction_report_shape(tmp_path: Path) -> 
     assert "Missing steps: 1" in summary
 
 
-async def test_judge_parameter_is_accepted_and_inert(tmp_path: Path) -> None:
-    run = await _run_smoke_eval(tmp_path, judge="completeness")
+async def test_no_judge_leaves_judge_slot_null(tmp_path: Path) -> None:
+    run = await _run_smoke_eval(tmp_path)
     results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
     assert results["judge"] is None
+
+
+async def test_unknown_judge_name_surfaces_missing_prompt(tmp_path: Path) -> None:
+    # Since Phase 15.2 the judge seam is live: a judge name without a committed
+    # prompt is a caller error, surfaced as the loader's FileNotFoundError.
+    with pytest.raises(FileNotFoundError):
+        await _run_smoke_eval(tmp_path, judge="completeness")
 
 
 async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> None:
@@ -420,6 +438,118 @@ async def test_no_baseline_is_handled_without_error(tmp_path: Path) -> None:
     assert (run.path / "results.json").is_file()
 
 
+# --- judge integration (Epic 15 Phase 15.2) ----------------------------------
+
+_JUDGE_PROMPT = (
+    "# Summary quality judge\n"
+    "# version: v1\n\n"
+    "Rate the summary.\n\n"
+    "## Extracted output\n\n{extracted_output}\n\n"
+    "## Expected (golden) values\n\n{expected_output}\n\n"
+    "## Source text\n\n{source_text}\n"
+)
+
+
+def _write_judge_prompt(fixtures_root: Path) -> None:
+    prompts = fixtures_root / "judge_prompts"
+    prompts.mkdir(parents=True, exist_ok=True)
+    (prompts / "summary_quality.md").write_text(_JUDGE_PROMPT, encoding="utf-8")
+
+
+def _judge_calls(provider: FakeLLMProvider) -> list[Any]:
+    return [call for call in provider.calls if call.schema_version == JUDGE_SCHEMA_VERSION]
+
+
+async def test_judge_records_ratings_and_pass_rate(tmp_path: Path) -> None:
+    fixtures_root = tmp_path / "fixtures"
+    provider = _write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    _write_judge_prompt(fixtures_root)
+    run = await run_extraction_eval(
+        "smoke",
+        "judged-eval",
+        llm_provider=provider,
+        judge="summary_quality",
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=_THRESHOLDS,
+        settings=_SettingsStandIn(),
+        judge_cache_root=tmp_path / "judge-cache",
+    )
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    judge = results["judge"]
+    assert judge["name"] == "summary_quality"
+    assert judge["version"] == "v1"
+    assert judge["model"] == "fake-model"
+    assert judge["pass_rate"] == pytest.approx(1.0)
+    assert judge["rated"] == 2
+    assert judge["unrated"] == 0
+    assert set(judge["per_fixture"]) == {"bean-stew", "tomato-soup"}
+    stew = judge["per_fixture"]["bean-stew"]
+    assert stew["status"] == "rated"
+    assert stew["rating"] == "pass"
+    assert stew["critique"] == "OK."
+    assert stew["metadata"]["model"] == "fake-model"
+    # Objective scoring is unchanged by the judge integration.
+    assert results["aggregate"]["ready"] == 1
+    assert results["aggregate"]["needs_review"] == 1
+
+    summary = (run.path / "summary.md").read_text(encoding="utf-8")
+    assert "Judge pass rate (summary_quality, v1): 1.00" in summary
+
+
+async def test_second_judge_run_replays_cache_without_new_calls(tmp_path: Path) -> None:
+    fixtures_root = tmp_path / "fixtures"
+    provider = _write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    _write_judge_prompt(fixtures_root)
+    kwargs: dict[str, Any] = {
+        "llm_provider": provider,
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": _THRESHOLDS,
+        "settings": _SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "first", **kwargs)
+    assert len(_judge_calls(provider)) == 2  # first run judges both fixtures
+    run = await run_extraction_eval("smoke", "second", **kwargs)
+    assert len(_judge_calls(provider)) == 2  # cache hit: no new judge calls
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    assert results["judge"]["pass_rate"] == pytest.approx(1.0)
+    assert results["judge"]["rated"] == 2
+
+
+async def test_judge_error_counts_fixture_as_unrated(tmp_path: Path) -> None:
+    fixtures_root = tmp_path / "fixtures"
+    # A malformed verdict (the Anthropic path is non-strict, so reachable) must
+    # surface as un-rated, never as a silent pass or fail.
+    provider = _write_smoke_set(
+        fixtures_root, judge_output={"rating": "maybe", "critique": "Hmm."}
+    )
+    _write_judge_prompt(fixtures_root)
+    run = await run_extraction_eval(
+        "smoke",
+        "unrated-eval",
+        llm_provider=provider,
+        judge="summary_quality",
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=_THRESHOLDS,
+        settings=_SettingsStandIn(),
+        judge_cache_root=tmp_path / "judge-cache",
+    )
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    judge = results["judge"]
+    assert judge["rated"] == 0
+    assert judge["unrated"] == 2
+    assert judge["pass_rate"] is None
+    for entry in judge["per_fixture"].values():
+        assert entry["status"] == "unrated"
+        assert "verdict" in entry["error"]
+    summary = (run.path / "summary.md").read_text(encoding="utf-8")
+    assert "Judge pass rate (summary_quality, v1): n/a" in summary
+
+
 # --- CLI wiring (Epic 15 Phase 15.1 TASK-003) --------------------------------
 
 runner = CliRunner()
@@ -441,15 +571,17 @@ def test_cli_extraction_runs_offline_with_injected_fake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixtures_root = tmp_path / "fixtures"
-    provider = _write_smoke_set(fixtures_root)
+    provider = _write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    _write_judge_prompt(fixtures_root)
     monkeypatch.setattr(evals.fixtures, "FIXTURES_ROOT", fixtures_root)
     monkeypatch.setattr(evals.reports, "REPORTS_ROOT", tmp_path / "reports")
+    monkeypatch.setattr(evals.judge_cache, "CACHE_ROOT", tmp_path / "judge-cache")
     monkeypatch.setattr("rag_recipes.config.get_settings", _CliSettingsStandIn)
     monkeypatch.setattr(evals.cli, "_build_llm_provider", lambda settings: provider)
 
     result = runner.invoke(
         app,
-        ["extraction", "--fixtures", "smoke", "--label", "smoke", "--judge", "completeness"],
+        ["extraction", "--fixtures", "smoke", "--label", "smoke", "--judge", "summary_quality"],
     )
 
     assert result.exit_code == 0

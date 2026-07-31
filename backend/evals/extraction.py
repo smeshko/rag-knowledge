@@ -9,10 +9,16 @@ writes ``results.json`` + ``summary.md`` through the Epic-14 ``ReportRun``.
 Synthetic-window path (DECISIONS #1): each fixture's ``source.md`` becomes one
 detached in-memory ``SourceSpan`` (id ``synthetic_span_id(fixture.name)``)
 wrapped in a single ``Window`` — no PDF, no DB row. By design every synthetic
-fixture holds a single recipe, so the driver scores the first extracted item;
-multi-recipe boundary correctness is a Phase 15.2 judge concern. The
-``judge`` parameter is accepted but inert in 15.1 — it is the integration seam
-Phase 15.2 fills.
+fixture holds a single recipe, so the driver scores the first extracted item.
+
+Judge integration (Phase 15.2): when ``judge`` names a committed judge prompt,
+the driver loads it via ``load_judge`` (reusing the *same* injected provider —
+never a second one), replays cached ratings from the on-disk ``JudgeCache``
+keyed by ``(fixture_id, judge_name, judge_version, model)``, calls the judge on
+misses, and records per-fixture ratings plus an aggregate pass rate at
+``results.judge``. A ``JudgeError`` (rejection, truncation, malformed verdict)
+marks the fixture *unrated* — never a silent pass/fail — and the pass rate is
+computed over rated fixtures only.
 
 ``results.json`` schema (the Epic-14 envelope wraps the payload)::
 
@@ -32,7 +38,13 @@ Phase 15.2 fills.
           "field_accuracy": {...},  # per-field means (None when ineligible)
           "missing_field_counts": {...},
         },
-        "judge": null,              # reserved — Phase 15.2 fills
+        "judge": null | {           # null without --judge
+          "name", "version", "model",
+          "per_fixture": {<fixture name>: {"status": "rated", ...JudgeRating}
+                          | {"status": "unrated", "error"}},
+          "pass_rate",              # over rated fixtures; null when none rated
+          "rated", "unrated", "passes", "fails"
+        },
         "agreement": null,          # reserved — Phase 15.3 fills
         "calibration": null         # reserved — Phase 15.3 fills
       }
@@ -46,6 +58,7 @@ construction site is the ``rag-evals`` CLI.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -54,6 +67,9 @@ from typing import Any, cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evals.fixtures import load_recipe_fixtures
+from evals.judge_cache import JudgeCache
+from evals.judges import Judge, JudgeError, load_judge
+from evals.models import RecipeFixture
 from evals.reports import BASELINES_ROOT, ReportRun, SettingsLike, diff_against_baseline
 from evals.scoring.objective import (
     score_ingredient_count,
@@ -176,15 +192,77 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+class _JudgeSection:
+    """Accumulates per-fixture judge outcomes for the ``results.judge`` slot."""
+
+    def __init__(self, judge: Judge, cache: JudgeCache) -> None:
+        self._judge = judge
+        self._cache = cache
+        self.per_fixture: dict[str, dict[str, Any]] = {}
+        self.passes = 0
+        self.fails = 0
+        self.unrated = 0
+
+    async def rate(self, fixture: RecipeFixture, recipe: ExtractedRecipe) -> None:
+        """Rate one scored fixture, replaying the cache; ``JudgeError`` → unrated."""
+        rating = self._cache.get(
+            fixture.name, self._judge.name, self._judge.version, self._judge.model
+        )
+        if rating is None:
+            try:
+                rating = await self._judge.judge(
+                    json.dumps(recipe.model_dump(mode="json", by_alias=True), indent=2),
+                    json.dumps(fixture.expected, indent=2),
+                    fixture.source_md,
+                )
+            except JudgeError as exc:
+                self.unrated += 1
+                self.per_fixture[fixture.name] = {"status": "unrated", "error": str(exc)}
+                return
+            self._cache.put(rating, fixture_id=fixture.name)
+        if rating.rating == "pass":
+            self.passes += 1
+        else:
+            self.fails += 1
+        self.per_fixture[fixture.name] = {"status": "rated", **rating.model_dump()}
+
+    def skip(self, fixture_name: str, reason: str) -> None:
+        """Record a fixture the judge never saw (e.g. its extraction failed)."""
+        self.unrated += 1
+        self.per_fixture[fixture_name] = {"status": "unrated", "error": reason}
+
+    @property
+    def pass_rate(self) -> float | None:
+        """Pass rate over *rated* fixtures only — unrated never counts as fail."""
+        rated = self.passes + self.fails
+        return self.passes / rated if rated else None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "name": self._judge.name,
+            "version": self._judge.version,
+            "model": self._judge.model,
+            "per_fixture": self.per_fixture,
+            "pass_rate": self.pass_rate,
+            "rated": self.passes + self.fails,
+            "unrated": self.unrated,
+            "passes": self.passes,
+            "fails": self.fails,
+        }
+
+
 def _render_summary(
-    label: str, fixture_set: str, aggregate: dict[str, Any]
+    label: str,
+    fixture_set: str,
+    aggregate: dict[str, Any],
+    judge_payload: dict[str, Any] | None = None,
 ) -> str:
     """Render the doc-12 § 10 extraction-report block for a multi-fixture run.
 
     doc 12 § 10's ``Document:`` / ``Source version:`` header lines are
     single-document framing; a fixture-set run renders the set name + fixture
-    count in their place. The judge pass-rate / agreement lines are Phase
-    15.2/15.3 outputs and are absent here.
+    count in their place. The judge pass-rate line appears only when a judge
+    ran; the judge-human agreement line is Phase 15.3's output and absent here.
     """
 
     def fmt(value: float | None) -> str:
@@ -207,6 +285,13 @@ def _render_summary(
         f"  ingredients (count match): {fmt(accuracy['ingredient_count'])}",
         f"  ingredients (per-field): {fmt(accuracy['ingredients_detail_f1'])}",
         f"  steps (count match): {fmt(accuracy['step_count'])}",
+    ]
+    if judge_payload is not None:
+        lines.append(
+            f"Judge pass rate ({judge_payload['name']}, {judge_payload['version']}): "
+            f"{fmt(judge_payload['pass_rate'])}"
+        )
+    lines += [
         f"Missing ingredients: {missing.get('ingredients', 0)}",
         f"Missing steps: {missing.get('steps', 0)}",
     ]
@@ -282,18 +367,26 @@ async def run_extraction_eval(
     thresholds: SoftValidationThresholds | None = None,
     settings: SettingsLike | None = None,
     baseline_path: Path | None = None,
+    judge_cache_root: Path | None = None,
 ) -> ReportRun:
     """Evaluate extraction quality over a recipe fixture set; returns the run.
 
     ``llm_provider`` is required and injected — this function never builds a
-    provider and never reads an API key. ``judge`` is a forward stub (Phase
-    15.2). ``fixtures_root``/``reports_root``/``thresholds``/``settings``/
-    ``baseline_path`` default to the repo layout and real ``Settings`` but are
-    injectable so tests stay hermetic. When a baseline exists the Epic-14
-    ``diff_against_baseline`` is invoked and its summary printed (placeholder
-    content until Phase 15.3 fills the diff in).
+    provider and never reads an API key. ``judge`` names a committed judge
+    prompt to run per fixture (the same injected provider serves both
+    extraction and judge calls). ``fixtures_root``/``reports_root``/
+    ``thresholds``/``settings``/``baseline_path``/``judge_cache_root`` default
+    to the repo layout and real ``Settings`` but are injectable so tests stay
+    hermetic. When a baseline exists the Epic-14 ``diff_against_baseline`` is
+    invoked and its summary printed (placeholder content until Phase 15.3 fills
+    the diff in).
     """
-    del judge  # accepted but inert in 15.1 — Phase 15.2 wires the LLM judge
+    judge_section: _JudgeSection | None = None
+    if judge is not None:
+        judge_section = _JudgeSection(
+            load_judge(judge, llm_provider, root=fixtures_root),
+            JudgeCache(root=judge_cache_root),
+        )
     if thresholds is None or settings is None:
         from rag_recipes.config import get_settings
 
@@ -330,8 +423,12 @@ async def run_extraction_eval(
                 per_fixture.append(
                     {"name": fixture.name, "status": "extraction_failed", "error": error}
                 )
+                if judge_section is not None:
+                    judge_section.skip(fixture.name, "extraction failed")
                 continue
             recipe = recipes[0]
+            if judge_section is not None:
+                await judge_section.rate(fixture, recipe)
             warnings = validate_soft(recipe, thresholds=thresholds)
             if warnings:
                 needs_review += 1
@@ -374,17 +471,18 @@ async def run_extraction_eval(
             },
             "missing_field_counts": dict(missing_counts),
         }
+        judge_payload = judge_section.payload() if judge_section is not None else None
         run.write_results(
             {
                 "fixture_set": fixture_set,
                 "per_fixture": per_fixture,
                 "aggregate": aggregate,
-                "judge": None,
+                "judge": judge_payload,
                 "agreement": None,
                 "calibration": None,
             }
         )
-        run.write_summary(_render_summary(label, fixture_set, aggregate))
+        run.write_summary(_render_summary(label, fixture_set, aggregate, judge_payload))
 
     resolved_baseline = _DEFAULT_BASELINE_PATH if baseline_path is None else baseline_path
     if resolved_baseline.is_file():
