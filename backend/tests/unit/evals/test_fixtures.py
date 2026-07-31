@@ -166,6 +166,33 @@ def test_judge_prompt_parses_version_below_other_front_matter_keys(tmp_path: Pat
     assert load_judge_prompt("extraction-judge", root=tmp_path).version == "v3"
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "# version: v1",  # the form Epic 15's judge prompts use
+        "<!-- version: v1 -->",  # the extraction prompt template's convention
+        "version: v1",
+        "---\nname: summary_quality\n# version: v1\n---",
+    ],
+)
+def test_judge_prompt_version_declaration_forms(tmp_path: Path, header: str) -> None:
+    prompts = tmp_path / "judge_prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "summary_quality.md").write_text(
+        f"{header}\n\nRate the summary.\n", encoding="utf-8"
+    )
+    assert load_judge_prompt("summary_quality", root=tmp_path).version == "v1"
+
+
+def test_judge_prompt_version_below_a_heading_in_the_header_block(tmp_path: Path) -> None:
+    prompts = tmp_path / "judge_prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "summary_quality.md").write_text(
+        "# Summary quality judge\n# version: v4\n\nRate the summary.\n", encoding="utf-8"
+    )
+    assert load_judge_prompt("summary_quality", root=tmp_path).version == "v4"
+
+
 def test_judge_prompt_bare_version_line(tmp_path: Path) -> None:
     prompts = tmp_path / "judge_prompts"
     prompts.mkdir(parents=True)

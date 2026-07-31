@@ -19,6 +19,7 @@ returns ``None`` for an absent record. Loaders are pure filesystem I/O — no
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from evals.models import (
@@ -103,28 +104,43 @@ def load_query_fixtures(fixture_set: str, *, root: Path | None = None) -> QueryF
     return QueryFixtureSet(name=fixture_set, queries=queries, qrels=qrels)
 
 
+_VERSION_LINE = re.compile(
+    r"^(?:<!--\s*)?(?:#+\s*)?version\s*:\s*(?P<version>.+?)\s*(?:-->)?$",
+    re.IGNORECASE,
+)
+
+
 def _parse_version(text: str) -> str | None:
     """Extract an optional ``version:`` declaration from a prompt's header.
 
-    Two accepted forms: a ``---`` front-matter block, where ``version:`` may sit
-    alongside other keys (``name:``, ``model:``, …) anywhere inside the fence,
-    and a bare leading ``version:`` line. Anything else yields ``None`` — the
-    body of a prompt is never scanned, so a sentence mentioning a version deep
+    The *header* is either a ``---`` front-matter fence (where ``version:`` may
+    sit alongside ``name:``/``model:``/… in any order) or, absent a fence, the
+    leading block of lines up to the first blank line. Within it the declaration
+    may be bare (``version: v1``), Markdown-prefixed (``# version: v1`` — the
+    form Epic 15's judge prompts use), or HTML-commented
+    (``<!-- version: v1 -->``, the convention of the extraction prompt template).
+
+    The prompt *body* is never scanned, so a sentence mentioning a version deep
     in the instructions cannot be mistaken for the declaration.
     """
-    lines = [line for line in text.splitlines() if line.strip()]
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    header: list[str] = []
     if lines and lines[0].strip() == "---":
-        header = lines[1:]
-        for index, line in enumerate(header):
+        for line in lines[1:]:
             if line.strip() == "---":
-                header = header[:index]
                 break
+            header.append(line)
     else:
-        header = lines[:1]
+        for line in lines:
+            if not line.strip():
+                break
+            header.append(line)
     for line in header:
-        stripped = line.strip()
-        if stripped.lower().startswith("version:"):
-            return stripped.split(":", 1)[1].strip() or None
+        match = _VERSION_LINE.match(line.strip())
+        if match:
+            return match.group("version").strip() or None
     return None
 
 
