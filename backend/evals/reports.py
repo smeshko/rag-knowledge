@@ -23,6 +23,7 @@ would silently shadow this module.
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import sys
@@ -598,6 +599,71 @@ def _render_retrieval_summary(diff: RetrievalDiff) -> str:
     return "\n".join(lines)
 
 
+def _check_finite_metric(
+    container: dict[str, Any], measure: str, where: str
+) -> None:
+    """Require ``measure`` in ``container`` to be a finite, non-bool number.
+
+    ``json.loads`` happily parses the bare tokens ``NaN`` / ``Infinity``, and
+    every comparison against ``NaN`` is ``False`` — so an ``NaN`` metric slid
+    through :func:`_headline_tag` as ``[no change]`` and through the worst-
+    queries filter, reporting a confident "nothing moved".
+    """
+    value = container.get(measure)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: {measure} is not a number ({value!r})")
+    if not math.isfinite(value):
+        raise ValueError(f"{where}: {measure} is not finite ({value!r})")
+
+
+def _validate_retrieval_payload(
+    payload: dict[str, Any], label: str, path: Path
+) -> None:
+    """Structurally validate a retrieval payload before it reaches the differ.
+
+    :func:`diff_retrieval` is written for the shape ``run_retrieval_eval``
+    writes and reads it with ``.get(..., 0.0)`` and bare subscripts, so a
+    payload that merely *claims* ``report_type: "retrieval"`` produced silent
+    nonsense rather than an error: a missing ``aggregate`` defaulted to all
+    zeroes and reported a fabricated improvement at exit 0, a missing
+    ``per_query`` reported ``no_change``, and a wrongly-typed ``run`` (a list,
+    say) leaked ``AttributeError`` out as exit 1 — indistinguishable from a
+    real regression. Baselines are committed to git and outlive the code that
+    wrote them, so this is the one place that must not assume its input.
+
+    Every failure is a ``ValueError`` so the CLI maps it to exit 2.
+    """
+    where = f"malformed retrieval {label} {path}"
+    for field in ("run", "aggregate", "per_query"):
+        if not isinstance(payload.get(field), dict):
+            raise ValueError(f"{where}: {field!r} is missing or not an object")
+    aggregate: dict[str, Any] = payload["aggregate"]
+    for measure, _ in _RETRIEVAL_METRIC_LABELS:
+        _check_finite_metric(aggregate, measure, where)
+    per_query: dict[str, Any] = payload["per_query"]
+    for query_id, entry in per_query.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where}: per_query[{query_id!r}] is not an object")
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError(
+                f"{where}: per_query[{query_id!r}].metrics is missing or not an object"
+            )
+        # Only NDCG@10 is read per query (the diff's per-query delta).
+        _check_finite_metric(metrics, "ndcg_cut_10", f"{where}: per_query[{query_id!r}]")
+        ranks = entry.get("expected_item_ranks", {})
+        if not isinstance(ranks, dict):
+            raise ValueError(
+                f"{where}: per_query[{query_id!r}].expected_item_ranks is not an object"
+            )
+        for item_id, rank in ranks.items():
+            if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int)):
+                raise ValueError(
+                    f"{where}: per_query[{query_id!r}].expected_item_ranks[{item_id!r}] "
+                    f"is neither an integer rank nor null ({rank!r})"
+                )
+
+
 def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
     """Diff a report run against a committed baseline, dispatching by type.
 
@@ -610,10 +676,11 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
     raise ``FileNotFoundError`` — a diff against a nonexistent baseline or
     report is a caller error, not a "no changes" result.
 
-    Three further input errors raise instead of falling through to the
+    Four further input errors raise instead of falling through to the
     placeholder — each would otherwise be reported as a clean, exit-0 diff:
     a run finalized ``failed`` on either side, a ``report_type`` mismatch
-    between the two sides, and malformed / non-object JSON.
+    between the two sides, malformed / non-object JSON, and a retrieval
+    payload that fails :func:`_validate_retrieval_payload`.
     """
     if not baseline_path.is_file():
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
@@ -644,6 +711,8 @@ def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> Dif
             f"report is {current_type!r}"
         )
     if baseline_type == "retrieval":
+        _validate_retrieval_payload(baseline_payload, "baseline", baseline_path)
+        _validate_retrieval_payload(current_payload, "report", results_path)
         diff = diff_retrieval(baseline_payload, current_payload)
         return DiffResult(
             baseline_path=str(baseline_path),

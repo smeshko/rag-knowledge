@@ -384,6 +384,74 @@ def test_report_type_mismatch_is_refused(tmp_path: Path) -> None:
         diff_against_baseline(baseline_file, report_dir)
 
 
+def _diff_with_current(tmp_path: Path, current: dict[str, Any]) -> DiffResult:
+    baseline_file, report_dir = _write_pair(
+        tmp_path, _payload({"q1": _query(0.9, {"a": 1})}), current
+    )
+    return diff_against_baseline(baseline_file, report_dir)
+
+
+def test_missing_aggregate_is_refused_not_read_as_zeroes(tmp_path: Path) -> None:
+    # `.get("aggregate", {})` defaulted every measure to 0.0, so a baseline or
+    # report without it reported a fabricated improvement and exited 0.
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    del current["aggregate"]
+    with pytest.raises(ValueError, match="'aggregate' is missing or not an object"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_missing_per_query_is_refused_not_read_as_no_change(tmp_path: Path) -> None:
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    del current["per_query"]
+    with pytest.raises(ValueError, match="'per_query' is missing or not an object"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_wrongly_typed_run_block_is_refused_not_an_attributeerror(tmp_path: Path) -> None:
+    # `run: []` used to leak AttributeError, which the CLI surfaced as exit 1 —
+    # indistinguishable from a real regression.
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["run"] = []
+    with pytest.raises(ValueError, match="'run' is missing or not an object"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_nan_metric_is_refused_not_reported_as_no_change(tmp_path: Path) -> None:
+    # json.loads parses the bare `NaN` token, and every NaN comparison is
+    # False, so `_headline_tag` returned "[no change]" with full confidence.
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["aggregate"]["ndcg_cut_10"] = float("nan")
+    with pytest.raises(ValueError, match="ndcg_cut_10 is not finite"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_infinite_per_query_metric_is_refused(tmp_path: Path) -> None:
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["per_query"]["q1"]["metrics"]["ndcg_cut_10"] = float("inf")
+    with pytest.raises(ValueError, match="ndcg_cut_10 is not finite"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_non_numeric_metric_is_refused(tmp_path: Path) -> None:
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["aggregate"]["recall_5"] = "0.9"
+    with pytest.raises(ValueError, match="recall_5 is not a number"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_non_integer_expected_item_rank_is_refused(tmp_path: Path) -> None:
+    current = _payload({"q1": _query(0.9, {"a": 1})})
+    current["per_query"]["q1"]["expected_item_ranks"]["a"] = "1"
+    with pytest.raises(ValueError, match="neither an integer rank nor null"):
+        _diff_with_current(tmp_path, current)
+
+
+def test_null_expected_item_rank_stays_valid(tmp_path: Path) -> None:
+    # None is the legitimate "not retrieved" encoding — it must not be rejected.
+    result = _diff_with_current(tmp_path, _payload({"q1": _query(0.9, {"a": None})}))
+    assert result.status == "regression"  # 'a' dropped out of the top-k
+
+
 def test_malformed_json_raises_a_caller_facing_error(tmp_path: Path) -> None:
     baseline_file, report_dir = _write_pair(
         tmp_path,
