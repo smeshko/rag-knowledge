@@ -172,6 +172,29 @@ def test_metric_missing_from_baseline_is_new_not_regression(tmp_path: Path) -> N
     assert "judge.pass_rate: n/a -> 0.86 (new)" in result.summary
 
 
+def test_accuracy_the_baseline_measured_and_this_run_cannot_is_a_regression(
+    tmp_path: Path,
+) -> None:
+    # A run whose every extraction was rejected/truncated stays `completed` with
+    # all-None accuracy. Treating that as merely "missing" printed
+    # "No regressions detected" for a total extraction collapse.
+    baseline = _write_baseline(
+        tmp_path, _results(field_accuracy={"title_normalized": 0.97, "yield": 0.92})
+    )
+    run_dir = _write_run(
+        tmp_path,
+        _results(
+            field_accuracy={"title_normalized": None, "yield": None},
+            counts={"fixtures": 2, "recipes_extracted": 0, "extraction_failures": 2},
+        ),
+    )
+    result = diff_against_baseline(baseline, run_dir)
+    assert _change(result, "field_accuracy.title_normalized")["flag"] == FLAG_REGRESSION
+    assert result.status == "regressions_detected"
+    assert "no longer measured" in result.summary
+    assert "2 regression(s) detected." in result.summary
+
+
 def test_metric_missing_from_current_is_missing_not_regression(tmp_path: Path) -> None:
     # e.g. the current run had no judge-alignment pass, so agreement is absent.
     baseline = _write_baseline(tmp_path, _results(with_agreement=True, agreement_rate=0.91))

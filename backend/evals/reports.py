@@ -415,6 +415,21 @@ def _metric_direction(metric: str) -> str:
     return _DIRECTION_INFO if metric.startswith("count.") else _DIRECTION_HIGHER
 
 
+def _lost_coverage_is_a_regression(metric: str) -> bool:
+    """Whether a metric the baseline measured, and this run did not, is a drop.
+
+    Objective accuracy stops being measurable only when the fixtures it covers
+    stopped producing scores — e.g. every extraction was rejected or truncated,
+    which leaves the run ``completed`` with survivor-only (or no) accuracy. Left
+    as plain ``missing`` that scenario prints "No regressions detected" for a
+    total extraction collapse. Judge pass rate and judge-human agreement are
+    different: they are absent whenever the optional ``--judge`` /
+    ``judge-alignment`` steps simply were not run, so their absence stays
+    informational.
+    """
+    return metric.startswith("field_accuracy.")
+
+
 def _diff_extraction(
     current: dict[str, Any], baseline: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -423,7 +438,9 @@ def _diff_extraction(
     Direction per DECISIONS #5: accuracy / pass-rate / agreement are
     higher-is-better and flag ``[REGRESSION]`` on a drop beyond the tolerance;
     counts are informational context. A metric present on only one side is
-    ``new`` / ``missing`` — never a regression, never a crash.
+    ``new`` / ``missing`` and never crashes — except that an *accuracy* metric
+    the baseline carried and this run cannot measure is a regression, not a
+    shrug (see :func:`_lost_coverage_is_a_regression`).
     """
     current_metrics = _scalar_metrics(current)
     baseline_metrics = _scalar_metrics(baseline)
@@ -438,7 +455,7 @@ def _diff_extraction(
         elif baseline_value is None:
             flag = "new"
         elif current_value is None:
-            flag = "missing"
+            flag = FLAG_REGRESSION if _lost_coverage_is_a_regression(metric) else "missing"
         else:
             delta = current_value - baseline_value
             threshold = _DIFF_TOLERANCE + _TOLERANCE_SLACK
@@ -477,6 +494,8 @@ def _render_diff_summary(changes: list[dict[str, Any]]) -> str:
         if change["delta"] is not None and change["direction"] == _DIRECTION_HIGHER:
             rendered += f" (delta {change['delta']:+.2f})"
         if change["flag"] == FLAG_REGRESSION:
+            if change["current"] is None:
+                rendered += " (no longer measured)"
             rendered = f"{FLAG_REGRESSION} {rendered}"
         elif change["flag"] in ("new", "missing", "improved"):
             rendered += f" ({change['flag']})"
