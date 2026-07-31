@@ -143,6 +143,31 @@ def test_judge_prompt_parses_leading_version_line(tmp_path: Path) -> None:
     assert "strict judge" in prompt.text
 
 
+def test_judge_prompt_parses_version_below_other_front_matter_keys(tmp_path: Path) -> None:
+    prompts = tmp_path / "judge_prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "extraction-judge.md").write_text(
+        "---\nname: extraction-judge\nversion: v3\n---\n\nYou are a strict judge.\n"
+    )
+    assert load_judge_prompt("extraction-judge", root=tmp_path).version == "v3"
+
+
+def test_judge_prompt_bare_version_line(tmp_path: Path) -> None:
+    prompts = tmp_path / "judge_prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "extraction-judge.md").write_text("version: v1\n\nYou are a strict judge.\n")
+    assert load_judge_prompt("extraction-judge", root=tmp_path).version == "v1"
+
+
+def test_judge_prompt_body_version_mention_is_not_parsed(tmp_path: Path) -> None:
+    prompts = tmp_path / "judge_prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "extraction-judge.md").write_text(
+        "# Extraction judge\n\nversion: not-a-declaration\n"
+    )
+    assert load_judge_prompt("extraction-judge", root=tmp_path).version is None
+
+
 # --- judge alignment load / save --------------------------------------------
 
 
