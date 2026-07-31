@@ -45,6 +45,8 @@ __all__ = [
     "save_as_baseline",
 ]
 
+_SAFE_BASELINE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 RUN_STATUS_COMPLETED = "completed"
 RUN_STATUS_FAILED = "failed"
 
@@ -274,7 +276,17 @@ def save_as_baseline(
     Refuses to promote a run finalized as ``failed``: a baseline is the
     reference every later run is judged against, so silently blessing a crashed
     run would turn its empty results into "the expected numbers".
+
+    ``baseline_name`` must be a single safe path segment. Epic 16 surfaces it as
+    a user-supplied ``--name``, and an unchecked name is pasted straight into a
+    path: ``../reports/results`` would escape the baselines dir and an absolute
+    path would discard it entirely, silently clobbering an unrelated file.
     """
+    if not _SAFE_BASELINE_NAME.fullmatch(baseline_name):
+        raise ValueError(
+            f"invalid baseline name {baseline_name!r}: expected a single path segment "
+            f"of letters, digits, '.', '_' or '-'"
+        )
     root = BASELINES_ROOT if baselines_root is None else baselines_root
     source_doc = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
     if source_doc.get("status") == RUN_STATUS_FAILED:

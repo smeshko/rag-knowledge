@@ -263,6 +263,18 @@ def test_save_as_baseline_writes_fixed_shape(tmp_path: Path) -> None:
     assert baseline["source"]["results"] == {"accuracy": 0.9}
 
 
+@pytest.mark.parametrize(
+    "name", ["../escape", "nested/name", "/absolute", "", ".", "..", ".hidden"]
+)
+def test_save_as_baseline_rejects_unsafe_names(tmp_path: Path, name: str) -> None:
+    # Epic 16 exposes this as a user-supplied --name; it is pasted into a path.
+    run = _run(tmp_path / "reports")
+    run.write_results({})
+    with pytest.raises(ValueError, match="invalid baseline name"):
+        save_as_baseline(run.path, name, baselines_root=tmp_path / "baselines")
+    assert not (tmp_path / "escape.json").exists()
+
+
 def test_save_as_baseline_creates_baselines_root(tmp_path: Path) -> None:
     run = _run(tmp_path / "reports")
     run.write_results({})
