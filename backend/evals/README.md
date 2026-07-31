@@ -15,11 +15,12 @@ uv run rag-evals --help
 uv run rag-evals extraction --fixtures <set> --label <label> [--judge <name>]  # Epic 15
 uv run rag-evals judge-alignment --judge <name> --fixtures <set> [--report <dir>]  # Epic 15
 uv run rag-evals confidence-review [--report <dir>]             # Epic 15
-uv run rag-evals diff <baseline_path> <report_dir>              # Epic 15 (extraction)
-uv run rag-evals retrieval --queries <set> [--k 10]             # stub — Epic 16
+uv run rag-evals retrieval --queries <set> [--k 10] [--mode hybrid] [--label <label>]  # Epic 16
+uv run rag-evals diff <baseline_path> <report_dir>              # both report types
+uv run rag-evals save-baseline <report_path> --name <name>
 ```
 
-**Provider cost warning.** `extraction`, `judge-alignment` (on a judge-cache miss), and any `--judge` run construct a real LLM provider from `Settings` (`LLM_PROVIDER`, `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) and incur real API cost. They are a **local workflow, never CI** — CI only runs the offline unit tests, which drive everything with `FakeLLMProvider`. The judge cache (below) is what keeps repeat runs cheap. `confidence-review` and `diff` make no provider calls at all.
+**Provider cost warning.** `extraction`, `judge-alignment` (on a judge-cache miss), and any `--judge` run construct a real LLM provider from `Settings` (`LLM_PROVIDER`, `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) and incur real API cost. They are a **local workflow, never CI** — CI only runs the offline unit tests, which drive everything with `FakeLLMProvider`. The judge cache (below) is what keeps repeat runs cheap. **`rag-evals retrieval` performs live searches**: it drives `POST /api/v1/search` in-process through the real app, whose dependencies construct the real embedding (and, when `reranking_enabled`, reranker) providers — running it needs a reachable database and provider credentials. `confidence-review`, `diff`, and `save-baseline` make no provider calls at all (files only).
 
 ## Extraction evaluation workflow
 
@@ -29,7 +30,7 @@ The full loop (doc 12 § 5 / § 9), in command order — the order matters becau
 2. **`rag-evals judge-alignment --judge <name> --fixtures <set>`** — interactive: you rate each fixture's extraction pass/fail with a critique; the judge's rating is replayed from the cache (LLM only on a miss); agreement % is computed over fixtures both sides rated and disagreements are listed with **both** critiques. The agreement section is written back into the run's `results.json` (`--report <dir>`, default: the latest run).
 3. **Iterate the judge prompt** on the disagreement patterns, bump its `# version:` line, and re-run steps 1–2 — the version bump invalidates the judge cache and re-prompts for human ratings; ~0.90 agreement is the defensible bar (doc 12 § 5).
 4. **`rag-evals confidence-review`** — buckets the run's items by `confidence.overall` (`0.90–1.00`, `0.75–0.89`, `0.50–0.74`, `<0.50`; boundary values land in the higher bucket), overlays mean objective accuracy + judge pass rate per bucket, and surfaces miscalibration lines ("N items with confidence ≥0.90 failed the judge"). Written back into the same run's `results.json` + `summary.md`.
-5. **`rag-evals diff evals/baselines/extraction.json <report_dir>`** — diffs the run against the committed baseline: per-field accuracy, judge pass rate, judge-human agreement (higher is better; a drop beyond 0.01 is flagged `[REGRESSION]`) and item counts (informational). Calibration is a review view, not a diffed metric. Promote an accepted run with `evals.reports.save_as_baseline(run_dir, "extraction")`.
+5. **`rag-evals diff evals/baselines/extraction.json <report_dir>`** — diffs the run against the committed baseline: per-field accuracy, judge pass rate, judge-human agreement (higher is better; a drop beyond 0.01 is flagged `[REGRESSION]`) and item counts (informational). Calibration is a review view, not a diffed metric. Promote an accepted run with `rag-evals save-baseline <report_dir> --name extraction`.
 
 **`results.json` mutation contract:** `extraction` creates the per-run report; `judge-alignment` and `confidence-review` merge their `agreement` / `calibration` sections into that **same** file (preserving `metadata` and each other's sections); `diff` reads that file. Agreement/calibration therefore appear in a diff only when those commands ran against the run being diffed.
 
@@ -38,6 +39,45 @@ The full loop (doc 12 § 5 / § 9), in command order — the order matters becau
 - **Judge prompts** live at `data/fixtures/judge_prompts/<name>.md`. Three ship with Epic 15: `summary_quality`, `boundary_correctness`, `step_text_quality`. Each carries a `# version: v1` header line — **required for judges** (the harness refuses a version-less judge prompt) and load-bearing: any observable prompt change MUST bump it, because the version keys the cache and appears in every report line.
 - **Judge cache** — `evals/reports/.judge_cache/` (gitignored), one JSON file per `(fixture_name, judge_name, judge_version, model)`. A hit skips the LLM call entirely; a version bump misses by construction.
 - **Alignment records** — `data/fixtures/judge_alignment/<fixture_name>__<judge_name>.json` (committed). The id is judge-scoped so two judges aligned on one fixture never overwrite each other. `human_rating`/`judge_rating` hold bare `"pass"`/`"fail"`; both critiques plus `{judge_name, judge_version, model, fixture_name, rated_at}` live under `run_metadata`. Human ratings are version-keyed: re-running reuses them while the judge version matches; a bump re-prompts.
+
+## Retrieval eval workflow: run → save baseline → change → re-run → diff
+
+```bash
+# 1. Run the eval and note the printed report directory.
+uv run rag-evals retrieval --queries golden --k 10 --mode hybrid --label before
+
+# 2. Promote that run to the committed baseline (refuses failed runs).
+uv run rag-evals save-baseline evals/reports/<run-dir> --name retrieval
+
+# 3. Change something (prompt, boost knob, reranker, embedding model, ...),
+#    then re-run with a fresh label.
+uv run rag-evals retrieval --queries golden --k 10 --mode hybrid --label after
+
+# 4. Diff the new run against the committed baseline.
+uv run rag-evals diff evals/baselines/retrieval.json evals/reports/<new-run-dir>
+```
+
+`diff` prints a per-metric headline (`NDCG@10: 0.61 → 0.57 [REGRESSION -0.04]`
+past a small delta threshold), the per-query regression list (an expected item
+that dropped out of the top-k, or whose rank worsened by ≥ 3), and the biggest
+per-query NDCG@10 drops — and exits **1** when a regression was found (0
+otherwise, **2** for any input error), so it can gate a local check without
+being a CI gate. Exit 2 covers a missing path, malformed JSON, a run finalized
+`failed`, a `report_type` mismatch between the two sides, a payload that
+fails structural validation (missing/mistyped `run`, `aggregate`,
+`per_query`, comparability fields, non-finite metrics, or invalid
+`expected_item_ranks`), and two runs that are not comparable. Runs are only comparable when `query_set` / `mode` /
+`reranking_enabled` / `embedding_model` / `k` / `limit` all match; when they
+differ the diff prints a prominent warning and the full deltas but reports no
+quality verdict, so a run-config mismatch can never masquerade as a
+regression. Commit the
+updated `evals/baselines/retrieval.json` when a new baseline is intended —
+per-run report directories stay gitignored.
+
+`diff` dispatches on the reports' `report_type`: the same command diffs an
+extraction pair (step 5 of the extraction workflow above) with the same exit
+contract — 1 on a flagged `[REGRESSION]`, 0 otherwise, 2 for any input error
+— and refuses a `report_type` mismatch between the two sides with exit 2.
 
 ## Fixture layout
 

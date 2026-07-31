@@ -23,10 +23,12 @@ would silently shadow this module.
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -39,10 +41,12 @@ __all__ = [
     "RUN_STATUS_FAILED",
     "DiffResult",
     "ReportRun",
+    "RetrievalDiff",
     "RunMetadata",
     "SettingsLike",
     "build_metadata",
     "diff_against_baseline",
+    "diff_retrieval",
     "latest_run_dir",
     "save_as_baseline",
 ]
@@ -341,7 +345,12 @@ def save_as_baseline(
             f"of letters, digits, '.', '_' or '-'"
         )
     root = BASELINES_ROOT if baselines_root is None else baselines_root
-    source_doc = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
+    results_path = report_path / "results.json"
+    if not results_path.is_file():
+        # A report *directory* is the contract; pointing at results.json itself
+        # would otherwise die with an unhandled NotADirectoryError.
+        raise FileNotFoundError(f"report results not found: {results_path}")
+    source_doc = _load_json_object(results_path, "report")
     if source_doc.get("status") == RUN_STATUS_FAILED:
         raise ValueError(
             f"refusing to baseline a failed run: {report_path} "
@@ -359,10 +368,14 @@ def save_as_baseline(
 
 
 class DiffResult(BaseModel):
-    """Regression-diff result; the extraction branch fills ``changes`` (Epic 15).
+    """Regression-diff result shared by both diff paths (Epics 15 & 16).
 
-    Retrieval metrics join in Epic 16. The field set is fixed — downstream
-    phases fill it, they do not reshape it.
+    The extraction path fills ``changes`` with per-metric delta dicts and sets
+    ``status`` to ``ok``/``regressions_detected``; the retrieval path projects
+    a :class:`RetrievalDiff` onto it (``changes`` carries the per-query
+    regression entries, ``status`` one of ``no_change``/``improvement``/
+    ``regression``/``incomparable``). The field set is fixed — callers fill
+    it, they do not reshape it.
     """
 
     baseline_path: str
@@ -371,6 +384,8 @@ class DiffResult(BaseModel):
     summary: str
     changes: list[dict[str, Any]] = []
 
+
+# --- extraction regression diff (Epic 15 Phase 15.3) -------------------------
 
 # Absolute tolerance for regression flagging (DECISIONS #5): suppresses LLM
 # nondeterminism / floating-point jitter so [REGRESSION] means a real drop.
@@ -521,47 +536,452 @@ def _render_diff_summary(changes: list[dict[str, Any]]) -> str:
 def _refuse_failed(doc: dict[str, Any], path: Path, kind: str) -> None:
     """Refuse to diff a run finalized as ``failed`` (mirrors ``save_as_baseline``).
 
-    A crashed run's ``results`` is empty or partial, so every metric would
-    unwrap to ``None`` — read as "missing", never a regression — and the diff
-    would return ``ok`` / "No regressions detected" for a run that never
-    produced numbers. A false green here is worse than no diff at all.
+    Shared by both diff paths (extraction and retrieval). A crashed run's
+    ``results`` is empty or partial, so every metric would unwrap to ``None``
+    (read as "missing", never a regression) or default to a fabricated zero —
+    and the diff would report a confident "no change" for a run that never
+    produced numbers. A false green here is worse than no diff at all. ``doc``
+    is either envelope shape — a baseline file or a report's ``results.json``
+    — and :func:`_run_status` digs the finalized status out of it.
     """
-    if doc.get("status") == RUN_STATUS_FAILED:
+    if _run_status(doc) == RUN_STATUS_FAILED:
+        inner = (
+            doc["source"]
+            if "baseline_set_at" in doc and isinstance(doc.get("source"), dict)
+            else doc
+        )
         raise ValueError(
-            f"refusing to diff a failed {kind}: {path} "
-            f"(error: {doc.get('error', 'unknown')})"
+            f"refusing to diff a failed {kind}: {path} — a failed run's metrics "
+            f"were never produced (error: {inner.get('error', 'unknown')})"
         )
 
 
-def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
-    """Diff a run's extraction metrics against a committed baseline (doc 12 § 9).
+# --- retrieval regression diff (Epic 16 Phase 16.2) --------------------------
 
-    ``current_report_path`` is the run *directory* (mirroring
-    ``save_as_baseline``, which reads ``report_path / "results.json"``). The two
-    inputs are wrapped differently and are unwrapped before comparing:
-    ``current = doc["results"]`` (the ``{"metadata", "results"}`` envelope) but
-    ``baseline = doc["source"]["results"]`` (``save_as_baseline`` nests the
-    whole results document under ``source``). Missing inputs raise
-    ``FileNotFoundError`` — a diff against a nonexistent baseline or report is
-    a caller error, not a "no changes" result — and a run finalized as
-    ``failed`` on either side raises ``ValueError`` rather than diffing its
-    empty metrics into a clean bill of health.
+#: Display labels for the four retrieval measures, in headline order.
+_RETRIEVAL_METRIC_LABELS = (
+    ("ndcg_cut_10", "NDCG@10"),
+    ("recall_5", "Recall@5"),
+    ("recall_10", "Recall@10"),
+    ("recip_rank", "MRR"),
+)
+
+#: ``run``-block fields that make two runs incomparable when they differ
+#: (Epic 18's rerank stage changes item ordering materially). ``k`` and
+#: ``limit`` belong here too: ``k`` is the top-k cutoff the per-query
+#: regression checks apply, so a ``--k 5`` run against a ``--k 10`` baseline
+#: manufactures ``dropped_from_top_k`` entries for ranks 6-10, and ``limit``
+#: bounds how deep the run was collected at all, so a shallower re-run
+#: depresses Recall@10 for reasons that have nothing to do with ranking.
+_COMPARABILITY_FIELDS = (
+    "query_set",
+    "mode",
+    "reranking_enabled",
+    "embedding_model",
+    "k",
+    "limit",
+)
+
+#: Per-query regression thresholds (fixed by the epic): an expected item that
+#: dropped out of the top-k, or whose rank worsened by at least this much.
+_RANK_DROP_THRESHOLD = 3
+
+
+@dataclass(frozen=True)
+class RetrievalDiff:
+    """Pure diff of two unwrapped retrieval results payloads.
+
+    ``diff_against_baseline`` projects this onto :class:`DiffResult`; keeping
+    the rich shape separate leaves ``DiffResult`` (shared with Epic 15)
+    untouched.
     """
-    if not baseline_path.exists():
+
+    overall: dict[str, dict[str, float]]
+    per_query_ndcg_delta: dict[str, float]
+    added_query_ids: list[str]
+    removed_query_ids: list[str]
+    regressions: list[dict[str, Any]]
+    worst_queries: list[dict[str, Any]]
+    warnings: list[str]
+    headline: str
+    status: str
+
+
+def _unwrap(doc: dict[str, Any]) -> dict[str, Any]:
+    """Normalise either diff input to the inner results payload.
+
+    The two inputs are differently-shaped envelopes: a baseline file is
+    ``{"baseline_set_at", "run_label", "source": {"metadata", ..., "results"}}``
+    while a report's ``results.json`` is ``{"metadata", ..., "results"}`` —
+    and ``report_type`` lives *inside* the inner payload, so top-level reads
+    would silently dispatch nothing. A bare payload passes through unchanged.
+    """
+    if "baseline_set_at" in doc and isinstance(doc.get("source"), dict):
+        source = doc["source"]
+        results = source.get("results")
+        return results if isinstance(results, dict) else source
+    if "metadata" in doc and isinstance(doc.get("results"), dict):
+        results_doc: dict[str, Any] = doc["results"]
+        return results_doc
+    return doc
+
+
+def _run_status(doc: dict[str, Any]) -> str | None:
+    """The finalized run status carried by either diff-input envelope shape.
+
+    ``_unwrap`` deliberately discards the envelope, but ``status`` is the one
+    envelope field the diff must not ignore: a run finalized as ``failed``
+    keeps whatever partial payload it had managed to write, so diffing it
+    would report a confident "no change" (or a fabricated regression) over
+    results that were never produced.
+    """
+    if "baseline_set_at" in doc and isinstance(doc.get("source"), dict):
+        doc = doc["source"]
+    status = doc.get("status")
+    return status if isinstance(status, str) else None
+
+
+def _load_json_object(path: Path, label: str) -> dict[str, Any]:
+    """Read a JSON **object** from ``path``, or raise a caller-facing ``ValueError``."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed JSON in {label} {path}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"expected a JSON object in {label} {path}, got {type(doc).__name__}"
+        )
+    return doc
+
+
+def _headline_tag(delta: float, threshold: float) -> str:
+    # Strictly past the threshold tags; |delta| == threshold is "no change".
+    # The epsilon keeps float noise (0.595 - 0.600 != -0.005 exactly) from
+    # flipping the boundary case.
+    epsilon = 1e-9
+    if delta < -(threshold + epsilon):
+        return f"[REGRESSION {delta:+.2f}]"
+    if delta > threshold + epsilon:
+        return f"[IMPROVEMENT {delta:+.2f}]"
+    return "[no change]"
+
+
+def _query_regressions(
+    query_id: str,
+    baseline_ranks: dict[str, Any],
+    current_ranks: dict[str, Any],
+    *,
+    baseline_k: int,
+    current_k: int,
+) -> list[dict[str, Any]]:
+    """Flag expected items that left the top-k or dropped ≥ 3 ranks."""
+    entries: list[dict[str, Any]] = []
+    for item_id, baseline_rank in baseline_ranks.items():
+        if baseline_rank is None or baseline_rank > baseline_k:
+            continue  # was not in the baseline top-k: nothing to regress from
+        current_rank = current_ranks.get(item_id)
+        if current_rank is None or current_rank > current_k:
+            reason = "dropped_from_top_k"
+        elif current_rank - baseline_rank >= _RANK_DROP_THRESHOLD:
+            reason = "rank_drop"
+        else:
+            continue
+        entries.append(
+            {
+                "query_id": query_id,
+                "item_id": item_id,
+                "baseline_rank": baseline_rank,
+                "current_rank": current_rank,
+                "reason": reason,
+            }
+        )
+    return entries
+
+
+def diff_retrieval(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    headline_threshold: float = 0.005,
+    top_n: int = 5,
+) -> RetrievalDiff:
+    """Diff two **unwrapped** retrieval payloads; pure, no I/O.
+
+    Overall deltas are ``current − baseline`` per measure; per-query NDCG@10
+    deltas cover the baseline∩current query-id intersection (ids present in
+    only one run are reported as added/removed, never as a delta against
+    zero). The headline tags a metric only strictly past
+    ``headline_threshold``; per-query regression thresholds are fixed
+    (dropped from top-k, or rank-drop ≥ 3). A ``run``-block mismatch on any
+    of :data:`_COMPARABILITY_FIELDS` prepends a prominent warning and forces
+    ``status="incomparable"`` — such runs are not comparable, so no quality
+    verdict is reported for them.
+    """
+    baseline_run = baseline.get("run", {})
+    current_run = current.get("run", {})
+    warnings = [
+        f"WARNING: runs are not comparable — {field} differs "
+        f"(baseline={baseline_run.get(field)!r}, current={current_run.get(field)!r})"
+        for field in _COMPARABILITY_FIELDS
+        if baseline_run.get(field) != current_run.get(field)
+    ]
+
+    overall: dict[str, dict[str, float]] = {}
+    headline_lines = list(warnings)
+    tags: dict[str, str] = {}
+    for measure, label in _RETRIEVAL_METRIC_LABELS:
+        baseline_value = float(baseline.get("aggregate", {}).get(measure, 0.0))
+        current_value = float(current.get("aggregate", {}).get(measure, 0.0))
+        delta = current_value - baseline_value
+        overall[measure] = {
+            "baseline": baseline_value,
+            "current": current_value,
+            "delta": delta,
+        }
+        tag = _headline_tag(delta, headline_threshold)
+        tags[measure] = tag
+        headline_lines.append(f"{label}: {baseline_value:.2f} → {current_value:.2f} {tag}")
+
+    baseline_queries = baseline.get("per_query", {})
+    current_queries = current.get("per_query", {})
+    shared_ids = sorted(set(baseline_queries) & set(current_queries))
+    added = sorted(set(current_queries) - set(baseline_queries))
+    removed = sorted(set(baseline_queries) - set(current_queries))
+
+    per_query_ndcg_delta: dict[str, float] = {}
+    regressions: list[dict[str, Any]] = []
+    baseline_k = int(baseline_run.get("k", 10))
+    current_k = int(current_run.get("k", 10))
+    for query_id in shared_ids:
+        baseline_query = baseline_queries[query_id]
+        current_query = current_queries[query_id]
+        per_query_ndcg_delta[query_id] = float(
+            current_query["metrics"]["ndcg_cut_10"]
+        ) - float(baseline_query["metrics"]["ndcg_cut_10"])
+        regressions.extend(
+            _query_regressions(
+                query_id,
+                baseline_query.get("expected_item_ranks", {}),
+                current_query.get("expected_item_ranks", {}),
+                baseline_k=baseline_k,
+                current_k=current_k,
+            )
+        )
+
+    worst_queries = [
+        {"query_id": query_id, "delta": delta}
+        for query_id, delta in sorted(per_query_ndcg_delta.items(), key=lambda entry: entry[1])
+        if delta < 0
+    ][:top_n]
+
+    if warnings:
+        # The deltas above are still printed — they are the evidence for *why*
+        # the runs disagree — but a run-config mismatch is an input error, not
+        # a quality verdict. Returning "regression" here would emit exactly the
+        # fake regression the comparability warning exists to prevent, and the
+        # CLI would exit 1 for a comparison the code itself declared invalid.
+        status = "incomparable"
+    elif regressions or any(tag.startswith("[REGRESSION") for tag in tags.values()):
+        status = "regression"
+    elif any(tag.startswith("[IMPROVEMENT") for tag in tags.values()):
+        status = "improvement"
+    else:
+        status = "no_change"
+
+    return RetrievalDiff(
+        overall=overall,
+        per_query_ndcg_delta=per_query_ndcg_delta,
+        added_query_ids=added,
+        removed_query_ids=removed,
+        regressions=regressions,
+        worst_queries=worst_queries,
+        warnings=warnings,
+        headline="\n".join(headline_lines),
+        status=status,
+    )
+
+
+def _render_retrieval_summary(diff: RetrievalDiff) -> str:
+    """The full printable diff block: headline, regressions, worst queries."""
+    lines = [diff.headline]
+    if diff.regressions:
+        lines += ["", "Per-query regressions:"]
+        lines += [
+            f"- {entry['query_id']}: {entry['item_id']} "
+            f"rank {entry['baseline_rank']} → {entry['current_rank']} ({entry['reason']})"
+            for entry in diff.regressions
+        ]
+    if diff.worst_queries:
+        lines += ["", "Biggest NDCG@10 drops:"]
+        lines += [
+            f"- {entry['query_id']}: {entry['delta']:+.4f}" for entry in diff.worst_queries
+        ]
+    if diff.added_query_ids:
+        lines += ["", f"Queries only in current run: {', '.join(diff.added_query_ids)}"]
+    if diff.removed_query_ids:
+        lines += ["", f"Queries only in baseline run: {', '.join(diff.removed_query_ids)}"]
+    return "\n".join(lines)
+
+
+def _check_finite_metric(
+    container: dict[str, Any], measure: str, where: str
+) -> None:
+    """Require ``measure`` in ``container`` to be a finite, non-bool number.
+
+    ``json.loads`` happily parses the bare tokens ``NaN`` / ``Infinity``, and
+    every comparison against ``NaN`` is ``False`` — so an ``NaN`` metric slid
+    through :func:`_headline_tag` as ``[no change]`` and through the worst-
+    queries filter, reporting a confident "nothing moved".
+    """
+    value = container.get(measure)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: {measure} is not a number ({value!r})")
+    if not math.isfinite(value):
+        raise ValueError(f"{where}: {measure} is not finite ({value!r})")
+
+
+def _validate_retrieval_payload(
+    payload: dict[str, Any], label: str, path: Path
+) -> None:
+    """Structurally validate a retrieval payload before it reaches the differ.
+
+    :func:`diff_retrieval` is written for the shape ``run_retrieval_eval``
+    writes and reads it with ``.get(..., 0.0)`` and bare subscripts, so a
+    payload that merely *claims* ``report_type: "retrieval"`` produced silent
+    nonsense rather than an error: a missing ``aggregate`` defaulted to all
+    zeroes and reported a fabricated improvement at exit 0, a missing
+    ``per_query`` reported ``no_change``, and a wrongly-typed ``run`` (a list,
+    say) leaked ``AttributeError`` out as exit 1 — indistinguishable from a
+    real regression. Baselines are committed to git and outlive the code that
+    wrote them, so this is the one place that must not assume its input.
+
+    Every failure is a ``ValueError`` so the CLI maps it to exit 2.
+    """
+    where = f"malformed retrieval {label} {path}"
+    for field in ("run", "aggregate", "per_query"):
+        if not isinstance(payload.get(field), dict):
+            raise ValueError(f"{where}: {field!r} is missing or not an object")
+
+    run: dict[str, Any] = payload["run"]
+    for field in _COMPARABILITY_FIELDS:
+        if field not in run:
+            # Absent on *both* sides would compare equal and wave the runs
+            # through as comparable.
+            raise ValueError(f"{where}: run.{field} is missing")
+    for field in ("k", "limit"):
+        depth = run[field]
+        # `diff_retrieval` coerces with `int(...)`, which raises TypeError on a
+        # list — surfacing as exit 1, the regression code. A non-positive k
+        # also silences every rank-regression check, since each positive
+        # baseline rank then reads as already outside the top-k.
+        if isinstance(depth, bool) or not isinstance(depth, int):
+            raise ValueError(f"{where}: run.{field} is not an integer ({depth!r})")
+        if depth < 1:
+            raise ValueError(f"{where}: run.{field} is not positive ({depth!r})")
+
+    aggregate: dict[str, Any] = payload["aggregate"]
+    for measure, _ in _RETRIEVAL_METRIC_LABELS:
+        _check_finite_metric(aggregate, measure, where)
+
+    per_query: dict[str, Any] = payload["per_query"]
+    if not per_query:
+        # `run_retrieval_eval` cannot emit this — an empty fixture set is
+        # rejected up front — so it means truncation. With the aggregate left
+        # intact the diff would report `no_change` at exit 0 while every
+        # query had vanished.
+        raise ValueError(f"{where}: 'per_query' is empty")
+    for query_id, entry in per_query.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where}: per_query[{query_id!r}] is not an object")
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError(
+                f"{where}: per_query[{query_id!r}].metrics is missing or not an object"
+            )
+        # Only NDCG@10 is read per query (the diff's per-query delta).
+        _check_finite_metric(metrics, "ndcg_cut_10", f"{where}: per_query[{query_id!r}]")
+        # Required, not defaulted: `_query_regressions` reads it through
+        # `.get(..., {})`, so an absent map fabricates dropped-item
+        # regressions on the current side and silently disables rank-drop
+        # detection on the baseline side.
+        ranks = entry.get("expected_item_ranks")
+        if not isinstance(ranks, dict):
+            raise ValueError(
+                f"{where}: per_query[{query_id!r}].expected_item_ranks "
+                f"is missing or not an object"
+            )
+        for item_id, rank in ranks.items():
+            if rank is not None and (isinstance(rank, bool) or not isinstance(rank, int)):
+                raise ValueError(
+                    f"{where}: per_query[{query_id!r}].expected_item_ranks[{item_id!r}] "
+                    f"is neither an integer rank nor null ({rank!r})"
+                )
+            # Ranks are 1-based retrieved positions; `_query_regressions`
+            # treats `rank <= k` as "inside the top-k", so a zero/negative
+            # rank on the current side silently suppressed a
+            # dropped-from-top-k regression at exit 0.
+            if rank is not None and rank < 1:
+                raise ValueError(
+                    f"{where}: per_query[{query_id!r}].expected_item_ranks[{item_id!r}] "
+                    f"is not a positive rank ({rank!r})"
+                )
+
+
+def diff_against_baseline(baseline_path: Path, current_report_path: Path) -> DiffResult:
+    """Diff a report run against a committed baseline, dispatching by type.
+
+    The signature is asymmetric by design: ``baseline_path`` is a JSON
+    **file** (``save_as_baseline`` output) while ``current_report_path`` is a
+    report **directory** whose ``results.json`` is loaded. Both envelopes are
+    normalised via :func:`_unwrap` before dispatch on the inner payload's
+    ``report_type`` — retrieval pairs route to :func:`diff_retrieval`;
+    extraction pairs (``report_type`` absent, as Epic 15 runs write, or
+    ``"extraction"``) route to :func:`_diff_extraction` (doc 12 § 9). Missing
+    inputs raise ``FileNotFoundError`` — a diff against a nonexistent baseline
+    or report is a caller error, not a "no changes" result.
+
+    Four further input errors raise ``ValueError`` instead of diffing — each
+    would otherwise be reported as a clean, exit-0 diff: a run finalized
+    ``failed`` on either side, a ``report_type`` mismatch between the two
+    sides, malformed / non-object JSON, and a retrieval payload that fails
+    :func:`_validate_retrieval_payload`.
+    """
+    if not baseline_path.is_file():
         raise FileNotFoundError(f"baseline not found: {baseline_path}")
-    if not current_report_path.exists():
-        raise FileNotFoundError(f"report not found: {current_report_path}")
-    current_results_path = current_report_path / "results.json"
-    if not current_results_path.is_file():
-        raise FileNotFoundError(f"report results not found: {current_results_path}")
-    current_doc = json.loads(current_results_path.read_text(encoding="utf-8"))
-    baseline_doc = json.loads(baseline_path.read_text(encoding="utf-8"))
-    baseline_source = baseline_doc.get("source") or {}
-    _refuse_failed(current_doc, current_report_path, "report")
-    _refuse_failed(baseline_source, baseline_path, "baseline")
-    current = current_doc.get("results") or {}
-    baseline = baseline_source.get("results") or {}
-    changes = _diff_extraction(current, baseline)
+    if not current_report_path.is_dir():
+        # A report *directory* is the contract; pointing at results.json
+        # itself would otherwise die with an unhandled NotADirectoryError.
+        raise FileNotFoundError(f"report directory not found: {current_report_path}")
+    results_path = current_report_path / "results.json"
+    if not results_path.is_file():
+        raise FileNotFoundError(f"report results not found: {results_path}")
+
+    baseline_doc = _load_json_object(baseline_path, "baseline")
+    current_doc = _load_json_object(results_path, "report")
+    _refuse_failed(baseline_doc, baseline_path, "baseline")
+    _refuse_failed(current_doc, results_path, "report")
+
+    baseline_payload = _unwrap(baseline_doc)
+    current_payload = _unwrap(current_doc)
+    baseline_type = baseline_payload.get("report_type")
+    current_type = current_payload.get("report_type")
+    if baseline_type != current_type:
+        raise ValueError(
+            f"report type mismatch: baseline is {baseline_type!r}, "
+            f"report is {current_type!r}"
+        )
+    if baseline_type == "retrieval":
+        _validate_retrieval_payload(baseline_payload, "baseline", baseline_path)
+        _validate_retrieval_payload(current_payload, "report", results_path)
+        diff = diff_retrieval(baseline_payload, current_payload)
+        return DiffResult(
+            baseline_path=str(baseline_path),
+            current_path=str(current_report_path),
+            status=diff.status,
+            summary=_render_retrieval_summary(diff),
+            changes=diff.regressions,
+        )
+    changes = _diff_extraction(current_payload, baseline_payload)
     has_regressions = any(change["flag"] == FLAG_REGRESSION for change in changes)
     return DiffResult(
         baseline_path=str(baseline_path),

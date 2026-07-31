@@ -1,11 +1,13 @@
-"""Tests for the ``rag-evals`` CLI shape (Epic 14 Phase 14.1, Epic 15).
+"""Tests for the ``rag-evals`` CLI shape (Epic 14 Phase 14.1, Epics 15 & 16).
 
-``extraction`` gained real behaviour in Epic 15 Phase 15.1 (covered offline in
-``test_extraction_eval.py``); the remaining subcommands are scaffold stubs that
-print ``not implemented yet`` and exit 0 until Epics 15/16 fill them in. These
-tests pin the CLI shape: the five hyphenated subcommand names, flag options
-(``--fixtures``, ``--label``, ``--queries``, ``--k``, ``--judge``) vs the two
-positional ``diff`` arguments, and the ``--k`` default of 10.
+Every subcommand is real: extraction/judge behaviour landed in Epic 15
+(covered offline in ``test_extraction_eval.py`` / ``test_alignment.py`` /
+``test_calibration.py``), retrieval in Epic 16 (covered in
+``test_cli_retrieval.py``), and diff/save-baseline span both (covered in
+``test_reports_diff.py`` / ``test_cli_diff.py``). These tests pin the CLI
+shape: the hyphenated subcommand names, flag options (``--fixtures``,
+``--label``, ``--queries``, ``--k``, ``--judge``) vs the two positional
+``diff`` arguments, and the flag defaults.
 """
 
 from __future__ import annotations
@@ -19,10 +21,17 @@ from typer.testing import CliRunner
 
 runner = CliRunner()
 
-SUBCOMMANDS = ("extraction", "retrieval", "judge-alignment", "confidence-review", "diff")
+SUBCOMMANDS = (
+    "extraction",
+    "retrieval",
+    "judge-alignment",
+    "confidence-review",
+    "diff",
+    "save-baseline",
+)
 
 
-def test_help_lists_all_five_subcommands() -> None:
+def test_help_lists_all_subcommands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     for name in SUBCOMMANDS:
@@ -40,24 +49,17 @@ def test_extraction_without_required_label_flag_fails() -> None:
     assert result.exit_code == 2
 
 
-def test_retrieval_stub_exits_zero_with_required_queries_flag() -> None:
-    result = runner.invoke(app, ["retrieval", "--queries", "golden"])
-    assert result.exit_code == 0
-    assert "not implemented yet" in result.output
-
-
-def test_retrieval_k_flag_defaults_to_ten() -> None:
+def test_retrieval_flag_defaults() -> None:
+    # `retrieval` is real as of Epic 16 (behaviour covered in
+    # test_cli_retrieval.py with run_retrieval_eval stubbed); this pins the
+    # flag shape: --k/--mode/--label are *options* with these defaults.
     command = get_command(app)
     assert isinstance(command, click.Group)
     retrieval = command.commands["retrieval"]
-    k_param = next(param for param in retrieval.params if param.name == "k")
-    assert k_param.default == 10
-
-
-def test_retrieval_accepts_explicit_k_flag() -> None:
-    result = runner.invoke(app, ["retrieval", "--queries", "golden", "--k", "5"])
-    assert result.exit_code == 0
-    assert "not implemented yet" in result.output
+    defaults = {param.name: param.default for param in retrieval.params}
+    assert defaults["k"] == 10
+    assert defaults["mode"] == "hybrid"
+    assert defaults["label"] == "retrieval"
 
 
 def test_judge_alignment_requires_judge_and_fixtures_flags() -> None:
