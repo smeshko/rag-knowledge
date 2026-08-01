@@ -32,9 +32,18 @@ computed over rated fixtures only.
       "status": "completed",        # or "failed" for a crashed run
       "results": {
         "fixture_set": str,
+        "extraction_prompt_version": str,   # eval-side copy of the extraction
+                                    # PROMPT_VERSION; deliberately duplicates
+                                    # metadata.prompt_version — build_metadata
+                                    # lazily imports the rag_recipes constant, so
+                                    # only this copy reflects the monkeypatch
+                                    # seam the invalidation tests rely on
         "per_fixture": [            # one entry per fixture, keyed by name
           {"name", "status": "scored", "recipes_returned", "review_status",
-           "warnings", "confidence_overall", "missing_fields", "scores": {...}},
+           "warnings", "confidence_overall", "missing_fields", "scores": {...},
+           "recipes": [...],        # full extracted payload (persisted list)
+           "fixture_content_hash",  # RecipeFixture.content_hash() at run time
+           "scored_recipe_index"},  # which item `scores` describe (always 0)
           {"name", "status": "extraction_failed", "error"},
           {"name", "status": "hard_validation_failed", "recipes_returned",
            "failures"},             # production would persist nothing
@@ -59,6 +68,17 @@ computed over rated fixtures only.
         "calibration": null         # reserved — Phase 15.3 fills
       }
     }
+
+Three distinct artifact slices, never to be conflated (DECISIONS #8):
+
+- **scored item** — ``recipes[0]`` (``recipes[scored_recipe_index]``): the only
+  item hard-validated, soft-validated, objectively scored, and whose
+  ``confidence.overall`` feeds ``aggregate`` and calibration.
+- **persisted list** — the full ``recipes`` payload in ``results.json``: every
+  item the extractor returned, validated or not. ``scores`` describe the scored
+  item only, never the whole list.
+- **judged list** — the same full list as serialized for the judge; what the
+  judge and the human both rate.
 
 The driver never constructs an LLM provider — ``llm_provider`` is a required
 injected dependency (tests use ``FakeLLMProvider``); the only live-provider
@@ -91,6 +111,7 @@ from evals.scoring.objective import (
     score_yield,
 )
 from rag_recipes.ingestion.pipeline.extraction import (
+    PROMPT_VERSION,
     ExtractedRecipe,
     RecipeExtractionOutput,
     run_extraction,
@@ -105,11 +126,24 @@ from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.storage.enums import ExtractionRunStatus
 from rag_recipes.storage.models.source_span import SourceSpan
 
-__all__ = ["run_extraction_eval", "synthetic_span_id"]
+__all__ = ["extraction_prompt_version", "run_extraction_eval", "synthetic_span_id"]
 
 _TIME_FIELDS = ("prep_time", "cook_time", "total_time")
 
 _DEFAULT_BASELINE_PATH = BASELINES_ROOT / "extraction.json"
+
+
+def extraction_prompt_version() -> str:
+    """The extraction ``PROMPT_VERSION`` this module keys judge caching on.
+
+    Reads the module global at call time, so
+    ``monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", ...)`` is
+    reflected — the seam the hermetic prompt-version-invalidation tests use.
+    ``evals.alignment`` calls this accessor rather than importing the constant
+    (DECISIONS #2): a second module-level binding would drift silently and make
+    the monkeypatch cover only half the system.
+    """
+    return PROMPT_VERSION
 
 
 def synthetic_span_id(fixture_name: str) -> str:
@@ -500,6 +534,12 @@ async def run_extraction_eval(
                 if judge_section is not None:
                     judge_section.skip(fixture.name, "hard validation failed")
                 continue
+            # One serialization site for the persisted list and the judged list
+            # (TASK-003): a second model_dump would make the byte-identity
+            # guarantee between them true only by coincidence.
+            recipe_payloads = [
+                item.model_dump(mode="json", by_alias=True) for item in recipes
+            ]
             if judge_section is not None:
                 await judge_section.rate(fixture, recipe)
             warnings = validate_soft(recipe, thresholds=thresholds)
@@ -520,6 +560,9 @@ async def run_extraction_eval(
                     "confidence_overall": recipe.confidence.overall,
                     "missing_fields": missing,
                     "scores": _score_fixture(recipe, fixture.expected, accuracy_values),
+                    "recipes": recipe_payloads,
+                    "fixture_content_hash": fixture.content_hash(),
+                    "scored_recipe_index": 0,
                 }
             )
 
@@ -556,6 +599,13 @@ async def run_extraction_eval(
         run.write_results(
             {
                 "fixture_set": fixture_set,
+                # Deliberately duplicates metadata.prompt_version: build_metadata
+                # lazily imports PROMPT_VERSION from rag_recipes at call time, so
+                # the metadata copy is NOT reachable by monkeypatch.setattr(
+                # evals.extraction, "PROMPT_VERSION", ...). This eval-side copy is
+                # the seam that makes prompt-version cache invalidation testable
+                # hermetically (DECISIONS #2) — do not "simplify" it away.
+                "extraction_prompt_version": PROMPT_VERSION,
                 "per_fixture": per_fixture,
                 "aggregate": aggregate,
                 "judge": judge_payload,

@@ -92,6 +92,37 @@ def test_recipe_fixture_source_is_read_as_utf8(tmp_path: Path) -> None:
     assert fixture.expected == {"title": "Crème brûlée"}
 
 
+# --- RecipeFixture.content_hash ---------------------------------------------
+
+
+def _fixture(source_md: str, expected: dict[str, object]) -> RecipeFixture:
+    return RecipeFixture(name="carbonara", source_md=source_md, expected=expected)
+
+
+def test_content_hash_is_order_independent_over_expected() -> None:
+    # The hash canonicalizes `expected` (sort_keys), so a re-serialized
+    # expected.json with reordered keys is the same fixture content.
+    one = _fixture("# Carbonara\n", {"title": "Carbonara", "yield": "serves 2"})
+    other = _fixture("# Carbonara\n", {"yield": "serves 2", "title": "Carbonara"})
+    assert one.content_hash() == other.content_hash()
+
+
+def test_content_hash_changes_when_source_md_changes() -> None:
+    expected: dict[str, object] = {"title": "Carbonara"}
+    assert (
+        _fixture("# Carbonara\n", expected).content_hash()
+        != _fixture("# Carbonara (edited)\n", expected).content_hash()
+    )
+
+
+def test_content_hash_changes_when_expected_changes() -> None:
+    source = "# Carbonara\n"
+    assert (
+        _fixture(source, {"title": "Carbonara"}).content_hash()
+        != _fixture(source, {"title": "Cacio e Pepe"}).content_hash()
+    )
+
+
 # --- load_query_fixtures ----------------------------------------------------
 
 

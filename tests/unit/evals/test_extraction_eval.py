@@ -18,13 +18,15 @@ import evals.judge_cache
 import evals.reports
 import pytest
 from evals.cli import app
-from evals.extraction import run_extraction_eval
+from evals.extraction import run_extraction_eval, synthetic_span_id
 from evals.judges import JUDGE_SCHEMA_VERSION
 from typer.testing import CliRunner
 
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from tests.unit.evals.eval_utils import (
+    SOUP_EXPECTED,
+    SOUP_SOURCE,
     STEW_EXPECTED,
     STEW_SOURCE,
     THRESHOLDS,
@@ -105,6 +107,54 @@ async def test_per_fixture_scores_and_ready_needs_review_split(tmp_path: Path) -
     assert aggregate["missing_field_counts"] == {"total_time": 1, "steps": 1}
 
 
+async def test_scored_entries_persist_extracted_recipes(tmp_path: Path) -> None:
+    # Alignment (Epic 20 Phase 20.1) rates the exact artifact this run scored,
+    # so every scored entry must carry the full extracted payload plus the
+    # provenance needed to rebuild the judge-cache key from the run itself.
+    from evals.extraction import extraction_prompt_version
+    from evals.models import RecipeFixture
+
+    run = await _run_smoke_eval(tmp_path)
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    assert results["extraction_prompt_version"] == extraction_prompt_version()
+
+    by_name = {entry["name"]: entry for entry in results["per_fixture"]}
+    stew = by_name["bean-stew"]
+    assert stew["scored_recipe_index"] == 0
+    assert stew["fixture_content_hash"] == RecipeFixture(
+        name="bean-stew", source_md=STEW_SOURCE, expected=STEW_EXPECTED
+    ).content_hash()
+    (stew_recipe,) = stew["recipes"]
+    assert stew_recipe["title"] == "Bean Stew"
+    assert stew_recipe["source_span_ids"] == [synthetic_span_id("bean-stew")]
+    ingredients = stew_recipe["structured_data"]["ingredients"]
+    assert [item["raw_text"] for item in ingredients] == [
+        "1 onion, diced",
+        "2 cups white beans",
+    ]
+
+    soup = by_name["tomato-soup"]
+    (soup_recipe,) = soup["recipes"]
+    assert soup_recipe["title"] == "Tomato Soup"
+    assert soup["scored_recipe_index"] == 0
+    assert soup["fixture_content_hash"] == RecipeFixture(
+        name="tomato-soup", source_md=SOUP_SOURCE, expected=SOUP_EXPECTED
+    ).content_hash()
+
+
+def test_extraction_prompt_version_reflects_the_module_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The accessor is the seam alignment uses (it must not import the constant)
+    # and the monkeypatch target TASK-002's invalidation test depends on.
+    import evals.extraction
+    from evals.extraction import extraction_prompt_version
+
+    assert extraction_prompt_version() == evals.extraction.PROMPT_VERSION
+    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v2")
+    assert extraction_prompt_version() == "recipe-extraction-v2"
+
+
 async def test_summary_renders_doc12_extraction_report_shape(tmp_path: Path) -> None:
     run = await _run_smoke_eval(tmp_path)
     summary = (run.path / "summary.md").read_text(encoding="utf-8")
@@ -162,6 +212,7 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
     entry = results["per_fixture"][0]
     assert entry["status"] == "extraction_failed"
     assert entry["error"] == "max_tokens truncation"
+    assert "recipes" not in entry  # nothing extracted, nothing to persist
     aggregate = results["aggregate"]
     assert aggregate["extraction_failures"] == 1
     assert aggregate["recipes_extracted"] == 0
@@ -197,6 +248,7 @@ async def test_a_candidate_production_would_discard_is_not_scored_or_counted_rea
     assert entry["status"] == "hard_validation_failed"
     assert "source_span_not_in_window" in entry["failures"]
     assert "scores" not in entry
+    assert "recipes" not in entry  # production would persist nothing
     aggregate = results["aggregate"]
     assert aggregate["hard_validation_failures"] == 1
     assert aggregate["ready"] == 0
@@ -262,6 +314,12 @@ async def test_a_fixture_split_across_items_is_counted_not_collapsed(tmp_path: P
     )
     results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
     assert results["per_fixture"][0]["recipes_returned"] == 2
+    # The full persisted list keeps both items even though only item 0 is scored
+    # (scored item vs persisted list, DECISIONS #8).
+    persisted = results["per_fixture"][0]["recipes"]
+    assert len(persisted) == 2
+    assert [item["title"] for item in persisted] == ["Bean Stew", "Bean Stew"]
+    assert results["per_fixture"][0]["scored_recipe_index"] == 0
     assert results["aggregate"]["recipes_extracted"] == 2
     assert results["aggregate"]["fixtures"] == 1
     assert results["aggregate"]["over_split_fixtures"] == 1
