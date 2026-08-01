@@ -9,6 +9,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Dummy values for Settings construction at test-collection time.
+      # Unit tests are hermetic (fake providers) — nothing dials out.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/rag_recipes
+      REDIS_URL: redis://:redis@localhost:6379/0
+      OPENAI_API_KEY: sk-ci-dummy
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
