@@ -100,6 +100,7 @@ _BAD_RUN_SHAPES = (
     "missing_dir",
     "missing_results",
     "malformed_results",
+    "malformed_per_fixture",
     "failed_run",
     "retrieval_run",
     "set_mismatch",
@@ -139,6 +140,18 @@ def test_judge_alignment_bad_run_exits_2_without_provider_or_settings(
         run = tmp_path / "bad-run"
         run.mkdir()
         (run / "results.json").write_text("{not json", encoding="utf-8")
+        args += ["--report", str(run)]
+    elif shape == "malformed_per_fixture":
+        # Valid JSON, wrong shape: iterating a null per_fixture raises
+        # TypeError, which this command does not catch — exit 1 + traceback.
+        run = _write_run(
+            tmp_path / "shape-run",
+            {
+                "metadata": {},
+                "status": "completed",
+                "results": {"fixture_set": "smoke", "per_fixture": None},
+            },
+        )
         args += ["--report", str(run)]
     elif shape == "failed_run":
         run = _write_run(

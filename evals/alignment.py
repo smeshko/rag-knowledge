@@ -197,6 +197,29 @@ def _run_fix_hint(fixture_set: str) -> str:
     return f"run `rag-evals extraction --fixtures {fixture_set} --label <label>` first"
 
 
+def _per_fixture_index(results: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The run's per-fixture entries keyed by fixture name, read defensively.
+
+    Every key of a foreign ``results.json`` is read with ``.get()`` and its
+    *shape* checked (DECISIONS #9): a payload whose ``per_fixture`` is ``null``
+    or a scalar — a hand-edited or truncated file — would otherwise raise
+    ``TypeError`` from the iteration, and the CLI catches only
+    ``(FileNotFoundError, ValueError)``, so a bad-run shape would surface as a
+    traceback instead of exit 2. An unusable ``per_fixture`` degrades to "no
+    entries", which routes every fixture down the unrated path.
+    """
+    entries = results.get("per_fixture")
+    if not isinstance(entries, list):
+        return {}
+    index: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            if isinstance(name, str):
+                index[name] = entry
+    return index
+
+
 def load_alignment_run(
     run_dir: Path | None, fixture_set: str, fixtures: list[RecipeFixture]
 ) -> dict[str, Any]:
@@ -209,7 +232,8 @@ def load_alignment_run(
     before the human has rated anything. Checks, in order: a run dir exists,
     its ``results.json`` exists and parses, the run did not finalize
     ``failed``, the payload is an extraction run for exactly ``fixture_set``,
-    and no loaded fixture's ``content_hash()`` drifted from the run-recorded
+    its ``per_fixture`` (when present) is a list rather than some other JSON
+    value, and no loaded fixture's ``content_hash()`` drifted from the run-recorded
     ``fixture_content_hash`` (all drifted fixtures reported in one message —
     a fixture with *no* recorded hash is not drift; it degrades to unrated in
     the loop, so a pre-change run never fails here).
@@ -252,11 +276,17 @@ def load_alignment_run(
             f"{results.get('fixture_set')!r}, not {fixture_set!r}; "
             f"{_run_fix_hint(fixture_set)}"
         )
-    per_fixture = {
-        entry.get("name"): entry
-        for entry in results.get("per_fixture", [])
-        if isinstance(entry, dict)
-    }
+    # Shape, not just syntax: `"per_fixture": null` (or a scalar) is valid JSON
+    # that the drift scan would iterate into a TypeError — a traceback where the
+    # contract promises exit 2. Refusing beats degrading here: the alternative
+    # would write `unrated` records into the committed `judge_alignment/` dir
+    # and an `agreement` section into a run whose payload we cannot read.
+    if "per_fixture" in results and not isinstance(results["per_fixture"], list):
+        raise ValueError(
+            f"malformed results.json in {run_dir}: per_fixture is not a list; "
+            f"{_run_fix_hint(fixture_set)}"
+        )
+    per_fixture = _per_fixture_index(results)
     drifted = [
         fixture.name
         for fixture in fixtures
@@ -338,11 +368,7 @@ async def run_judge_alignment(
     extraction_provider = str(run_meta.get("llm_provider", "unknown"))
     extraction_model = str(run_meta.get("llm_model", "unknown"))
     prompt_version = results.get("extraction_prompt_version")
-    per_fixture = {
-        entry.get("name"): entry
-        for entry in results.get("per_fixture", [])
-        if isinstance(entry, dict)
-    }
+    per_fixture = _per_fixture_index(results)
 
     records: list[JudgeAlignmentRecord] = []
     disagreements: list[AlignmentDisagreement] = []

@@ -796,6 +796,23 @@ async def test_every_unusable_run_shape_raises_value_error(tmp_path: Path) -> No
     # A fixture-set mismatch: smoke2 fixtures against the smoke run.
     with pytest.raises(ValueError, match="not 'smoke2'"):
         await align(run_dir, fixture_set="smoke2")
+    # Malformed *shape* (not syntax): per_fixture is valid JSON but not a list.
+    # Iterating it would raise TypeError, which the CLI does not catch — so the
+    # bad-run contract (ValueError → exit 2) would break on a traceback.
+    for bad in (None, 5, "oops"):
+        (tmp_path / "shape-run").mkdir(exist_ok=True)
+        (tmp_path / "shape-run" / "results.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "status": "completed",
+                    "results": {"fixture_set": "smoke", "per_fixture": bad},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="per_fixture is not a list"):
+            await align(tmp_path / "shape-run")
 
 
 def test_load_alignment_run_returns_the_results_payload(tmp_path: Path) -> None:
