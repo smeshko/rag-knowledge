@@ -148,6 +148,11 @@ async def persist_chunks_for_ready_items(
     re-chunking the prior version's still-READY items: during that run the prior
     version's items remain active (the supersede + active-version flip happen later,
     at the READY gate) so an unscoped query would duplicate their chunks.
+
+    Items that already carry chunks are skipped, which makes the call replayable:
+    a ``resume`` finalize re-runs this over a READY set that mixes freshly promoted
+    winners with items an earlier pass of the same ingest already chunked, and only
+    the former need building.
     """
     result = await session.execute(
         select(KnowledgeItem).where(
@@ -156,8 +161,22 @@ async def persist_chunks_for_ready_items(
             KnowledgeItem.status == KnowledgeItemStatus.READY,
         )
     )
+    items = list(result.scalars().all())
+    already_chunked: set[str] = set()
+    if items:
+        already_chunked = set(
+            (
+                await session.execute(
+                    select(Chunk.parent_id).where(Chunk.parent_id.in_([item.id for item in items]))
+                )
+            )
+            .scalars()
+            .all()
+        )
     chunks: list[Chunk] = []
-    for item in result.scalars().all():
+    for item in items:
+        if item.id in already_chunked:
+            continue
         chunks.extend(build_chunks(item, category=category))
     session.add_all(chunks)
     await session.flush()

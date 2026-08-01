@@ -176,9 +176,7 @@ def _build_llm_provider(
     if settings.llm_provider == "anthropic":
         api_key = settings.anthropic_api_key
         if api_key is None:
-            raise ValueError(
-                "anthropic_api_key is required when llm_provider == 'anthropic'"
-            )
+            raise ValueError("anthropic_api_key is required when llm_provider == 'anthropic'")
         return AnthropicLLMProvider(
             api_key,
             default_model=settings.anthropic_llm_model,
@@ -241,6 +239,19 @@ def _chunked(windows: list[Window], size: int) -> Iterator[list[Window]]:
         yield windows[start : start + size]
 
 
+def _window_key(span_ids: list[str]) -> str:
+    """Identity of the page window a set of source spans forms.
+
+    Keys the window on its span set alone — deliberately *not* on the
+    ``input_hash``, which also folds in the prompt/schema version. A reuse pass
+    re-extracts the same window under a bumped prompt and must be recognised as
+    having covered it; hashing the prompt in would make every reuse window look
+    untouched. Ordering is normalised so a span-order change never forges a new
+    window identity.
+    """
+    return " ".join(sorted(span_ids))
+
+
 async def _run_extraction_batches(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -249,7 +260,7 @@ async def _run_extraction_batches(
     settings: Settings,
     provider: LLMProvider,
     observability: ProviderObservability | None,
-) -> None:
+) -> frozenset[str]:
     """Extract every window, committing per batch (Phase 9.5, DECISIONS #4).
 
     Loads the document's ordered spans, builds the overlapping page windows, then
@@ -261,6 +272,12 @@ async def _run_extraction_batches(
     heartbeat advances on every batch commit (server ``func.now()``, never via
     ``onupdate``) so the progress-aware stuck-job sweep can tell a slow-but-healthy
     run from a hung one.
+
+    Returns the ``_window_key`` of every window this pass actually sent to the
+    provider — i.e. all windows minus the ones the skip set short-circuited.
+    ``_finalize_extraction`` needs it to tell a full re-extraction from a partial
+    resume: only the windows in this set have a fresh candidate that may replace
+    what an earlier pass already promoted.
     """
     async with session_factory() as session:
         spans = await _load_ordered_spans(session, document_id, source_version)
@@ -282,9 +299,8 @@ async def _run_extraction_batches(
             .scalars()
             .all()
         )
-    windows = build_windows(
-        spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
-    )
+    windows = build_windows(spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages)
+    reextracted: set[str] = set()
 
     for batch in _chunked(windows, settings.extraction_commit_batch_size):
         async with session_factory() as session:
@@ -294,6 +310,10 @@ async def _run_extraction_batches(
                     # staging candidates are committed and finalize reads them
                     # from the DB, so skip the provider/DB work entirely.
                     continue
+                # Recorded before the provider call, so a window whose extraction
+                # errors still counts as covered: this pass owns it either way, and
+                # a reuse must not carry the prior item forward on a failed retry.
+                reextracted.add(_window_key(list(window.span_ids)))
                 run = await run_extraction(
                     session,
                     window,
@@ -302,10 +322,7 @@ async def _run_extraction_batches(
                     provider=provider,
                     observability=observability,
                 )
-                if (
-                    run.status is not ExtractionRunStatus.SUCCESS
-                    or run.output_json is None
-                ):
+                if run.status is not ExtractionRunStatus.SUCCESS or run.output_json is None:
                     continue
                 parsed = RecipeExtractionOutput.model_validate(run.output_json)
                 for extracted in parsed.items:
@@ -340,6 +357,7 @@ async def _run_extraction_batches(
                 .values(last_progress_at=func.now())
             )
             await session.commit()
+    return frozenset(reextracted)
 
 
 # Non-terminal item statuses: a window with an item in one of these is already
@@ -393,18 +411,14 @@ async def _register_extraction_batch_items(
                     select(ExtractionBatchItem.input_hash).where(
                         ExtractionBatchItem.document_id == document_id,
                         ExtractionBatchItem.source_version == source_version,
-                        ExtractionBatchItem.status.in_(
-                            _NON_TERMINAL_BATCH_ITEM_STATUSES
-                        ),
+                        ExtractionBatchItem.status.in_(_NON_TERMINAL_BATCH_ITEM_STATUSES),
                     )
                 )
             )
             .scalars()
             .all()
         )
-    windows = build_windows(
-        spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages
-    )
+    windows = build_windows(spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages)
     # The sanitized schema is identical for every window — build it once and store
     # the same dict on each item so submission is a pure transform (DECISIONS #5).
     request_schema = _sanitize_schema(build_recipe_v1_json_schema())
@@ -453,6 +467,7 @@ async def _finalize_extraction(
     *,
     document_id: str,
     source_version: int,
+    reextracted_windows: frozenset[str] | None = None,
 ) -> int:
     """Promote staged candidates to final status in one atomic transaction.
 
@@ -465,6 +480,28 @@ async def _finalize_extraction(
     validating_items → creating_chunks``. One transaction so no reader ever sees a
     half-finalized document (the atomicity 9.4's Session #4 gave, now scoped to
     finalize). Returns the number of surviving (chosen) items.
+
+    ``reextracted_windows`` is the set of window keys this pass actually called the
+    provider for (``_run_extraction_batches``'s return). Items already promoted at
+    this ``source_version`` whose producing window is **not** in that set are loaded
+    as candidates alongside the staging rows, because this pass never revisited
+    their window and therefore holds no replacement for them.
+
+    That distinction is what separates the two same-version passes. A ``reuse``
+    re-extracts every window, so nothing is carried, and the keep-set supersede
+    below retires the whole prior pass — including recipes whose titles the new
+    extraction no longer produces (Epic 11.1's replacement semantics). A ``resume``
+    re-extracts only the windows with no committed ``ExtractionRun`` (the
+    ``done_hashes`` skip set), so with only that remainder in the dedup the
+    supersede would retire every item the earlier passes of the very same ingest
+    had already promoted — the whole book, replaced by the last few windows.
+    Carrying the untouched windows' items restores the supersede's premise: every
+    live item at this version competed, so anything outside the keep-set genuinely
+    lost its title.
+
+    ``None`` means "every window was covered" (the legacy full-pass behaviour).
+    ``REJECTED`` rows are never carried (terminal audit record, no resurrection),
+    nor are ``INDEXING`` rows (an in-flight approval owns them).
     """
     async with session_factory() as session:
         items = list(
@@ -480,6 +517,32 @@ async def _finalize_extraction(
             .scalars()
             .all()
         )
+        # Losing a dedup group means deletion for a staging row (nothing else
+        # references it) but only a status flip for a carried one: it may hold
+        # chunks and is part of the document's audit trail.
+        staged_ids = {item.id for item in items}
+        if reextracted_windows is not None:
+            carried = (
+                await session.execute(
+                    select(KnowledgeItem, ExtractionRun.input_source_span_ids)
+                    .join(ExtractionRun, ExtractionRun.id == KnowledgeItem.extraction_run_id)
+                    .where(
+                        KnowledgeItem.document_id == document_id,
+                        KnowledgeItem.source_version == source_version,
+                        KnowledgeItem.status.in_(
+                            {
+                                KnowledgeItemStatus.READY,
+                                KnowledgeItemStatus.NEEDS_REVIEW,
+                            }
+                        ),
+                    )
+                )
+            ).all()
+            items.extend(
+                item
+                for item, span_ids in carried
+                if _window_key(span_ids) not in reextracted_windows
+            )
         candidates = [
             CandidateRef(
                 item_id=item.id,
@@ -507,35 +570,45 @@ async def _finalize_extraction(
                 ref.normalized_title,
                 ref.candidate_score,
             )
-        if discarded:
+        discarded_staged = [ref.item_id for ref in discarded if ref.item_id in staged_ids]
+        discarded_promoted = [ref.item_id for ref in discarded if ref.item_id not in staged_ids]
+        if discarded_staged:
             await session.execute(
-                delete(KnowledgeItem).where(
-                    KnowledgeItem.id.in_([ref.item_id for ref in discarded])
-                )
+                delete(KnowledgeItem).where(KnowledgeItem.id.in_(discarded_staged))
+            )
+        if discarded_promoted:
+            await session.execute(
+                update(KnowledgeItem)
+                .where(KnowledgeItem.id.in_(discarded_promoted))
+                .values(status=KnowledgeItemStatus.SUPERSEDED)
+                .execution_options(synchronize_session=False)
             )
 
         # Promote winners: re-derive final status from the stored warnings
-        # (DECISIONS #1) — empty → ready, any warning → needs_review.
+        # (DECISIONS #1) — empty → ready, any warning → needs_review. Only the
+        # staging rows are (re)derived: an already-promoted winner keeps the
+        # status it holds, so a review decision taken on it is never overwritten.
         items_by_id = {item.id: item for item in items}
         for ref in chosen:
             item = items_by_id[ref.item_id]
+            if item.id not in staged_ids:
+                continue
             warnings = item.structured_data.get("warnings") or []
             item.status = (
-                KnowledgeItemStatus.NEEDS_REVIEW
-                if warnings
-                else KnowledgeItemStatus.READY
+                KnowledgeItemStatus.NEEDS_REVIEW if warnings else KnowledgeItemStatus.READY
             )
 
-        # Whether this pass produced an *accepted* (READY) replacement. This — not
+        # Whether this version now holds an *accepted* (READY) winner. This — not
         # merely "chosen is non-empty" — is the gate for both superseding the prior
         # set and (re)building chunks (review #2). A pass whose only winners are
         # NEEDS_REVIEW, or a zero-winner pass, must NOT retire the prior active
         # version: the epic's rule is "supersede only after the new run reaches
         # ready" / "a needs_review/failed re-extraction must not auto-supersede"
-        # (DECISIONS #5).
+        # (DECISIONS #5). A surviving already-promoted READY winner satisfies the
+        # gate too — the version is searchable either way, and the supersede is now
+        # safe because that winner competed in the dedup above.
         has_ready_winner = any(
-            items_by_id[ref.item_id].status is KnowledgeItemStatus.READY
-            for ref in chosen
+            items_by_id[ref.item_id].status is KnowledgeItemStatus.READY for ref in chosen
         )
 
         # Same-version supersede (Epic 11.1): retire the prior pass's items *at this
@@ -543,6 +616,9 @@ async def _finalize_extraction(
         # pass's dedup (the `chosen` set). This is the reuse case — a same-version
         # re-run replaces the prior same-version pass before chunks are (re)built, so
         # persist_chunks_for_ready_items below never re-chunks the retired items.
+        # Sound only because the live same-version items were loaded as candidates
+        # above: a run outside the keep-set lost its title to a better copy, it was
+        # not merely absent from a partial resume's staging set.
         #
         # Crucially this is scoped to `source_version`: it must NOT touch a different
         # (prior-active) version's live items. The cross-version active-version
@@ -598,9 +674,7 @@ async def _finalize_extraction(
         # report progress or a long-but-healthy run would be reaped on the stale
         # last_progress_at frozen at the final extraction batch (review #1).
         await session.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(last_progress_at=func.now())
+            update(Document).where(Document.id == document_id).values(last_progress_at=func.now())
         )
         logger.info("created %d chunks for %s", chunk_count, document_id)
         await session.commit()
@@ -661,9 +735,7 @@ async def _embed_document_chunks(
         # is no longer sweep-exempt, so a freshly-embedded document must carry a fresh
         # last_progress_at or the sweep would reap it on the stale extraction heartbeat.
         await session.execute(
-            update(Document)
-            .where(Document.id == document_id)
-            .values(last_progress_at=func.now())
+            update(Document).where(Document.id == document_id).values(last_progress_at=func.now())
         )
         await session.commit()
     logger.info("embedded %d chunks for %s", len(embeddings), document_id)
@@ -749,9 +821,7 @@ async def _index_and_finalize(
             doc.active_source_version = source_version
             await session.flush()
         await session.commit()
-    logger.info(
-        "finalized %s -> %s (%d chunks)", document_id, terminal.value, chunk_count or 0
-    )
+    logger.info("finalized %s -> %s (%d chunks)", document_id, terminal.value, chunk_count or 0)
     return terminal
 
 
@@ -773,9 +843,7 @@ async def _resume_or_fresh(
     completed doc; the caller no-ops rather than risk flipping a good row to
     FAILED). Raises ``LookupError`` when the document does not exist.
     """
-    status = await session.scalar(
-        select(Document.status).where(Document.id == document_id)
-    )
+    status = await session.scalar(select(Document.status).where(Document.id == document_id))
     if status is None:
         raise LookupError(f"Document not found: {document_id}")
     if status is DocumentStatus.QUEUED:
@@ -845,18 +913,14 @@ async def process_document(
                 if entry == "skip":
                     return 0
                 if entry == "fresh":
-                    await transition_to(
-                        session, document_id, DocumentStatus.EXTRACTING_TEXT
-                    )
+                    await transition_to(session, document_id, DocumentStatus.EXTRACTING_TEXT)
                     await session.commit()
                 elif entry == "reuse":
                     # Reuse reprocess (Epic 11.1): skip the PDF text stage. Jump
                     # straight to item extraction over the existing spans via the
                     # QUEUED -> EXTRACTING_ITEMS edge — the doc never enters
                     # EXTRACTING_TEXT / CREATING_SOURCE_SPANS.
-                    await transition_to(
-                        session, document_id, DocumentStatus.EXTRACTING_ITEMS
-                    )
+                    await transition_to(session, document_id, DocumentStatus.EXTRACTING_ITEMS)
                     await session.commit()
 
             # Staged flow with resumable entry points: the entry selects the
@@ -894,9 +958,7 @@ async def process_document(
                     # extraction so the stuck-job cron sees progress. On resume the
                     # doc is already in EXTRACTING_ITEMS, so this is skipped.
                     async with session_factory() as session:
-                        await transition_to(
-                            session, document_id, DocumentStatus.EXTRACTING_ITEMS
-                        )
+                        await transition_to(session, document_id, DocumentStatus.EXTRACTING_ITEMS)
                         await session.commit()
                 elif entry == "reuse":
                     # The reuse entry already landed the doc in EXTRACTING_ITEMS
@@ -909,9 +971,7 @@ async def process_document(
                         source_version,
                     )
                 else:
-                    logger.info(
-                        "resuming extraction for %s from extracting_items", document_id
-                    )
+                    logger.info("resuming extraction for %s from extracting_items", document_id)
 
                 # Epic 19.2 batch path: register each window as a PENDING
                 # ExtractionBatchItem (no synchronous LLM call) and return, leaving
@@ -945,7 +1005,7 @@ async def process_document(
                 # candidates in one atomic finalize transaction (dedup from persisted
                 # rows; DECISIONS #1, #3). Both run inside this try/except so a
                 # batch-level LLMTechnicalError still routes to mark_failed.
-                await _run_extraction_batches(
+                reextracted_windows = await _run_extraction_batches(
                     session_factory,
                     document_id=document_id,
                     source_version=source_version,
@@ -954,7 +1014,10 @@ async def process_document(
                     observability=observability,
                 )
                 chosen_count = await _finalize_extraction(
-                    session_factory, document_id=document_id, source_version=source_version
+                    session_factory,
+                    document_id=document_id,
+                    source_version=source_version,
+                    reextracted_windows=reextracted_windows,
                 )
 
             if entry in ("fresh", "resume", "reuse", "embed"):
@@ -964,9 +1027,7 @@ async def process_document(
                 # persisted; embed_chunks upserts, so the replay is idempotent).
                 # Provider seam mirrors the LLM one.
                 if entry == "embed":
-                    logger.info(
-                        "resuming embedding for %s from creating_chunks", document_id
-                    )
+                    logger.info("resuming embedding for %s from creating_chunks", document_id)
                 embedding_provider: EmbeddingProvider = ctx.get(
                     "embedding_provider"
                 ) or _build_embedding_provider(settings, observability)
@@ -982,9 +1043,7 @@ async def process_document(
                 # Resume after a crash between the embedding commit and the terminal
                 # commit: the embeddings are persisted at EMBEDDING_CHUNKS, so run
                 # only the idempotent index + terminal stage.
-                logger.info(
-                    "resuming indexing for %s from embedding_chunks", document_id
-                )
+                logger.info("resuming indexing for %s from embedding_chunks", document_id)
 
             # Phase 10.3: mark indexed and land the terminal status (READY with
             # >= 1 chunk, else NEEDS_REVIEW) atomically, completing the lifecycle.
@@ -1019,9 +1078,7 @@ async def process_document(
                     # The doc may already be terminal (e.g. the cron got there
                     # first, or a prior mark_failed succeeded). Swallow — the
                     # original failure is what we re-raise.
-                    logger.warning(
-                        "mark_failed rejected for %s (already terminal)", document_id
-                    )
+                    logger.warning("mark_failed rejected for %s (already terminal)", document_id)
                     await session.rollback()
             raise
 
@@ -1134,11 +1191,7 @@ async def index_knowledge_item(
                 session.add_all(build_chunks(item, category=doc.category))
                 await session.flush()
             chunks = list(
-                (
-                    await session.execute(
-                        select(Chunk).where(Chunk.parent_id == item_id)
-                    )
-                )
+                (await session.execute(select(Chunk).where(Chunk.parent_id == item_id)))
                 .scalars()
                 .all()
             )
@@ -1155,10 +1208,7 @@ async def index_knowledge_item(
             )
 
             # Forward-only active-version handoff (D1a/D9).
-            if (
-                doc.active_source_version is None
-                or item.source_version > doc.active_source_version
-            ):
+            if doc.active_source_version is None or item.source_version > doc.active_source_version:
                 keep_run_ids = set(
                     (
                         await session.execute(
@@ -1228,9 +1278,7 @@ class WorkerSettings:
         ),
         cron(
             submit_extraction_batches,
-            minute=set(
-                range(0, 60, _SETTINGS.anthropic_batch_submit_interval_minutes)
-            ),
+            minute=set(range(0, 60, _SETTINGS.anthropic_batch_submit_interval_minutes)),
             run_at_startup=False,
             unique=True,
             max_tries=1,
@@ -1238,9 +1286,7 @@ class WorkerSettings:
         ),
         cron(
             poll_extraction_batches,
-            minute=set(
-                range(0, 60, _SETTINGS.anthropic_batch_poll_interval_minutes)
-            ),
+            minute=set(range(0, 60, _SETTINGS.anthropic_batch_poll_interval_minutes)),
             run_at_startup=False,
             unique=True,
             max_tries=1,
