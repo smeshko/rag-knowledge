@@ -3,11 +3,16 @@
 ``build_review_reasons`` is pure (no session): it maps the persisted
 ``structured_data["warnings"]`` codes into ``{code, message}`` pairs for
 ``needs_review`` items and returns ``[]`` for everything else. The drift
-guard at the bottom fires every ``validate_soft`` rule and asserts the
-static message map covers every emittable code.
+guards at the bottom assert the static message map covers every
+``validate_soft`` code — once against the codes declared in its source, once
+against the codes it actually emits.
 """
 
 from __future__ import annotations
+
+import ast
+import inspect
+import textwrap
 
 from rag_recipes.api.review_reasons import (
     SOFT_WARNING_MESSAGES,
@@ -66,7 +71,47 @@ def test_missing_or_none_warnings_key_returns_empty_list() -> None:
     assert build_review_reasons("needs_review", {"warnings": None}) == []
 
 
-# --- Drift guard: every validate_soft-emittable code has a map entry ---
+# --- Drift guard: every validate_soft code has a map entry ---
+#
+# Two complementary halves. The static half reads the codes *declared* in
+# `validate_soft`'s source, so a new rule is caught even when no fixture here
+# happens to fire it (a fixture-only guard stays green in that case and the new
+# canonical code silently ships as `llm_warning`). The behavioural half below
+# fires the rules for real, proving the declared codes are reachable and that
+# the AST scan is not reading dead literals.
+
+
+def _declared_soft_codes() -> set[str]:
+    """String literals passed as ``SoftValidationWarning(code=...)`` in the source."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(validate_soft)))
+    codes: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        callee = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if callee != "SoftValidationWarning":
+            continue
+        for keyword in node.keywords:
+            value = keyword.value
+            if (
+                keyword.arg == "code"
+                and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            ):
+                codes.add(value.value)
+    return codes
+
+
+def test_soft_warning_messages_covers_every_declared_code() -> None:
+    """Every code `validate_soft` can construct has a message, and vice versa.
+
+    Fixture-independent: adding a rule to `validate_soft` fails this test whether
+    or not the candidates below trigger it.
+    """
+    declared = _declared_soft_codes()
+    assert declared, "AST scan found no SoftValidationWarning codes — guard is vacuous"
+    assert declared == set(SOFT_WARNING_MESSAGES)
 
 _THRESHOLDS = SoftValidationThresholds(
     min_overall_confidence=0.5,
