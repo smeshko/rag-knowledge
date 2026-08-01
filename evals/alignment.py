@@ -1,53 +1,81 @@
-"""Judge-alignment workflow: human-vs-judge agreement (Epic 15 Phase 15.3).
+"""Judge-alignment workflow: human-vs-judge agreement (Epic 15 Phase 15.3,
+integrity fixes in Epic 20 Phase 20.1).
 
-Implements the doc-12 § 5 alignment loop: a human rates each fixture's
-extraction pass/fail with a critique, the LLM judge rates the same fixtures
-(replayed from the Phase-15.2 cache — the injected provider is only consulted
-on a cache miss, in which case the fixture's extraction is re-driven through
-the synthetic-window path to give the judge something to rate), agreement is
-computed over the fixtures both sides rated, and disagreements are listed with
-**both** critiques for prompt iteration.
+Implements the doc-12 § 5 alignment loop over a *prior extraction run*: the
+run's ``results.json`` supplies each fixture's persisted extracted artifact
+(serialized as ``{"items": [...]}`` by the shared
+``serialize_extracted_artifact`` helper), the human and the LLM judge both rate
+exactly that byte-identical string, agreement is computed over the fixtures
+both sides rated, and disagreements are listed with **both** critiques for
+prompt iteration. Alignment never re-extracts — a fixture with no persisted
+artifact in the run (extraction failed, hard validation failed, or a run
+written before artifacts were persisted) is recorded *unrated* and the human
+is never prompted for it (DECISIONS #4).
 
-Epic-14 model gaps absorbed here (DECISIONS #6): ``save_judge_alignment``
-writes by ``record.fixture_id`` alone and ``load_judge_alignment`` ignores its
-``name`` argument, so records are namespaced with the composite id
-``<fixture_name>__<judge_name>`` — two judges aligned on one fixture never
-overwrite each other. ``JudgeAlignmentRecord`` has no critique fields, so both
-critiques (plus judge version/model/fixture name/timestamp) live in
-``run_metadata`` under the documented keys ``{"judge_name", "judge_version",
-"model", "fixture_name", "human_critique", "judge_critique", "rated_at"}``.
+:func:`load_alignment_run` is the public pre-flight validator (DECISIONS #9):
+every unusable run shape — no run at all, a missing dir or ``results.json``,
+malformed JSON, a ``failed`` run, a retrieval run, a fixture-set mismatch, or
+a fixture edited since the run — raises ``ValueError`` *before* the first
+human prompt (and, in the CLI, before ``get_settings()`` or a provider exist).
 
-Human ratings are version-keyed (DECISIONS #2): a stored rating is reused only
-while the judge version matches; a version bump re-prompts and overwrites the
-record (prior-version ratings are not retained). The interactive prompt is an
-injected callable (DECISIONS #3) — tests script it; only the CLI uses the real
-``typer.prompt``. The agreement metric is written into the *existing*
-extraction run's ``results.json`` at ``results.agreement`` via the
-read-modify-write helper (DECISIONS #7), never via a new ``ReportRun``.
+Judge ratings replay from the Phase-15.2 cache under the run's *recorded*
+provenance — ``fixture_content_hash`` and ``extraction_prompt_version`` come
+from ``results.json``, never from the current working tree — plus the judged
+artifact's hash (DECISIONS #2/#10); the injected provider is only consulted on
+a cache miss, and a miss writes the entry back with ``artifact_hash`` stamped
+into its metadata, exactly like the driver's own cache writes.
+
+Records are set- and provider-scoped: the composite id is
+``<fixture_set>__<fixture>__<judge>__<extraction_model>`` (each part through
+``slugify_key_part``), where the model is the run's ``metadata.llm_model`` —
+the *artifact's* producer, not the judge's provider (DECISIONS #6). Both
+critiques plus provenance live in ``run_metadata`` under the documented keys
+``{"judge_name", "judge_version", "model", "fixture_name", "fixture_set",
+"human_critique", "judge_critique", "rated_at", "artifact_hash",
+"judge_dimension", "extraction_provider", "extraction_model", "aligned_run"}``.
+
+Human ratings are reused only while the judge version **and** the artifact
+hash both match (DECISIONS #5) — a re-extraction that changed the artifact
+re-prompts, and an old record without a hash re-prompts. The human is told
+which judge dimension they are rating: ``_judge_dimension`` lifts the
+``Rate exactly ONE subjective dimension: … ?`` sentence verbatim from the
+judge prompt, falling back to the judge name when absent (DECISIONS #11). On
+the unrated path an existing record carrying a human rating is left on disk
+untouched — a collected human rating is never destroyed, and no verdict is
+asserted about an artifact that no longer exists (DECISIONS #4).
+
+The interactive prompt is an injected callable (DECISIONS #3) — tests script
+it; only the CLI uses the real ``typer.prompt``. The agreement metric is
+written into the *existing* extraction run's ``results.json`` at
+``results.agreement`` via the read-modify-write helper (DECISIONS #7), never
+via a new ``ReportRun``.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import typer
 from pydantic import BaseModel
 
 from evals.extraction import (
-    _build_synthetic_window,
-    _extract_recipes,
     artifact_hash,
     build_judge_cache_key,
-    extraction_prompt_version,
     serialize_extracted_artifact,
 )
-from evals.fixtures import load_judge_alignment, load_recipe_fixtures, save_judge_alignment
-from evals.judge_cache import JudgeCache
-from evals.judges import Judge, JudgeError, JudgeRating, load_judge
+from evals.fixtures import (
+    load_judge_alignment,
+    load_judge_prompt,
+    load_recipe_fixtures,
+    save_judge_alignment,
+)
+from evals.judge_cache import JudgeCache, slugify_key_part
+from evals.judges import JudgeError, JudgeRating, load_judge
 from evals.models import JudgeAlignmentRecord, RecipeFixture
 from evals.reports import _append_run_summary, _update_run_results
 from rag_recipes.providers.llm.base import LLMProvider
@@ -56,17 +84,23 @@ __all__ = [
     "AlignmentDisagreement",
     "AlignmentReport",
     "PromptHuman",
+    "load_alignment_run",
     "run_judge_alignment",
 ]
 
 HumanRating = Literal["pass", "fail"]
 
-PromptHuman = Callable[[RecipeFixture], tuple[HumanRating, str]]
+PromptHuman = Callable[[RecipeFixture, str, str, str], tuple[HumanRating, str]]
 """Collect a human ``("pass"|"fail", critique)`` for one fixture.
 
-The rating shares ``JudgeRating.rating``'s domain — anything else would make
-the human-vs-judge comparison silently never match.
+Called as ``(fixture, artifact, judge_name, dimension)``: ``artifact`` is the
+exact serialized string the judge rates (byte-identical), and ``dimension`` is
+the judge's dimension sentence so both sides answer the same question
+(DECISIONS #11). The rating shares ``JudgeRating.rating``'s domain — anything
+else would make the human-vs-judge comparison silently never match.
 """
+
+_DIMENSION_MARKER = "Rate exactly ONE subjective dimension:"
 
 
 class AlignmentDisagreement(BaseModel):
@@ -106,10 +140,36 @@ class AlignmentReport(BaseModel):
         }
 
 
-def _default_prompt_human(fixture: RecipeFixture) -> tuple[HumanRating, str]:
+def _judge_dimension(prompt_text: str, judge_name: str) -> str:
+    """The judge's dimension sentence, lifted verbatim from its prompt.
+
+    The extraction rule is a parsing contract against the committed prompts
+    (DECISIONS #11): the substring from the literal marker ``Rate exactly ONE
+    subjective dimension:`` up to and including the first ``?`` after it, with
+    all whitespace/newlines collapsed to single spaces and ``**`` emphasis
+    stripped. The sentence is *not* a line — it starts mid-line and wraps.
+    Absent the marker (or a ``?``), falls back to the judge name alone.
+    """
+    start = prompt_text.find(_DIMENSION_MARKER)
+    if start == -1:
+        return judge_name
+    end = prompt_text.find("?", start)
+    if end == -1:
+        return judge_name
+    sentence = prompt_text[start : end + 1]
+    return re.sub(r"\s+", " ", sentence).replace("**", "").strip()
+
+
+def _default_prompt_human(
+    fixture: RecipeFixture, artifact: str, judge_name: str, dimension: str
+) -> tuple[HumanRating, str]:
     """Interactive typer prompt — the CLI path; tests inject a scripted fake."""
     typer.echo(f"\n=== {fixture.name} ===")
+    typer.echo(f"Judge dimension ({judge_name}): {dimension}")
+    typer.echo("\n--- Source ---")
     typer.echo(fixture.source_md)
+    typer.echo("--- Extracted artifact (exactly what the judge rates) ---")
+    typer.echo(artifact)
     while True:
         raw = typer.prompt("Rating (pass/fail)").strip().lower()
         if raw in ("pass", "fail"):
@@ -119,68 +179,113 @@ def _default_prompt_human(fixture: RecipeFixture) -> tuple[HumanRating, str]:
     return cast(HumanRating, raw), critique
 
 
-def _composite_id(fixture_name: str, judge_name: str) -> str:
-    """Judge-scoped alignment-record id (DECISIONS #6 — no overwrite across judges)."""
-    return f"{fixture_name}__{judge_name}"
+def _composite_id(
+    fixture_set: str, fixture_name: str, judge_name: str, extraction_model: str
+) -> str:
+    """Set-, judge- and extraction-model-scoped record id (DECISIONS #6).
 
-
-async def _judge_rating_for(
-    judge: Judge,
-    cache: JudgeCache,
-    fixture: RecipeFixture,
-    fixture_set: str,
-    llm_provider: LLMProvider,
-) -> JudgeRating | None:
-    """The judge's rating for a fixture: cache replay, LLM only on a miss.
-
-    Interim Epic 20.1 state (rewritten in the alignment task): this still
-    re-drives the fixture's extraction through the synthetic-window path — the
-    extraction runs *before* the cache lookup because the judged artifact's
-    hash is a key part (DECISIONS #10) — and judges the full extracted list
-    through the shared ``serialize_extracted_artifact`` helper. The prompt
-    version comes from the ``extraction_prompt_version()`` accessor, never a
-    second import of the constant (DECISIONS #2). Extraction failure or
-    ``JudgeError`` yields ``None`` — the fixture is *unrated*, never a silent
-    pass/fail.
+    ``extraction_model`` is the run's ``metadata.llm_model`` — the model that
+    produced the rated *artifact*, not the judge's provider — so 20.3's
+    dual-provider session keeps one record per (set, fixture, judge, provider).
+    Every part goes through the shared ``slugify_key_part``.
     """
-    window = _build_synthetic_window(fixture.name, fixture.source_md)
-    recipes, _error = await _extract_recipes(window, fixture.name, llm_provider)
-    if not recipes:
-        return None
-    extracted = serialize_extracted_artifact(
-        [item.model_dump(mode="json", by_alias=True) for item in recipes]
-    )
-    key = build_judge_cache_key(
-        fixture_set=fixture_set,
-        fixture_id=fixture.name,
-        fixture_content_hash=fixture.content_hash(),
-        extraction_prompt_version=extraction_prompt_version(),
-        artifact_hash=artifact_hash(extracted),
-        judge=judge,
-    )
-    rating = cache.get(key)
-    if rating is not None:
-        return rating
-    try:
-        rating = await judge.judge(
-            extracted,
-            json.dumps(fixture.expected, indent=2),
-            fixture.source_md,
+    parts = (fixture_set, fixture_name, judge_name, extraction_model)
+    return "__".join(slugify_key_part(part) for part in parts)
+
+
+def _run_fix_hint(fixture_set: str) -> str:
+    return f"run `rag-evals extraction --fixtures {fixture_set} --label <label>` first"
+
+
+def load_alignment_run(
+    run_dir: Path | None, fixture_set: str, fixtures: list[RecipeFixture]
+) -> dict[str, Any]:
+    """Validate an extraction run for alignment; returns its ``results`` payload.
+
+    The whole pre-flight validation pass (DECISIONS #9): called by
+    ``run_judge_alignment`` before its fixture loop *and* by the CLI before
+    ``get_settings()``/provider construction, so every unusable-run shape dies
+    with a clean ``ValueError`` (CLI exit 2) instead of a traceback — and
+    before the human has rated anything. Checks, in order: a run dir exists,
+    its ``results.json`` exists and parses, the run did not finalize
+    ``failed``, the payload is an extraction run for exactly ``fixture_set``,
+    and no loaded fixture's ``content_hash()`` drifted from the run-recorded
+    ``fixture_content_hash`` (all drifted fixtures reported in one message —
+    a fixture with *no* recorded hash is not drift; it degrades to unrated in
+    the loop, so a pre-change run never fails here).
+    """
+    if run_dir is None:
+        raise ValueError(
+            f"no extraction run to align against; {_run_fix_hint(fixture_set)}"
         )
-    except JudgeError:
-        return None
-    cache.put(rating, key=key)
-    return rating
+    results_path = run_dir / "results.json"
+    if not results_path.is_file():
+        raise ValueError(
+            f"no usable extraction run at {run_dir}: results.json is missing; "
+            f"{_run_fix_hint(fixture_set)}"
+        )
+    try:
+        doc = json.loads(results_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed results.json in {run_dir}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"malformed results.json in {run_dir}: expected a JSON object")
+    if doc.get("status") == "failed":
+        raise ValueError(
+            f"the run at {run_dir} finalized as failed "
+            f"(error: {doc.get('error', 'unknown')}); {_run_fix_hint(fixture_set)}"
+        )
+    results = doc.get("results")
+    if not isinstance(results, dict):
+        raise ValueError(f"malformed results.json in {run_dir}: no results payload")
+    # Retrieval payloads carry an explicit report_type and no fixture_set;
+    # extraction payloads omit report_type entirely. Check the explicit
+    # discriminator first, the absent fixture_set as the backstop.
+    if results.get("report_type") == "retrieval" or results.get("fixture_set") is None:
+        raise ValueError(
+            f"the run at {run_dir} is not an extraction run; "
+            f"{_run_fix_hint(fixture_set)}"
+        )
+    if results.get("fixture_set") != fixture_set:
+        raise ValueError(
+            f"the run at {run_dir} evaluated fixture set "
+            f"{results.get('fixture_set')!r}, not {fixture_set!r}; "
+            f"{_run_fix_hint(fixture_set)}"
+        )
+    per_fixture = {
+        entry.get("name"): entry
+        for entry in results.get("per_fixture", [])
+        if isinstance(entry, dict)
+    }
+    drifted = [
+        fixture.name
+        for fixture in fixtures
+        if (recorded := (per_fixture.get(fixture.name) or {}).get("fixture_content_hash"))
+        is not None
+        and recorded != fixture.content_hash()
+    ]
+    if drifted:
+        raise ValueError(
+            f"fixtures {', '.join(sorted(drifted))} changed since the run at "
+            f"{run_dir}; re-run extraction before aligning"
+        )
+    return results
 
 
 def _reusable_human_rating(
-    existing: JudgeAlignmentRecord | None, judge_version: str
+    existing: JudgeAlignmentRecord | None, judge_version: str, current_artifact_hash: str
 ) -> tuple[HumanRating, str] | None:
-    """A stored human rating, reused only while the judge version matches."""
+    """A stored human rating, reused only for the same judge version AND artifact.
+
+    A human rating is a statement about one specific displayed artifact
+    (DECISIONS #5): a record whose ``artifact_hash`` is missing (pre-20.1) or
+    differs (the run was re-extracted) re-prompts.
+    """
     if (
         existing is not None
         and existing.human_rating in ("pass", "fail")
         and existing.run_metadata.get("judge_version") == judge_version
+        and existing.run_metadata.get("artifact_hash") == current_artifact_hash
     ):
         return (
             cast(HumanRating, existing.human_rating),
@@ -199,16 +304,21 @@ async def run_judge_alignment(
     root: Path | None = None,
     judge_cache_root: Path | None = None,
 ) -> AlignmentReport:
-    """Walk a fixture set collecting human ratings and computing judge agreement.
+    """Align human and judge ratings over a run's persisted artifacts.
 
-    ``llm_provider`` is injected, never constructed (only the CLI builds a real
-    one). ``root`` covers fixtures, judge prompts, and alignment records;
+    ``report_path`` names the extraction run whose persisted artifacts are
+    rated — it is required in effect: ``load_alignment_run`` raises for
+    ``None`` or any unusable run (DECISIONS #9). ``llm_provider`` is injected,
+    never constructed (only the CLI builds a real one), and is consulted only
+    on a judge-cache miss — alignment performs **zero** extraction calls.
+    ``root`` covers fixtures, judge prompts, and alignment records;
     ``judge_cache_root`` the 15.2 cache — both injectable so tests stay in
-    ``tmp_path``. When ``report_path`` names an extraction run directory, the
-    agreement section is merged into its ``results.json``/``summary.md``.
+    ``tmp_path``. The agreement section is merged into the run's
+    ``results.json``/``summary.md``.
     """
     ask_human = _default_prompt_human if prompt_human is None else prompt_human
     judge_runner = load_judge(judge, llm_provider, root=root)
+    dimension = _judge_dimension(load_judge_prompt(judge, root=root).text, judge_runner.name)
     cache = JudgeCache(root=judge_cache_root)
     fixtures = load_recipe_fixtures(fixture_set, root=root)
     if not fixtures:
@@ -219,26 +329,120 @@ async def run_judge_alignment(
             f"nothing to align"
         )
 
+    results = load_alignment_run(report_path, fixture_set, fixtures)
+    assert report_path is not None  # load_alignment_run raised otherwise
+    # The envelope was just validated; metadata identifies the artifact's
+    # producer (the *extraction* provider/model, not the judge's — DECISIONS #6).
+    envelope = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
+    run_meta = envelope.get("metadata") or {}
+    extraction_provider = str(run_meta.get("llm_provider", "unknown"))
+    extraction_model = str(run_meta.get("llm_model", "unknown"))
+    prompt_version = results.get("extraction_prompt_version")
+    per_fixture = {
+        entry.get("name"): entry
+        for entry in results.get("per_fixture", [])
+        if isinstance(entry, dict)
+    }
+
     records: list[JudgeAlignmentRecord] = []
     disagreements: list[AlignmentDisagreement] = []
     unrated: list[str] = []
     agreements = 0
     rated = 0
 
+    def base_metadata() -> dict[str, Any]:
+        return {
+            "judge_name": judge_runner.name,
+            "judge_version": judge_runner.version,
+            "model": judge_runner.model,
+            "fixture_set": fixture_set,
+            "judge_dimension": dimension,
+            "extraction_provider": extraction_provider,
+            "extraction_model": extraction_model,
+            "aligned_run": str(report_path),
+            "rated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+
     for fixture in fixtures:
-        composite_id = _composite_id(fixture.name, judge_runner.name)
+        composite_id = _composite_id(
+            fixture_set, fixture.name, judge_runner.name, extraction_model
+        )
         existing = load_judge_alignment(judge_runner.name, composite_id, root=root)
-        reused = _reusable_human_rating(existing, judge_runner.version)
-        human_rating, human_critique = reused if reused is not None else ask_human(fixture)
+        entry = per_fixture.get(fixture.name) or {}
+        recipes_payload = entry.get("recipes")
+        content_hash = entry.get("fixture_content_hash")
+
+        if not recipes_payload or content_hash is None or prompt_version is None:
+            # No usable persisted artifact (extraction failed, hard validation
+            # failed, missing from the run, or a pre-20.1 run without the
+            # provenance keys): unrated, and the human is never prompted —
+            # a source-only human rating is exactly the divergence this phase
+            # removes (DECISIONS #4).
+            unrated.append(fixture.name)
+            if existing is not None and existing.human_rating in ("pass", "fail"):
+                # Never destroy a collected human rating, and never assert one
+                # about a vanished artifact: leave the record untouched.
+                continue
+            reason = (
+                "run predates persisted artifacts"
+                if recipes_payload
+                else f"no persisted artifact for {fixture.name!r} in this run"
+            )
+            record = JudgeAlignmentRecord(
+                fixture_id=composite_id,
+                human_rating=None,
+                judge_rating=None,
+                agreement_status="unrated",
+                run_metadata={
+                    **base_metadata(),
+                    "fixture_name": fixture.name,
+                    "unrated_reason": reason,
+                },
+            )
+            save_judge_alignment(record, root=root)
+            records.append(record)
+            continue
+
+        artifact = serialize_extracted_artifact(recipes_payload)
+        current_hash = artifact_hash(artifact)
+        reused = _reusable_human_rating(existing, judge_runner.version, current_hash)
+        human_rating, human_critique = (
+            reused
+            if reused is not None
+            else ask_human(fixture, artifact, judge_runner.name, dimension)
+        )
         if human_rating not in ("pass", "fail"):
             raise ValueError(
                 f"human rating must be 'pass' or 'fail', got {human_rating!r} "
                 f"for fixture {fixture.name!r}"
             )
 
-        judge_rating = await _judge_rating_for(
-            judge_runner, cache, fixture, fixture_set, llm_provider
+        # Cache key from the run's recorded provenance, not the working tree
+        # (DECISIONS #2): the entry's content hash and the run's prompt version.
+        key = build_judge_cache_key(
+            fixture_set=fixture_set,
+            fixture_id=fixture.name,
+            fixture_content_hash=str(content_hash),
+            extraction_prompt_version=str(prompt_version),
+            artifact_hash=current_hash,
+            judge=judge_runner,
         )
+        judge_rating: JudgeRating | None = cache.get(key)
+        if judge_rating is None:
+            try:
+                judge_rating = await judge_runner.judge(
+                    artifact,
+                    json.dumps(fixture.expected, indent=2),
+                    fixture.source_md,
+                )
+            except JudgeError:
+                judge_rating = None
+            else:
+                # Alignment is a first-class cache producer: stamp the artifact
+                # hash so its files are as self-describing as the driver's.
+                judge_rating.metadata["artifact_hash"] = current_hash
+                cache.put(judge_rating, key=key)
+
         if judge_rating is None:
             agreement_status = "unrated"
             unrated.append(fixture.name)
@@ -265,13 +469,11 @@ async def run_judge_alignment(
             judge_rating=judge_rating.rating if judge_rating is not None else None,
             agreement_status=agreement_status,
             run_metadata={
-                "judge_name": judge_runner.name,
-                "judge_version": judge_runner.version,
-                "model": judge_runner.model,
+                **base_metadata(),
                 "fixture_name": fixture.name,
                 "human_critique": human_critique,
                 "judge_critique": judge_rating.critique if judge_rating is not None else None,
-                "rated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "artifact_hash": current_hash,
             },
         )
         save_judge_alignment(record, root=root)
@@ -289,18 +491,17 @@ async def run_judge_alignment(
         records=records,
     )
 
-    if report_path is not None:
-        payload = report.agreement_payload()
+    payload = report.agreement_payload()
 
-        def _merge(results: dict[str, object]) -> None:
-            results["agreement"] = payload
+    def _merge(results_payload: dict[str, object]) -> None:
+        results_payload["agreement"] = payload
 
-        _update_run_results(report_path, _merge)
-        rate = report.agreement_rate
-        rendered = "n/a" if rate is None else f"{rate:.2f}"
-        _append_run_summary(
-            report_path,
-            f"Judge-human agreement ({report.judge_name}, {report.judge_version}): {rendered}",
-        )
+    _update_run_results(report_path, _merge)
+    rate = report.agreement_rate
+    rendered = "n/a" if rate is None else f"{rate:.2f}"
+    _append_run_summary(
+        report_path,
+        f"Judge-human agreement ({report.judge_name}, {report.judge_version}): {rendered}",
+    )
 
     return report

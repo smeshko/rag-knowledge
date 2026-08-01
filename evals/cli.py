@@ -166,21 +166,42 @@ def judge_alignment(
         Path | None,
         typer.Option(
             help=(
-                "Extraction run directory to record the agreement metric into "
+                "Extraction run directory whose persisted artifacts are rated; "
+                "the agreement metric is recorded into it "
                 "(default: the latest run under evals/reports/)."
             )
         ),
     ] = None,
 ) -> None:
-    """Measure LLM-judge vs human-rating agreement (Epic 15)."""
+    """Measure LLM-judge vs human-rating agreement (Epic 15, Epic 20.1).
+
+    Rates the run's *persisted* extracted artifacts — never re-extracts. Exits
+    2 for every unusable run (none at all, missing or malformed results.json, a
+    failed run, a retrieval run, a fixture-set mismatch, a drifted fixture),
+    checked *before* ``Settings`` or a provider are constructed so a missing
+    API key can never mask the real error.
+    """
     import asyncio
 
-    from evals.alignment import run_judge_alignment
+    from evals.alignment import load_alignment_run, run_judge_alignment
+    from evals.fixtures import load_recipe_fixtures
     from evals.reports import latest_run_dir
-    from rag_recipes.config import get_settings
 
     run_dir = report if report is not None else latest_run_dir()
     try:
+        fixture_list = load_recipe_fixtures(fixtures)
+        if not fixture_list:
+            raise ValueError(
+                f"recipe fixture set {fixtures!r} is empty or does not exist; "
+                f"nothing to align"
+            )
+        # Pre-flight (DECISIONS #9): validate the run before get_settings() /
+        # _build_llm_provider are evaluated — a config error must never mask
+        # the "no run to align against" message.
+        load_alignment_run(run_dir, fixtures, fixture_list)
+
+        from rag_recipes.config import get_settings
+
         result = asyncio.run(
             run_judge_alignment(
                 judge,
@@ -189,7 +210,7 @@ def judge_alignment(
                 report_path=run_dir,
             )
         )
-    except ValueError as exc:  # empty/unknown fixture set — a caller error
+    except (FileNotFoundError, ValueError) as exc:  # unusable run/fixtures — caller error
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     rate = "n/a" if result.agreement_rate is None else f"{result.agreement_rate:.2f}"
@@ -199,9 +220,8 @@ def judge_alignment(
         typer.echo(f"  human ({item.human_rating}): {item.human_critique}")
         typer.echo(f"  judge ({item.judge_rating}): {item.judge_critique}")
     if result.unrated:
-        typer.echo(f"Unrated (judge error): {', '.join(result.unrated)}")
-    if run_dir is not None:
-        typer.echo(f"agreement recorded in: {run_dir}")
+        typer.echo(f"Unrated: {', '.join(result.unrated)}")
+    typer.echo(f"agreement recorded in: {run_dir}")
 
 
 @app.command("confidence-review")

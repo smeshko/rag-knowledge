@@ -12,12 +12,19 @@ shape: the hyphenated subcommand names, flag options (``--fixtures``,
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
+import evals.cli
+import evals.fixtures
+import evals.reports
+import pytest
 from evals.cli import app
 from typer.main import get_command
 from typer.testing import CliRunner
+
+from tests.unit.evals.eval_utils import STEW_EXPECTED, STEW_SOURCE, write_fixture
 
 runner = CliRunner()
 
@@ -69,6 +76,123 @@ def test_judge_alignment_requires_judge_and_fixtures_flags() -> None:
     assert result.exit_code == 2
     result = runner.invoke(app, ["judge-alignment", "--fixtures", "smoke"])
     assert result.exit_code == 2
+
+
+# --- judge-alignment bad-run shapes (Epic 20 Phase 20.1) ---------------------
+
+
+def _forbid(fired: list[str], name: str):  # noqa: ANN202
+    def _raise(*args: object, **kwargs: object) -> object:
+        fired.append(name)
+        raise AssertionError(f"{name} must not be called on a bad-run path")
+
+    return _raise
+
+
+def _write_run(run_dir: Path, doc: dict[str, object]) -> Path:
+    run_dir.mkdir(parents=True)
+    (run_dir / "results.json").write_text(json.dumps(doc), encoding="utf-8")
+    return run_dir
+
+
+_BAD_RUN_SHAPES = (
+    "no_run",
+    "missing_dir",
+    "missing_results",
+    "malformed_results",
+    "failed_run",
+    "retrieval_run",
+    "set_mismatch",
+    "drifted_fixture",
+)
+
+
+@pytest.mark.parametrize("shape", _BAD_RUN_SHAPES)
+def test_judge_alignment_bad_run_exits_2_without_provider_or_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Every unusable run exits 2 before ``get_settings``/provider construction.
+
+    Both seams are monkeypatched to raise: ``get_settings()`` is where a
+    missing API key would blow up, so proving only the provider half would
+    leave the original failure mode uncovered.
+    """
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    monkeypatch.setattr(evals.fixtures, "FIXTURES_ROOT", fixtures_root)
+    monkeypatch.setattr(evals.reports, "REPORTS_ROOT", tmp_path / "reports")
+    fired: list[str] = []
+    monkeypatch.setattr(
+        evals.cli, "_build_llm_provider", _forbid(fired, "_build_llm_provider")
+    )
+    monkeypatch.setattr("rag_recipes.config.get_settings", _forbid(fired, "get_settings"))
+
+    args = ["judge-alignment", "--judge", "summary_quality", "--fixtures", "smoke"]
+    if shape == "no_run":
+        pass  # REPORTS_ROOT does not exist → latest_run_dir() → None
+    elif shape == "missing_dir":
+        args += ["--report", str(tmp_path / "nope")]
+    elif shape == "missing_results":
+        (tmp_path / "empty-run").mkdir()
+        args += ["--report", str(tmp_path / "empty-run")]
+    elif shape == "malformed_results":
+        run = tmp_path / "bad-run"
+        run.mkdir()
+        (run / "results.json").write_text("{not json", encoding="utf-8")
+        args += ["--report", str(run)]
+    elif shape == "failed_run":
+        run = _write_run(
+            tmp_path / "failed-run",
+            {"metadata": {}, "status": "failed", "error": "ValueError", "results": {}},
+        )
+        args += ["--report", str(run)]
+    elif shape == "retrieval_run":
+        run = _write_run(
+            tmp_path / "retrieval-run",
+            {
+                "metadata": {},
+                "status": "completed",
+                "results": {"report_type": "retrieval", "aggregate": {}},
+            },
+        )
+        args += ["--report", str(run)]
+    elif shape == "set_mismatch":
+        run = _write_run(
+            tmp_path / "other-run",
+            {
+                "metadata": {},
+                "status": "completed",
+                "results": {"fixture_set": "other", "per_fixture": []},
+            },
+        )
+        args += ["--report", str(run)]
+    elif shape == "drifted_fixture":
+        run = _write_run(
+            tmp_path / "drift-run",
+            {
+                "metadata": {},
+                "status": "completed",
+                "results": {
+                    "fixture_set": "smoke",
+                    "extraction_prompt_version": "recipe-extraction-v1",
+                    "per_fixture": [
+                        {
+                            "name": "bean-stew",
+                            "status": "scored",
+                            "fixture_content_hash": "0" * 64,
+                            "recipes": [{"title": "stale"}],
+                        }
+                    ],
+                },
+            },
+        )
+        args += ["--report", str(run)]
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 2
+    assert "error" in result.output
+    assert fired == []  # neither get_settings nor the provider seam ever ran
 
 
 def test_confidence_review_with_missing_report_dir_exits_with_error(tmp_path: Path) -> None:
