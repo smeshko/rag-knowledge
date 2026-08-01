@@ -36,7 +36,9 @@ from rag_recipes.api.dependencies import (
 )
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.documents import (
+    BatchUploadErrorCode,
     BatchUploadItemResult,
+    BatchUploadItemStatus,
     BatchUploadResponse,
     DocumentCounts,
     DocumentDetailResponse,
@@ -396,6 +398,18 @@ def _anthropic_batch_enabled(settings: Settings) -> bool:
     return settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key)
 
 
+def _batch_error_code(code: ErrorCode) -> BatchUploadErrorCode:
+    """Map an ``ApiError.code`` to the batch-item error code (D2).
+
+    By value, with an ``internal_error`` fallback so a future raise site with
+    a code outside the reachable set cannot break item construction.
+    """
+    try:
+        return BatchUploadErrorCode(code.value)
+    except ValueError:
+        return BatchUploadErrorCode.INTERNAL_ERROR
+
+
 @router.post("/documents/batch", status_code=201)
 async def upload_documents_batch(
     files: Annotated[list[UploadFile], File()],
@@ -448,7 +462,10 @@ async def upload_documents_batch(
             # processing the rest of the cohort.
             results.append(
                 BatchUploadItemResult(
-                    filename=filename, status="error", error=exc.message
+                    filename=filename,
+                    status=BatchUploadItemStatus.ERROR,
+                    error=exc.message,
+                    error_code=_batch_error_code(exc.code),
                 )
             )
             continue
@@ -456,7 +473,9 @@ async def upload_documents_batch(
         if is_duplicate:
             results.append(
                 BatchUploadItemResult(
-                    filename=filename, status="duplicate", document_id=document.id
+                    filename=filename,
+                    status=BatchUploadItemStatus.DUPLICATE,
+                    document_id=document.id,
                 )
             )
             continue
@@ -477,16 +496,20 @@ async def upload_documents_batch(
             )
         results.append(
             BatchUploadItemResult(
-                filename=filename, status="created", document_id=document.id
+                filename=filename,
+                status=BatchUploadItemStatus.CREATED,
+                document_id=document.id,
             )
         )
 
     return BatchUploadResponse(
         items=results,
         total=len(results),
-        created=sum(1 for r in results if r.status == "created"),
-        duplicates=sum(1 for r in results if r.status == "duplicate"),
-        errors=sum(1 for r in results if r.status == "error"),
+        created=sum(1 for r in results if r.status is BatchUploadItemStatus.CREATED),
+        duplicates=sum(
+            1 for r in results if r.status is BatchUploadItemStatus.DUPLICATE
+        ),
+        errors=sum(1 for r in results if r.status is BatchUploadItemStatus.ERROR),
     )
 
 

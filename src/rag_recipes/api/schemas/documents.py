@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
@@ -33,13 +34,34 @@ class UploadResponse(BaseModel):
     ingestion: UploadIngestion
 
 
+class BatchUploadItemStatus(StrEnum):
+    """Per-file outcome of a batch cohort upload — closed set (Epic 21.1)."""
+
+    CREATED = "created"
+    DUPLICATE = "duplicate"
+    ERROR = "error"
+
+
+class BatchUploadErrorCode(StrEnum):
+    """Machine-readable code on ``error`` items (Epic 21.1, D2).
+
+    Mirrors the ``ErrorCode`` values actually raisable by the per-file upload
+    helper; anything unexpected maps to ``internal_error``.
+    """
+
+    INVALID_REQUEST = "invalid_request"
+    UNSUPPORTED_FILE_TYPE = "unsupported_file_type"
+    INTERNAL_ERROR = "internal_error"
+
+
 class BatchUploadItemResult(BaseModel):
     """Per-file outcome in a batch cohort upload (Epic 19.2)."""
 
     filename: str
-    status: str  # "created" | "duplicate" | "error"
+    status: BatchUploadItemStatus
     document_id: str | None = None
     error: str | None = None
+    error_code: BatchUploadErrorCode | None = None
 
 
 class BatchUploadResponse(BaseModel):
