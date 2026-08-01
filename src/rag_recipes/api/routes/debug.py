@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.dependencies import get_session, require_debug_enabled
 from rag_recipes.api.errors import ApiError, ErrorCode
-from rag_recipes.api.routes.documents import _parse_enum, _parse_int
+from rag_recipes.api.routes._params import parse_enum, parse_int
 from rag_recipes.api.schemas.debug import (
     ExtractionRunDetail,
     ExtractionRunListResponse,
@@ -38,7 +38,7 @@ def _optional_version(raw: str | None) -> int | None:
     """Parse an optional ``source_version`` query param (>= 1) or None when absent."""
     if not raw:
         return None
-    return _parse_int(raw, field="source_version", default=1, minimum=1)
+    return parse_int(raw, field="source_version", default=1, minimum=1)
 
 
 @router.get(
@@ -52,7 +52,7 @@ async def list_extraction_runs(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
     version = _optional_version(source_version)
-    status_enum = _parse_enum(ExtractionRunStatus, status, field="status")
+    status_enum = parse_enum(ExtractionRunStatus, status, field="status")
     runs = await DebugRepository(session).list_extraction_runs(
         document_id, source_version=version, status=status_enum
     )
@@ -98,12 +98,12 @@ async def list_source_spans(
 ) -> Any:
     version = _optional_version(source_version)
     start = (
-        _parse_int(page_start, field="page_start", default=1, minimum=1)
+        parse_int(page_start, field="page_start", default=1, minimum=1)
         if page_start
         else None
     )
     end = (
-        _parse_int(page_end, field="page_end", default=1, minimum=1)
+        parse_int(page_end, field="page_end", default=1, minimum=1)
         if page_end
         else None
     )

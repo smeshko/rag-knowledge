@@ -15,7 +15,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from rag_recipes.config import Settings
@@ -24,9 +24,14 @@ from rag_recipes.ingestion.status import (
     InvalidTransitionError,
     mark_failed,
 )
-from rag_recipes.storage.enums import DocumentStatus, ExtractionBatchItemStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionBatchItemStatus,
+    KnowledgeItemStatus,
+)
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
 logger = logging.getLogger(__name__)
 
@@ -152,4 +157,53 @@ async def sweep_stuck_jobs(ctx: dict[str, Any]) -> int:
         await session.commit()
 
     logger.info("Stuck-job sweep marked %d documents failed", count)
+    # Phase 21.3 (plan D1b): second, independent pass over knowledge items.
+    # Deliberately does NOT contribute to the return value — callers and tests
+    # rely on it being the document count.
+    await sweep_stuck_indexing_items(session_factory, settings)
+    return count
+
+
+async def sweep_stuck_indexing_items(
+    session_factory: async_sessionmaker[Any], settings: Settings
+) -> int:
+    """Return knowledge items stuck in ``indexing`` to ``needs_review`` (D1b).
+
+    The backstop that closes ``POST …/review``'s two enqueue windows (Redis
+    accepts the job then errors; the API process dies after the commit but
+    before the enqueue) and the exhausted-retries case of
+    ``index_knowledge_item`` — making the honest invariant true: indexing
+    either completes, or the item returns to the queue.
+
+    One bulk UPDATE on ``status == INDEXING AND updated_at < now() -
+    stuck_indexing_timeout_minutes`` (the approve UPDATE stamps ``updated_at``
+    via ``onupdate``, so no heartbeat is needed). Bulk rather than per-row
+    locking, unlike the document sweep: that sweep's care exists because
+    ``mark_failed`` is destructive, whereas this transition is *recuperative*
+    — worst case a still-running job's row is reverted, the job then no-ops on
+    its own ``status is INDEXING`` guard, and the user re-approves once. A
+    late-arriving original job for a swept row no-ops the same way; the
+    reverse race is equally safe (a completed job's ``ready`` row no longer
+    matches the predicate). No ``IngestionFailure`` row and no ``Document``
+    transition — this is item-local.
+    """
+    threshold = datetime.now(tz=UTC) - timedelta(
+        minutes=settings.stuck_indexing_timeout_minutes
+    )
+    async with session_factory() as session:
+        result = await session.execute(
+            update(KnowledgeItem)
+            .where(
+                KnowledgeItem.status == KnowledgeItemStatus.INDEXING,
+                KnowledgeItem.updated_at < threshold,
+            )
+            .values(status=KnowledgeItemStatus.NEEDS_REVIEW)
+            .execution_options(synchronize_session=False)
+        )
+        assert isinstance(result, CursorResult)
+        count = result.rowcount
+        await session.commit()
+    logger.info(
+        "Stuck-indexing sweep returned %d knowledge items to needs_review", count
+    )
     return count

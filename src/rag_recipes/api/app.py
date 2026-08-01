@@ -25,6 +25,7 @@ from rag_recipes.api.routes import (
     documents,
     health,
     knowledge_items,
+    review,
     search,
 )
 from rag_recipes.config import get_settings
@@ -104,6 +105,7 @@ app.include_router(documents.router, prefix="/api/v1")
 app.include_router(search.router, prefix="/api/v1")
 app.include_router(answers.router, prefix="/api/v1")
 app.include_router(knowledge_items.router, prefix="/api/v1")
+app.include_router(review.router, prefix="/api/v1")
 # Dev-only debug endpoints: hidden from the production OpenAPI; the router's
 # require_debug_enabled gate 404s when debug_endpoints_enabled is false.
 app.include_router(debug.router, prefix="/api/v1", include_in_schema=False)

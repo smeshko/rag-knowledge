@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -35,6 +34,7 @@ from rag_recipes.api.dependencies import (
     get_settings,
 )
 from rag_recipes.api.errors import ApiError, ErrorCode
+from rag_recipes.api.routes._params import parse_enum, parse_int
 from rag_recipes.api.schemas.documents import (
     BatchUploadErrorCode,
     BatchUploadItemResult,
@@ -83,59 +83,30 @@ _TERMINAL_DOCUMENT_STATUSES: frozenset[DocumentStatus] = frozenset(
     {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW, DocumentStatus.FAILED}
 )
 
-def _parse_enum[E: StrEnum](
-    enum_cls: type[E], raw: str | None, *, field: str
-) -> E | None:
-    """Coerce an optional string to a `StrEnum` member or raise the
-    doc-6 ``invalid_request`` envelope.
+# Phase 21.3 (plan D3): the two persisted statuses whose displayed value is
+# derived from pending-review item counts at read time.
+_DERIVED_STATUS_DOMAIN: frozenset[DocumentStatus] = frozenset(
+    {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW}
+)
 
-    Filter params are typed ``str | None`` rather than enums so FastAPI's raw
-    422 never fires before the handler runs — every validation error stays
-    inside the ``ApiError`` envelope.
+
+def _derived_status(persisted: DocumentStatus, pending: int) -> str:
+    """Displayed document status under read-time review derivation (D3).
+
+    When the persisted status is READY/NEEDS_REVIEW: ``needs_review`` while
+    the document has ≥1 pending item, else ``ready`` — decisions stay
+    item-local and the pipeline's transition matrix is never touched. Every
+    other persisted status passes through unchanged. Consequence (recorded in
+    D3): ``pending == 0`` displays ``ready`` even for a document with zero
+    surviving items — the counts beside the pill tell the true story.
     """
-    if raw is None or raw == "":
-        return None
-    try:
-        return enum_cls(raw)
-    except ValueError as exc:
-        raise ApiError(
-            status_code=400,
-            code=ErrorCode.INVALID_REQUEST,
-            message=f"Invalid value for {field!r}.",
-            details={"field": field, "value": raw},
-        ) from exc
-
-
-def _parse_int(
-    raw: str | None,
-    *,
-    field: str,
-    default: int,
-    minimum: int,
-    maximum: int | None = None,
-) -> int:
-    """Parse an optional integer query param with explicit bounds; raise
-    the doc-6 ``invalid_request`` envelope on any failure."""
-    if raw is None or raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ApiError(
-            status_code=400,
-            code=ErrorCode.INVALID_REQUEST,
-            message=f"{field!r} must be an integer.",
-            details={"field": field, "value": raw},
-        ) from exc
-    if value < minimum or (maximum is not None and value > maximum):
-        bounds = f">= {minimum}" if maximum is None else f"in [{minimum}, {maximum}]"
-        raise ApiError(
-            status_code=400,
-            code=ErrorCode.INVALID_REQUEST,
-            message=f"{field!r} must be {bounds}.",
-            details={"field": field, "value": raw},
+    if persisted in _DERIVED_STATUS_DOMAIN:
+        return (
+            DocumentStatus.NEEDS_REVIEW.value
+            if pending > 0
+            else DocumentStatus.READY.value
         )
-    return value
+    return persisted.value
 
 
 async def _best_effort_rollback(session: AsyncSession) -> None:
@@ -522,16 +493,16 @@ async def list_documents(
     offset: str | None = None,
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
-    status_enum = _parse_enum(DocumentStatus, status, field="status")
-    source_type_enum = _parse_enum(SourceType, source_type, field="source_type")
-    limit_int = _parse_int(
+    status_enum = parse_enum(DocumentStatus, status, field="status")
+    source_type_enum = parse_enum(SourceType, source_type, field="source_type")
+    limit_int = parse_int(
         limit,
         field="limit",
         default=_LIST_LIMIT_DEFAULT,
         minimum=1,
         maximum=_LIST_LIMIT_MAX,
     )
-    offset_int = _parse_int(
+    offset_int = parse_int(
         offset,
         field="offset",
         default=_LIST_OFFSET_DEFAULT,
@@ -547,8 +518,20 @@ async def list_documents(
         limit=limit_int,
         offset=offset_int,
     )
+    # Read-time review derivation (D3): one grouped count over the page's ids;
+    # only `status` is overridden, every other field byte-identical.
+    pending_counts = await repo.pending_review_counts([doc.id for doc in documents])
     return DocumentListResponse(
-        documents=[DocumentListItem.model_validate(doc) for doc in documents],
+        documents=[
+            DocumentListItem.model_validate(doc).model_copy(
+                update={
+                    "status": _derived_status(
+                        doc.status, pending_counts.get(doc.id, 0)
+                    )
+                }
+            )
+            for doc in documents
+        ],
     )
 
 
@@ -580,7 +563,13 @@ async def get_document(
         chunks=await repo.count_chunks(document_id),
     )
     return DocumentDetailResponse(
-        document=DocumentResponse.model_validate(document),
+        # Derivation (D3) reuses the already-fetched needs_review count, so the
+        # detail status and the detail counts can never disagree.
+        document=DocumentResponse.model_validate(document).model_copy(
+            update={
+                "status": _derived_status(document.status, item_counts.needs_review)
+            }
+        ),
         counts=counts,
     )
 
@@ -641,6 +630,10 @@ async def get_document_status(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
     """Report ingestion progress for a document.
+
+    Deliberately exempt from Phase 21.3's read-time review derivation (plan
+    D3): this endpoint reports pipeline/ingestion truth (progress, terminal,
+    failure); the review pill reads list/detail.
 
     For a non-terminal doc the in-flight version is the highest existing span
     version (Epic 11.2, DECISIONS #5) — ``max + 1`` work for a new_source_version

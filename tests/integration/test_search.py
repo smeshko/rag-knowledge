@@ -480,3 +480,31 @@ async def test_rerank_technical_error_degrades_to_baseline(db_session: AsyncSess
     assert body["results"] == baseline["results"]  # RRF baseline order intact
     assert body["debug"]["rerank_applied"] is False
     assert boom.called is True  # it was called and raised
+
+
+async def test_rejected_item_with_lingering_chunks_is_excluded(
+    db_session: AsyncSession,
+) -> None:
+    """Phase 21.3 (D5) regression: the search floor is `status == READY`, so a
+    rejected item is excluded even when chunks + embeddings still exist for it
+    (belt-and-braces over the floor's construction)."""
+    provider = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+    doc = await _make_document(db_session)
+    span = await _make_span(db_session, doc, page=42)
+    rejected_id = await _make_recipe(
+        db_session,
+        doc,
+        title="Cozy White Bean Soup",
+        chunk_text="a cozy soup with creamy white beans",
+        embed_text=_QUERY,
+        provider=provider,
+        span_ids=[span],
+        structured_data=_RECIPE_STRUCTURED,
+        status=KnowledgeItemStatus.REJECTED,
+    )
+    async with _client(db_session) as client:
+        resp = await client.post(
+            "/api/v1/search", json={"query": _QUERY, "mode": "hybrid"}
+        )
+    assert resp.status_code == 200, resp.text
+    assert rejected_id not in [r["item"]["id"] for r in resp.json()["results"]]

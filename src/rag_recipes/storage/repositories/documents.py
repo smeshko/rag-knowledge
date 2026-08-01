@@ -108,10 +108,23 @@ class DocumentRepository:
         ``transition_to``); this flush-level write does not commit.
         ``synchronize_session=False`` keeps it a single round-trip — the caller
         does not rely on the in-session ORM objects reflecting the new status.
+
+        Phase 21.3 terminal guards (plan D5): ``REJECTED`` rows are never
+        touched — rejection is a terminal audit record and a reprocess handoff
+        must not flip it to superseded (no resurrection, D7). ``INDEXING`` rows
+        are also spared: an in-flight approval flipped to ``SUPERSEDED`` by a
+        concurrent handoff would make its own job's ``status is INDEXING``
+        guard silently no-op — the approval would vanish with no error.
         """
         conditions = [
             KnowledgeItem.document_id == document_id,
-            KnowledgeItem.status != KnowledgeItemStatus.SUPERSEDED,
+            KnowledgeItem.status.notin_(
+                {
+                    KnowledgeItemStatus.SUPERSEDED,
+                    KnowledgeItemStatus.REJECTED,
+                    KnowledgeItemStatus.INDEXING,
+                }
+            ),
             KnowledgeItem.extraction_run_id.notin_(keep_extraction_run_ids),
         ]
         if source_version is not None:
@@ -196,10 +209,36 @@ class DocumentRepository:
         limit: int,
         offset: int,
     ) -> Sequence[Document]:
+        """List documents, newest first, with optional filters.
+
+        Phase 21.3 (plan D3): the ``status`` filter uses *derived* semantics
+        for the two review-facing values so the filter agrees with the status
+        the list response displays — ``needs_review`` matches any doc whose
+        persisted status is READY/NEEDS_REVIEW with ≥1 pending item, ``ready``
+        the same domain with none. Every other status keeps the plain column
+        filter.
+        """
         stmt = select(Document)
         if category is not None:
             stmt = stmt.where(Document.category == category)
-        if status is not None:
+        if status in (DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW):
+            pending_exists = (
+                select(KnowledgeItem.id)
+                .where(
+                    KnowledgeItem.document_id == Document.id,
+                    KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+                )
+                .exists()
+            )
+            stmt = stmt.where(
+                Document.status.in_(
+                    {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW}
+                ),
+                pending_exists
+                if status is DocumentStatus.NEEDS_REVIEW
+                else ~pending_exists,
+            )
+        elif status is not None:
             stmt = stmt.where(Document.status == status)
         if source_type is not None:
             stmt = stmt.where(Document.source_type == source_type)
@@ -208,6 +247,27 @@ class DocumentRepository:
         stmt = stmt.limit(limit).offset(offset)
         result = await self._session.execute(stmt)
         return result.scalars().all()
+
+    async def pending_review_counts(
+        self, document_ids: Sequence[str]
+    ) -> dict[str, int]:
+        """Count ``needs_review`` items per document for one list page (D3).
+
+        One grouped SELECT over the page's ids (≤200), riding
+        ``ix_knowledge_items_document_id`` + ``ix_knowledge_items_status``.
+        Documents with no pending items are simply absent from the map.
+        """
+        if not document_ids:
+            return {}
+        result = await self._session.execute(
+            select(KnowledgeItem.document_id, func.count())
+            .where(
+                KnowledgeItem.document_id.in_(document_ids),
+                KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+            )
+            .group_by(KnowledgeItem.document_id)
+        )
+        return {document_id: count for document_id, count in result.all()}
 
     async def count_source_spans(self, document_id: str) -> int:
         result = await self._session.execute(
@@ -369,9 +429,16 @@ class DocumentRepository:
 
     async def count_knowledge_items(self, document_id: str) -> KnowledgeItemCounts:
         # Single GROUP BY query — one round-trip for total / ready / needs_review.
+        # Phase 21.3 (plan D5): REJECTED is excluded from the aggregate so
+        # `total` — and therefore DocumentCounts.knowledge_items — drops on
+        # rejection ("excluded from all counts"). superseded/extracting stay in
+        # `total` (pre-existing semantics, untouched).
         result = await self._session.execute(
             select(KnowledgeItem.status, func.count())
-            .where(KnowledgeItem.document_id == document_id)
+            .where(
+                KnowledgeItem.document_id == document_id,
+                KnowledgeItem.status != KnowledgeItemStatus.REJECTED,
+            )
             .group_by(KnowledgeItem.status)
         )
         by_status: dict[KnowledgeItemStatus, int] = {

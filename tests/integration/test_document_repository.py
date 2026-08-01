@@ -6,11 +6,66 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionRunStatus,
+    KnowledgeItemStatus,
+    SourceType,
+    UploadStatus,
+)
 from rag_recipes.storage.ids import new_id
+from rag_recipes.storage.models.extraction_run import ExtractionRun
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
 from rag_recipes.storage.repositories.documents import DocumentRepository
+
+
+async def _add_run(
+    session: AsyncSession, *, document_id: str, source_version: int = 1
+) -> ExtractionRun:
+    run = ExtractionRun(
+        document_id=document_id,
+        source_version=source_version,
+        provider="fake",
+        model="fake-model",
+        prompt_version="test-prompt-v1",
+        schema_version="test-schema-v1",
+        input_source_span_ids=[],
+        input_hash=new_id("hash"),
+        status=ExtractionRunStatus.SUCCESS,
+        output_json=None,
+    )
+    session.add(run)
+    await session.flush()
+    return run
+
+
+async def _add_item(
+    session: AsyncSession,
+    *,
+    document_id: str,
+    extraction_run_id: str,
+    status: KnowledgeItemStatus,
+    source_version: int = 1,
+) -> KnowledgeItem:
+    item = KnowledgeItem(
+        document_id=document_id,
+        extraction_run_id=extraction_run_id,
+        source_version=source_version,
+        item_type="recipe",
+        title=f"Item {new_id('t')}",
+        normalized_title="item",
+        summary=None,
+        body_text="body " * 20,
+        source_span_ids=[],
+        structured_data={"schema": "recipe.v1"},
+        confidence=None,
+        status=status,
+    )
+    session.add(item)
+    await session.flush()
+    return item
 
 
 async def _make_asset_and_document(
@@ -188,3 +243,108 @@ class TestDuplicateContentHash:
                 content_hash="hash-dup-1",
                 upload_status=UploadStatus.UPLOADED,
             )
+
+
+class TestReviewStatusRoundtrip:
+    """Phase 21.3 (TASK-001): the two new statuses persist through the native enum."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_and_indexing_persist_and_read_back(
+        self, db_session: AsyncSession
+    ) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="rt-review-1")
+        run = await _add_run(db_session, document_id=document_id)
+        rejected = await _add_item(
+            db_session,
+            document_id=document_id,
+            extraction_run_id=run.id,
+            status=KnowledgeItemStatus.REJECTED,
+        )
+        indexing = await _add_item(
+            db_session,
+            document_id=document_id,
+            extraction_run_id=run.id,
+            status=KnowledgeItemStatus.INDEXING,
+        )
+        db_session.expunge_all()
+        reloaded_rejected = await db_session.get(KnowledgeItem, rejected.id)
+        reloaded_indexing = await db_session.get(KnowledgeItem, indexing.id)
+        assert reloaded_rejected is not None
+        assert reloaded_rejected.status is KnowledgeItemStatus.REJECTED
+        assert reloaded_indexing is not None
+        assert reloaded_indexing.status is KnowledgeItemStatus.INDEXING
+
+
+class TestSupersedeTerminalGuards:
+    """Phase 21.3 (D5): supersede_prior_items must not touch rejected/indexing rows."""
+
+    @pytest.mark.asyncio
+    async def test_supersede_spares_rejected_and_indexing_rows(
+        self, db_session: AsyncSession
+    ) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="sup-guard-1")
+        kept_run = await _add_run(db_session, document_id=document_id)
+        prior_run = await _add_run(db_session, document_id=document_id)
+        ready_prior = await _add_item(
+            db_session,
+            document_id=document_id,
+            extraction_run_id=prior_run.id,
+            status=KnowledgeItemStatus.READY,
+        )
+        rejected_prior = await _add_item(
+            db_session,
+            document_id=document_id,
+            extraction_run_id=prior_run.id,
+            status=KnowledgeItemStatus.REJECTED,
+        )
+        indexing_prior = await _add_item(
+            db_session,
+            document_id=document_id,
+            extraction_run_id=prior_run.id,
+            status=KnowledgeItemStatus.INDEXING,
+        )
+
+        flipped = await repo.supersede_prior_items(
+            document_id, keep_extraction_run_ids={kept_run.id}
+        )
+
+        assert flipped == 1  # only the ready sibling
+        db_session.expunge_all()
+        ready_reloaded = await db_session.get(KnowledgeItem, ready_prior.id)
+        rejected_reloaded = await db_session.get(KnowledgeItem, rejected_prior.id)
+        indexing_reloaded = await db_session.get(KnowledgeItem, indexing_prior.id)
+        assert ready_reloaded is not None
+        assert ready_reloaded.status is KnowledgeItemStatus.SUPERSEDED
+        assert rejected_reloaded is not None
+        assert rejected_reloaded.status is KnowledgeItemStatus.REJECTED
+        assert indexing_reloaded is not None
+        assert indexing_reloaded.status is KnowledgeItemStatus.INDEXING
+
+
+class TestCountKnowledgeItemsExcludesRejected:
+    """Phase 21.3 (D5): rejection drops the row out of counts.total."""
+
+    @pytest.mark.asyncio
+    async def test_total_excludes_rejected(self, db_session: AsyncSession) -> None:
+        repo = DocumentRepository(db_session)
+        _, document_id = await _make_asset_and_document(repo, content_hash="cnt-rej-1")
+        run = await _add_run(db_session, document_id=document_id)
+        for status in (
+            KnowledgeItemStatus.READY,
+            KnowledgeItemStatus.NEEDS_REVIEW,
+            KnowledgeItemStatus.REJECTED,
+        ):
+            await _add_item(
+                db_session,
+                document_id=document_id,
+                extraction_run_id=run.id,
+                status=status,
+            )
+
+        counts = await repo.count_knowledge_items(document_id)
+
+        assert counts.total == 2
+        assert counts.ready == 1
+        assert counts.needs_review == 1
