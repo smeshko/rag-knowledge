@@ -15,6 +15,11 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/rag_recipes
       REDIS_URL: redis://:redis@localhost:6379/0
       OPENAI_API_KEY: sk-ci-dummy
+      # Rich/typer --help tests do literal substring matches; stop Rich from
+      # ANSI-styling and 80-col-wrapping the output in the CI pty.
+      NO_COLOR: "1"
+      TERM: dumb
+      COLUMNS: "200"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
