@@ -43,6 +43,29 @@ JUDGE_PROMPT = (
     "## Source text\n\n{source_text}\n"
 )
 
+# Mirrors the committed judge prompts' dimension sentence (Epic 20.1): starts
+# mid-line after the framing sentence, wraps across lines, carries ** emphasis,
+# and ends at the first "?". JUDGE_PROMPT above has NO such sentence, so it
+# exercises the judge-name fallback; this one exercises the extraction rule.
+DIMENSION_JUDGE_PROMPT = (
+    "# Summary quality judge\n"
+    "# version: v1\n\n"
+    "You are an exacting culinary editor reviewing the output of a "
+    "recipe-extraction pipeline. Rate exactly ONE subjective dimension: "
+    "**summary quality** — does the\nextracted summary capture the recipe's "
+    "character? Rate fail when it misleads.\n\n"
+    "## Extracted output\n\n{extracted_output}\n\n"
+    "## Expected (golden) values\n\n{expected_output}\n\n"
+    "## Source text\n\n{source_text}\n"
+)
+
+# What `_judge_dimension` lifts from DIMENSION_JUDGE_PROMPT: marker through the
+# first "?", whitespace collapsed, "**" emphasis stripped.
+DIMENSION_SENTENCE = (
+    "Rate exactly ONE subjective dimension: summary quality — does the "
+    "extracted summary capture the recipe's character?"
+)
+
 
 class SettingsStandIn:
     """Lightweight ``SettingsLike`` stand-in (exactly the five read attributes)."""
@@ -152,10 +175,12 @@ def write_fixture(
     (fixture_dir / "expected.json").write_text(json.dumps(expected, indent=2), encoding="utf-8")
 
 
-def write_judge_prompt(fixtures_root: Path, name: str = "summary_quality") -> None:
+def write_judge_prompt(
+    fixtures_root: Path, name: str = "summary_quality", text: str = JUDGE_PROMPT
+) -> None:
     prompts = fixtures_root / "judge_prompts"
     prompts.mkdir(parents=True, exist_ok=True)
-    (prompts / f"{name}.md").write_text(JUDGE_PROMPT, encoding="utf-8")
+    (prompts / f"{name}.md").write_text(text, encoding="utf-8")
 
 
 def request_hash(name: str, source_md: str) -> str:

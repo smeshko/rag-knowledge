@@ -8,6 +8,8 @@ them lands in Epics 15/16.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -34,6 +36,19 @@ class RecipeFixture(BaseModel):
     source_md: str
     expected: dict[str, Any]
     notes: str | None = None
+
+    def content_hash(self) -> str:
+        """Content hash over ``source_md`` and the canonical ``expected`` JSON.
+
+        ``expected`` is serialized with ``sort_keys=True`` so the hash is
+        key-order-independent; the NUL separator keeps the two parts from
+        running into each other. This is the ``fixture_content_hash`` recorded
+        per scored fixture in ``results.json`` and used as a judge-cache key
+        part (Epic 20 Phase 20.1) — an edit to either file invalidates cached
+        judge ratings for the fixture.
+        """
+        payload = self.source_md + "\x00" + json.dumps(self.expected, sort_keys=True)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class QueryFixture(BaseModel):

@@ -18,13 +18,15 @@ import evals.judge_cache
 import evals.reports
 import pytest
 from evals.cli import app
-from evals.extraction import run_extraction_eval
+from evals.extraction import run_extraction_eval, synthetic_span_id
 from evals.judges import JUDGE_SCHEMA_VERSION
 from typer.testing import CliRunner
 
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from tests.unit.evals.eval_utils import (
+    SOUP_EXPECTED,
+    SOUP_SOURCE,
     STEW_EXPECTED,
     STEW_SOURCE,
     THRESHOLDS,
@@ -105,6 +107,54 @@ async def test_per_fixture_scores_and_ready_needs_review_split(tmp_path: Path) -
     assert aggregate["missing_field_counts"] == {"total_time": 1, "steps": 1}
 
 
+async def test_scored_entries_persist_extracted_recipes(tmp_path: Path) -> None:
+    # Alignment (Epic 20 Phase 20.1) rates the exact artifact this run scored,
+    # so every scored entry must carry the full extracted payload plus the
+    # provenance needed to rebuild the judge-cache key from the run itself.
+    from evals.extraction import extraction_prompt_version
+    from evals.models import RecipeFixture
+
+    run = await _run_smoke_eval(tmp_path)
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    assert results["extraction_prompt_version"] == extraction_prompt_version()
+
+    by_name = {entry["name"]: entry for entry in results["per_fixture"]}
+    stew = by_name["bean-stew"]
+    assert stew["scored_recipe_index"] == 0
+    assert stew["fixture_content_hash"] == RecipeFixture(
+        name="bean-stew", source_md=STEW_SOURCE, expected=STEW_EXPECTED
+    ).content_hash()
+    (stew_recipe,) = stew["recipes"]
+    assert stew_recipe["title"] == "Bean Stew"
+    assert stew_recipe["source_span_ids"] == [synthetic_span_id("bean-stew")]
+    ingredients = stew_recipe["structured_data"]["ingredients"]
+    assert [item["raw_text"] for item in ingredients] == [
+        "1 onion, diced",
+        "2 cups white beans",
+    ]
+
+    soup = by_name["tomato-soup"]
+    (soup_recipe,) = soup["recipes"]
+    assert soup_recipe["title"] == "Tomato Soup"
+    assert soup["scored_recipe_index"] == 0
+    assert soup["fixture_content_hash"] == RecipeFixture(
+        name="tomato-soup", source_md=SOUP_SOURCE, expected=SOUP_EXPECTED
+    ).content_hash()
+
+
+def test_extraction_prompt_version_reflects_the_module_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The accessor is the seam alignment uses (it must not import the constant)
+    # and the monkeypatch target TASK-002's invalidation test depends on.
+    import evals.extraction
+    from evals.extraction import extraction_prompt_version
+
+    assert extraction_prompt_version() == evals.extraction.PROMPT_VERSION
+    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v2")
+    assert extraction_prompt_version() == "recipe-extraction-v2"
+
+
 async def test_summary_renders_doc12_extraction_report_shape(tmp_path: Path) -> None:
     run = await _run_smoke_eval(tmp_path)
     summary = (run.path / "summary.md").read_text(encoding="utf-8")
@@ -162,6 +212,7 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
     entry = results["per_fixture"][0]
     assert entry["status"] == "extraction_failed"
     assert entry["error"] == "max_tokens truncation"
+    assert "recipes" not in entry  # nothing extracted, nothing to persist
     aggregate = results["aggregate"]
     assert aggregate["extraction_failures"] == 1
     assert aggregate["recipes_extracted"] == 0
@@ -197,6 +248,7 @@ async def test_a_candidate_production_would_discard_is_not_scored_or_counted_rea
     assert entry["status"] == "hard_validation_failed"
     assert "source_span_not_in_window" in entry["failures"]
     assert "scores" not in entry
+    assert "recipes" not in entry  # production would persist nothing
     aggregate = results["aggregate"]
     assert aggregate["hard_validation_failures"] == 1
     assert aggregate["ready"] == 0
@@ -262,6 +314,12 @@ async def test_a_fixture_split_across_items_is_counted_not_collapsed(tmp_path: P
     )
     results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
     assert results["per_fixture"][0]["recipes_returned"] == 2
+    # The full persisted list keeps both items even though only item 0 is scored
+    # (scored item vs persisted list, DECISIONS #8).
+    persisted = results["per_fixture"][0]["recipes"]
+    assert len(persisted) == 2
+    assert [item["title"] for item in persisted] == ["Bean Stew", "Bean Stew"]
+    assert results["per_fixture"][0]["scored_recipe_index"] == 0
     assert results["aggregate"]["recipes_extracted"] == 2
     assert results["aggregate"]["fixtures"] == 1
     assert results["aggregate"]["over_split_fixtures"] == 1
@@ -452,6 +510,276 @@ async def test_judge_error_counts_fixture_as_unrated(tmp_path: Path) -> None:
         assert "verdict" in entry["error"]
     summary = (run.path / "summary.md").read_text(encoding="utf-8")
     assert "Judge pass rate (summary_quality, v1): n/a" in summary
+
+
+async def test_judge_rates_the_full_recipe_list(tmp_path: Path) -> None:
+    # An over-split extraction (2 items, item 0 valid) gets exactly ONE judge
+    # call whose input carries BOTH items — boundary_correctness cannot see a
+    # split it is never shown. The second item gets a distinct title: a
+    # deep-copied item 0 would satisfy "both titles present" with one title
+    # appearing once and prove nothing.
+    from evals.extraction import serialize_extracted_artifact
+
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_judge_prompt(fixtures_root)
+    split = stew_output()
+    second = json.loads(json.dumps(split["items"][0]))
+    second["title"] = "Spurious Second Stew"
+    split["items"].append(second)
+    provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): split},
+        default_output={"rating": "fail", "critique": "Split into two items."},
+    )
+    run = await run_extraction_eval(
+        "smoke",
+        "split-judged",
+        llm_provider=provider,
+        judge="summary_quality",
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+        judge_cache_root=tmp_path / "judge-cache",
+    )
+    (judge_call,) = _judge_calls(provider)
+    assert "Bean Stew" in judge_call.input
+    assert "Spurious Second Stew" in judge_call.input
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    entry = results["per_fixture"][0]
+    assert len(entry["recipes"]) == 2
+    # Byte-identity groundwork: the judged string IS the serialization of the
+    # persisted list — embedded verbatim in the rendered judge prompt.
+    assert serialize_extracted_artifact(entry["recipes"]) in judge_call.input
+    assert results["judge"]["per_fixture"]["bean-stew"]["status"] == "rated"
+
+
+async def test_item_zero_hard_failure_is_never_judged(tmp_path: Path) -> None:
+    # The complementary boundary (DECISIONS #8): gating stays on recipes[0], so
+    # a two-item extraction whose FIRST item fails hard validation is recorded
+    # hard_validation_failed, persists nothing, and the judge never runs.
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_judge_prompt(fixtures_root)
+    split = stew_output()
+    valid_second = json.loads(json.dumps(split["items"][0]))
+    split["items"][0]["source_span_ids"] = ["span_hallucinated"]  # item 0 invalid
+    split["items"].append(valid_second)
+    provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): split},
+        default_output={"rating": "pass", "critique": "OK."},
+    )
+    run = await run_extraction_eval(
+        "smoke",
+        "hard-fail-split",
+        llm_provider=provider,
+        judge="summary_quality",
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+        judge_cache_root=tmp_path / "judge-cache",
+    )
+    assert _judge_calls(provider) == []
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    entry = results["per_fixture"][0]
+    assert entry["status"] == "hard_validation_failed"
+    assert "recipes" not in entry
+    assert results["judge"]["per_fixture"]["bean-stew"]["status"] == "unrated"
+
+
+async def test_cached_rating_for_a_different_artifact_is_not_served(tmp_path: Path) -> None:
+    # DECISIONS #10: the artifact hash is a key part, so a rating produced from
+    # a different extraction of the same fixture misses — a fresh judge call is
+    # made and BOTH entries stay on disk (the coexistence the round-1
+    # read-guard design lacked).
+    import dataclasses
+
+    from evals.extraction import (
+        artifact_hash,
+        extraction_prompt_version,
+        serialize_extracted_artifact,
+    )
+    from evals.judge_cache import JudgeCache, JudgeCacheKey
+    from evals.judges import JudgeRating
+    from evals.models import RecipeFixture
+
+    from rag_recipes.ingestion.pipeline.extraction import RecipeExtractionOutput
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    cache_root = tmp_path / "judge-cache"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_judge_prompt(fixtures_root)
+    payloads = [
+        item.model_dump(mode="json", by_alias=True)
+        for item in RecipeExtractionOutput.model_validate(stew_output()).items
+    ]
+    real_key = JudgeCacheKey(
+        fixture_set="smoke",
+        fixture_id="bean-stew",
+        fixture_content_hash=RecipeFixture(
+            name="bean-stew", source_md=STEW_SOURCE, expected=STEW_EXPECTED
+        ).content_hash(),
+        extraction_prompt_version=extraction_prompt_version(),
+        artifact_hash=artifact_hash(serialize_extracted_artifact(payloads)),
+        judge_name="summary_quality",
+        judge_version="v1",
+        model="fake-model",
+    )
+    stale_key = dataclasses.replace(real_key, artifact_hash="0" * 64)
+    stale = JudgeRating(
+        judge_name="summary_quality",
+        judge_version="v1",
+        rating="fail",
+        critique="A rating for an artifact that no longer exists.",
+        metadata={"provider": "fake", "model": "fake-model"},
+    )
+    cache = JudgeCache(root=cache_root)
+    cache.put(stale, key=stale_key)
+
+    provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): stew_output()},
+        default_output={"rating": "pass", "critique": "Fresh judgment."},
+    )
+    run = await run_extraction_eval(
+        "smoke",
+        "warm-guard",
+        llm_provider=provider,
+        judge="summary_quality",
+        fixtures_root=fixtures_root,
+        reports_root=tmp_path / "reports",
+        thresholds=THRESHOLDS,
+        settings=SettingsStandIn(),
+        judge_cache_root=cache_root,
+    )
+    assert len(_judge_calls(provider)) == 1  # the stale entry was not served
+    results = json.loads((run.path / "results.json").read_text(encoding="utf-8"))["results"]
+    assert results["judge"]["per_fixture"]["bean-stew"]["critique"] == "Fresh judgment."
+    # Both entries coexist: the new rating landed under the real key and the
+    # stale one survived under its own artifact hash.
+    assert len(list(cache_root.glob("*.json"))) == 2
+    assert cache.get(stale_key) == stale
+    fresh = cache.get(real_key)
+    assert fresh is not None
+    assert fresh.critique == "Fresh judgment."
+    assert fresh.metadata["artifact_hash"] == real_key.artifact_hash
+
+
+async def test_source_edit_invalidates_cached_judge_rating(tmp_path: Path) -> None:
+    """A fixture ``source.md`` edit must not replay the pre-edit judge rating.
+
+    Note the edit moves *two* key parts at once in general —
+    ``fixture_content_hash`` and, unless the canned output is byte-identical,
+    ``artifact_hash`` — so this driver-level miss is not attributable to either
+    part alone; the per-part attribution lives in ``test_judge_cache.py``'s
+    significance matrix. (Here the canned output *is* identical, so the miss is
+    the content hash's doing.)
+    """
+    from tests.unit.evals.eval_utils import request_hash, soup_output, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    provider = write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    write_judge_prompt(fixtures_root)
+    kwargs: dict[str, Any] = {
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": THRESHOLDS,
+        "settings": SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "first", llm_provider=provider, **kwargs)
+    assert len(_judge_calls(provider)) == 2
+
+    edited_source = STEW_SOURCE + "\nNow with a splash of sherry.\n"
+    (fixtures_root / "synthetic_recipes" / "smoke" / "bean-stew" / "source.md").write_text(
+        edited_source, encoding="utf-8"
+    )
+    # The edit changes the extraction request hash, so the provider is rebuilt
+    # with the re-derived hash serving the same canned output.
+    from tests.unit.evals.eval_utils import SOUP_SOURCE as _SOUP_SOURCE
+
+    edited_provider = FakeLLMProvider(
+        {
+            request_hash("bean-stew", edited_source): stew_output(),
+            request_hash("tomato-soup", _SOUP_SOURCE): soup_output(),
+        },
+        default_output={"rating": "pass", "critique": "OK."},
+    )
+    await run_extraction_eval("smoke", "second", llm_provider=edited_provider, **kwargs)
+    # bean-stew misses (content hash changed); tomato-soup still hits.
+    assert len(_judge_calls(edited_provider)) == 1
+
+
+async def test_extraction_prompt_version_bump_invalidates_cached_judge_rating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``PROMPT_VERSION`` bump invalidates every cached judge rating.
+
+    The monkeypatch changes the *cache-key input* only: the production pipeline
+    global that builds extraction requests, the value stamped into
+    ``RunMetadata``, and ``eval_utils``' separately imported copy are all
+    untouched — which is why ``request_hash(...)`` keeps serving the canned
+    extractions unchanged. No real prompt-version transition is exercised here.
+    """
+    import evals.extraction
+
+    fixtures_root = tmp_path / "fixtures"
+    provider = write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    write_judge_prompt(fixtures_root)
+    kwargs: dict[str, Any] = {
+        "llm_provider": provider,
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": THRESHOLDS,
+        "settings": SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "first", **kwargs)
+    assert len(_judge_calls(provider)) == 2
+    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v2")
+    await run_extraction_eval("smoke", "second", **kwargs)
+    assert len(_judge_calls(provider)) == 4  # both fixtures re-judged
+
+
+async def test_same_named_fixture_in_two_sets_caches_separately(tmp_path: Path) -> None:
+    # The old key had no fixture_set part, so `smoke/bean-stew` and
+    # `smoke2/bean-stew` would share (and clobber) one cache slot.
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_fixture(fixtures_root, "smoke2", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_judge_prompt(fixtures_root)
+    provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): stew_output()},
+        default_output={"rating": "pass", "critique": "OK."},
+    )
+    kwargs: dict[str, Any] = {
+        "llm_provider": provider,
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": THRESHOLDS,
+        "settings": SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "set-a", **kwargs)
+    assert len(_judge_calls(provider)) == 1
+    await run_extraction_eval("smoke2", "set-b", **kwargs)
+    # Identical fixture content and artifact, but a different set: a miss.
+    assert len(_judge_calls(provider)) == 2
+    assert len(list((tmp_path / "judge-cache").glob("*.json"))) == 2
+    # Both entries stay retrievable: re-running either set is free again.
+    await run_extraction_eval("smoke", "set-a-again", **kwargs)
+    await run_extraction_eval("smoke2", "set-b-again", **kwargs)
+    assert len(_judge_calls(provider)) == 2
 
 
 # --- CLI wiring (Epic 15 Phase 15.1 TASK-003) --------------------------------
