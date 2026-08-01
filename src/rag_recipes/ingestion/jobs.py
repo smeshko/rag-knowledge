@@ -28,7 +28,10 @@ from rag_recipes.ingestion.batch import (
     submit_extraction_batches,
 )
 from rag_recipes.ingestion.cron import sweep_stuck_jobs
-from rag_recipes.ingestion.pipeline.chunking import persist_chunks_for_ready_items
+from rag_recipes.ingestion.pipeline.chunking import (
+    build_chunks,
+    persist_chunks_for_ready_items,
+)
 from rag_recipes.ingestion.pipeline.dedup import (
     CandidateRef,
     compute_candidate_score,
@@ -1023,6 +1026,166 @@ async def process_document(
             raise
 
 
+async def index_knowledge_item(
+    ctx: dict[str, Any],
+    item_id: str,
+    *,
+    _session_id: str | None = None,
+) -> int:
+    """Index one approved knowledge item: ``indexing → ready`` + chunk + embed
+    + active-version handoff, in a single transaction (Epic 21.3, plan D1).
+
+    The approve-side worker for ``POST /knowledge-items/{item_id}/review``.
+    Everything commits atomically, so a provider failure rolls back to
+    ``indexing`` and arq retries (``max_tries=3``); if every retry is
+    exhausted, the item-level pass in ``sweep_stuck_jobs`` returns the row to
+    ``needs_review`` (plan D1b) — never an unrecoverable state.
+
+    Lock order is **Document first, item second** — the same order
+    ``_index_and_finalize`` uses (``transition_to`` locks the Document row,
+    then ``supersede_prior_items`` bulk-updates items); the inverse order
+    could deadlock against a concurrent reprocess READY gate.
+
+    Idempotency: the ``status is INDEXING`` guard makes a re-delivered job for
+    a completed (``ready``), reverted (``needs_review``) or superseded item a
+    no-op — which is also what makes the D1b sweep and the route's
+    compensating revert race-safe against a late-arriving original job.
+
+    Staleness (plan D9 rule 4): a reprocess can land between the route's 409
+    guard and this job running, so staleness is re-checked here *before any
+    chunking*; a stale item is reverted to ``needs_review`` — never flipped to
+    READY, which would commit a chunked-but-permanently-unsearchable row (the
+    forward-only handoff refuses to move the active version backwards while
+    search requires version equality, ``retrieval/_sql.py``).
+
+    Handoff (plan D1a, mirrors ``_index_and_finalize``'s READY gate,
+    forward-only per D9): when ``active_source_version`` is NULL (a doc that
+    landed terminal NEEDS_REVIEW never reached the READY gate) or older than
+    the item's version, flip it to the item's version and supersede every
+    other version's items (rejected/indexing rows are spared by the
+    repository guard). Equal → no-op; **older item → no-op** — a symmetric
+    ``!=`` would supersede the newer live generation.
+
+    Langfuse scope opens on ``_session_id`` (the route passes the document id
+    per the session==document convention) with ``item_id`` as the fallback —
+    the document id is unknown until the item is loaded inside the
+    transaction, so the scope cannot be opened on it directly.
+
+    Returns the number of chunk rows carried by the item on success, 0 on any
+    no-op path.
+    """
+    session_factory = ctx["session_factory"]
+    settings: Settings = ctx["settings"]
+    observability = ctx.get("observability")
+
+    with langfuse_session_scope(observability, _session_id or item_id):
+        async with session_factory() as session:
+            # Lock-free resolve of the parent document id, so the Document can
+            # be locked FIRST (see docstring).
+            document_id = await session.scalar(
+                select(KnowledgeItem.document_id).where(KnowledgeItem.id == item_id)
+            )
+            if document_id is None:
+                logger.warning("index_knowledge_item: item %s not found", item_id)
+                return 0
+            doc = await session.get(Document, document_id, with_for_update=True)
+            if doc is None:
+                logger.warning(
+                    "index_knowledge_item: document %s vanished for item %s",
+                    document_id,
+                    item_id,
+                )
+                return 0
+            item = await session.get(KnowledgeItem, item_id, with_for_update=True)
+            if item is None or item.status is not KnowledgeItemStatus.INDEXING:
+                logger.info(
+                    "index_knowledge_item: no-op for %s (status %s)",
+                    item_id,
+                    "missing" if item is None else item.status.value,
+                )
+                return 0
+
+            # Run-time staleness re-check (D9 rule 4) — BEFORE any chunking.
+            current_version = await session.scalar(
+                select(func.max(KnowledgeItem.source_version)).where(
+                    KnowledgeItem.document_id == document_id
+                )
+            )
+            if current_version is not None and item.source_version < current_version:
+                item.status = KnowledgeItemStatus.NEEDS_REVIEW
+                await session.commit()
+                logger.warning(
+                    "index_knowledge_item: item %s went stale (v%d < v%d); "
+                    "reverted to needs_review without chunking",
+                    item_id,
+                    item.source_version,
+                    current_version,
+                )
+                return 0
+
+            # Flip before building: build_chunks returns [] for non-READY.
+            item.status = KnowledgeItemStatus.READY
+            # Defensive idempotency: needs_review-born items never have chunks;
+            # the guard covers hand-seeded/degraded rows.
+            existing_chunk = await session.scalar(
+                select(Chunk.id).where(Chunk.parent_id == item_id).limit(1)
+            )
+            if existing_chunk is None:
+                session.add_all(build_chunks(item, category=doc.category))
+                await session.flush()
+            chunks = list(
+                (
+                    await session.execute(
+                        select(Chunk).where(Chunk.parent_id == item_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            provider = ctx.get("embedding_provider") or _build_embedding_provider(
+                settings, observability
+            )
+            # Upserts on (chunk_id, provider, model) — replay-idempotent.
+            await embed_chunks(
+                session,
+                chunks,
+                provider=provider,
+                batch_size=settings.embedding_batch_size,
+                trace_context=TraceContext(session_id=document_id),
+            )
+
+            # Forward-only active-version handoff (D1a/D9).
+            if (
+                doc.active_source_version is None
+                or item.source_version > doc.active_source_version
+            ):
+                keep_run_ids = set(
+                    (
+                        await session.execute(
+                            select(ExtractionRun.id).where(
+                                ExtractionRun.document_id == document_id,
+                                ExtractionRun.source_version == item.source_version,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                await DocumentRepository(session).supersede_prior_items(
+                    document_id, keep_extraction_run_ids=keep_run_ids
+                )
+                doc.active_source_version = item.source_version
+                await session.flush()
+            await session.commit()
+    logger.info(
+        "index_knowledge_item: indexed %s (%d chunks) for document %s",
+        item_id,
+        len(chunks),
+        document_id,
+    )
+    return len(chunks)
+
+
 async def on_startup(ctx: dict[str, Any]) -> None:
     settings: Settings = get_settings()
     ctx["settings"] = settings
@@ -1049,7 +1212,11 @@ _SETTINGS = get_settings()
 
 
 class WorkerSettings:
-    functions = [ping_job, arq_func(process_document, name="process_document", max_tries=3)]
+    functions = [
+        ping_job,
+        arq_func(process_document, name="process_document", max_tries=3),
+        arq_func(index_knowledge_item, name="index_knowledge_item", max_tries=3),
+    ]
     cron_jobs = [
         cron(
             sweep_stuck_jobs,

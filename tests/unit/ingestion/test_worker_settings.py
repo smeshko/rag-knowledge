@@ -17,3 +17,10 @@ def test_process_document_registered_with_max_tries_3() -> None:
     # a killed/timed-out job — max_tries=1 would never trigger the resume path.
     process_document_fn = _function_named("process_document")
     assert process_document_fn.max_tries == 3
+
+
+def test_index_knowledge_item_registered_with_max_tries_3() -> None:
+    # Phase 21.3: the burst-worker integration test hand-wires its own Worker,
+    # so this is the only guard on the *production* registration (plan TASK-004).
+    index_fn = _function_named("index_knowledge_item")
+    assert index_fn.max_tries == 3
