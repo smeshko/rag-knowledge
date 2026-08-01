@@ -168,7 +168,14 @@ def build_result(
     )
 
 
-def build_structured_preview(structured_data: dict[str, Any]) -> StructuredPreview:
+def top_ingredients(structured_data: dict[str, Any]) -> list[str]:
+    """Pick up to ``TOP_INGREDIENTS`` display labels from ``ingredients``.
+
+    Shared by the search structured preview and the 21.3 review-items listing
+    (one picker, no copy drift). Non-dict entries are skipped; the first
+    present of ``item_normalized`` / ``item_text`` / ``raw_text`` labels each
+    ingredient.
+    """
     ingredients = structured_data.get("ingredients") or []
     top: list[str] = []
     for ing in ingredients:
@@ -179,11 +186,15 @@ def build_structured_preview(structured_data: dict[str, Any]) -> StructuredPrevi
             top.append(label)
         if len(top) >= TOP_INGREDIENTS:
             break
+    return top
+
+
+def build_structured_preview(structured_data: dict[str, Any]) -> StructuredPreview:
     return StructuredPreview.model_validate(
         {
             "schema": "recipe.preview.v1",
             "yield": structured_data.get("yield"),
-            "top_ingredients": top,
+            "top_ingredients": top_ingredients(structured_data),
         }
     )
 
