@@ -15,9 +15,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi import FastAPI
 
 from rag_recipes.api.app import app
+from rag_recipes.api.schemas.search import SearchResponse
 
 _HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
 
@@ -59,6 +61,17 @@ def _assert_typed_success_responses(openapi: dict[str, Any]) -> None:
                     assert any(
                         key in schema for key in ("type", "properties", "allOf", "anyOf")
                     ), f"{where}: {status} schema is empty/untyped: {schema!r}"
+                    if schema.get("type") == "object":
+                        # Same bar as the $ref branch below: a `-> dict[str, Any]`
+                        # / `response_model=dict` handler documents the identical
+                        # untyped `{"type": "object", "additionalProperties": true}`
+                        # body, and `type` alone would wave it through.
+                        assert any(
+                            key in schema for key in ("properties", "allOf", "anyOf")
+                        ), (
+                            f"{where}: {status} inline object schema types nothing "
+                            f"(dict passthrough): {schema!r}"
+                        )
                     continue
                 name = ref.rsplit("/", 1)[-1]
                 assert name in components, f"{where}: {ref} does not resolve"
@@ -104,3 +117,51 @@ def test_204_no_content_operation_is_exempted_not_failed() -> None:
         return None
 
     _assert_typed_success_responses(throwaway.openapi())
+
+
+# --- Red direction: the guard must actually fail on untyped bodies ---
+#
+# Without these, gutting `_assert_typed_success_responses` to `pass` would leave
+# the whole module green — the guard would assert nothing and no test would say so.
+
+
+def _guard_message(app_: FastAPI) -> str:
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_typed_success_responses(app_.openapi())
+    return str(excinfo.value)
+
+
+def test_guard_fails_on_route_without_response_model() -> None:
+    """The regression this guard exists for: `-> Any` and no response_model."""
+    throwaway = FastAPI(separate_input_output_schemas=False)
+
+    @throwaway.get("/things")
+    async def list_things() -> Any:  # pragma: no cover - schema only
+        return {}
+
+    assert "empty/untyped" in _guard_message(throwaway)
+
+
+def test_guard_fails_on_untyped_dict_response() -> None:
+    """`-> dict[str, Any]` documents an object that types nothing."""
+    throwaway = FastAPI(separate_input_output_schemas=False)
+
+    @throwaway.get("/things")
+    async def list_things() -> dict[str, Any]:  # pragma: no cover - schema only
+        return {}
+
+    assert "types nothing" in _guard_message(throwaway)
+
+
+def test_guard_fails_on_serializer_collapsed_component() -> None:
+    """The D4 failure mode: `separate_input_output_schemas` left at its default
+    collapses a `@model_serializer` model to a property-less object behind a
+    `$ref`, with byte-perfect responses. Proves `api/app.py`'s flag is
+    load-bearing and that the guard, not luck, is what holds it."""
+    throwaway = FastAPI()  # i.e. separate_input_output_schemas=True (default)
+
+    @throwaway.post("/search", response_model=SearchResponse)
+    async def search() -> Any:  # pragma: no cover - schema only
+        return None
+
+    assert "has no properties" in _guard_message(throwaway)
