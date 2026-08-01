@@ -77,13 +77,20 @@ def _assert_typed_body(
         f"{where}: schema is empty/untyped: {schema!r}"
     )
     if schema_type == "object":
-        # A `-> dict[str, Any]` / `response_model=dict` handler documents the
-        # identical untyped `{"type": "object", "additionalProperties": true}`
-        # body the $ref branch rejects; `type` alone would wave it through.
-        assert schema.get("properties"), (
-            f"{where}: inline object schema types nothing "
-            f"(dict passthrough): {schema!r}"
-        )
+        if not schema.get("properties"):
+            # A typed mapping (`-> dict[str, str]`) documents its body through
+            # `additionalProperties`. `additionalProperties: true` or `{}` (a
+            # `-> dict[str, Any]` / `response_model=dict` handler) is the same
+            # untyped shape the $ref branch rejects, and `type` alone would wave
+            # it through.
+            additional = schema.get("additionalProperties")
+            assert isinstance(additional, dict) and additional, (
+                f"{where}: inline object schema types nothing "
+                f"(dict passthrough): {schema!r}"
+            )
+            _assert_typed_body(
+                additional, components, f"{where} [additionalProperties]"
+            )
     elif schema_type == "array":
         # `-> list[Any]` documents `{"type": "array", "items": {}}`.
         items = schema.get("items")
@@ -184,6 +191,28 @@ def test_guard_fails_on_untyped_dict_response() -> None:
         return {}
 
     assert "types nothing" in _guard_message(throwaway)
+
+
+def test_guard_accepts_a_typed_mapping_body() -> None:
+    """`-> dict[str, str]` has no properties but is still a fully typed body."""
+    throwaway = FastAPI(separate_input_output_schemas=False)
+
+    @throwaway.get("/things")
+    async def list_things() -> dict[str, str]:  # pragma: no cover - schema only
+        return {}
+
+    _assert_typed_success_responses(throwaway.openapi())
+
+
+def test_guard_fails_on_mapping_of_untyped_values() -> None:
+    """The mapping allowance is not a bypass — its value schema is walked too."""
+    throwaway = FastAPI(separate_input_output_schemas=False)
+
+    @throwaway.get("/things")
+    async def list_things() -> dict[str, list[Any]]:  # pragma: no cover - schema only
+        return {}
+
+    assert "untyped items" in _guard_message(throwaway)
 
 
 def test_guard_fails_on_untyped_array_response() -> None:
