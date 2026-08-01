@@ -1,12 +1,15 @@
 """OpenAPI guard: no untyped response bodies (Epic 21.1, TASK-006).
 
-Every documented operation must declare a non-empty JSON schema for each 2xx
-response, and every ``$ref`` must resolve to a component with a non-empty
-``properties`` block — the second half catches the ``@model_serializer``
+Every documented operation must declare a JSON schema for each 2xx response
+that actually types the body: ``$ref``s must resolve to a component with a
+non-empty ``properties`` block — which catches the ``@model_serializer``
 schema collapse (``{"type": "object", "additionalProperties": true}``) that
-the byte-compat suite structurally cannot see (D4). ``204`` no-content
-responses are exempt, narrowly: they must carry no ``content`` block at all
-(Phase 21.2's DELETE lands as a 204 without a response_model).
+the byte-compat suite structurally cannot see (D4) — and inline schemas are
+walked recursively so an untyped object (``-> dict[str, Any]``) or an untyped
+array (``-> list[Any]``) cannot slip through on the strength of a bare
+``type`` key. ``204`` no-content responses are exempt, narrowly: they must
+carry no ``content`` block at all (Phase 21.2's DELETE lands as a 204 without
+a response_model).
 
 Hermetic: importing the app reads no env (settings load in the lifespan).
 """
@@ -19,6 +22,7 @@ import pytest
 from fastapi import FastAPI
 
 from rag_recipes.api.app import app
+from rag_recipes.api.schemas.health import HealthResponse
 from rag_recipes.api.schemas.search import SearchResponse
 
 _HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
@@ -27,6 +31,64 @@ _HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options", "tr
 # dict[str, Any] passthrough response model). None exist today — add a name
 # here only with a comment justifying it.
 _COMPONENT_EXEMPTIONS: frozenset[str] = frozenset()
+
+
+_COMPOSITION_KEYS = ("allOf", "anyOf", "oneOf")
+
+
+def _assert_typed_body(
+    schema: dict[str, Any], components: dict[str, Any], where: str
+) -> None:
+    """Assert one response-body schema types something.
+
+    Recurses through the *envelope* only — ``$ref``, composition branches and
+    array items — and stops at the first component. It deliberately does not
+    walk a component's own properties: fields like
+    ``KnowledgeItemDetail.structured_data`` are untyped ``dict[str, Any]``
+    passthroughs by design (the full recipe.v1 payload), which is a different
+    question from "does this endpoint document its body at all".
+    """
+    ref = schema.get("$ref")
+    if ref is not None:
+        name = ref.rsplit("/", 1)[-1]
+        assert name in components, f"{where}: {ref} does not resolve"
+        if name in _COMPONENT_EXEMPTIONS:
+            return
+        # Load-bearing (D4): a @model_serializer collapses a model to
+        # {"type": "object", "additionalProperties": true} — non-empty by a
+        # shallow check, yet it types nothing.
+        assert components[name].get("properties"), (
+            f"{where}: component {name!r} has no properties "
+            "(schema collapsed or untyped)"
+        )
+        return
+
+    for key in _COMPOSITION_KEYS:
+        branches = schema.get(key)
+        if branches:
+            for branch in branches:
+                if branch.get("type") == "null":
+                    continue
+                _assert_typed_body(branch, components, f"{where} [{key}]")
+            return
+
+    schema_type = schema.get("type")
+    assert schema_type or schema.get("properties"), (
+        f"{where}: schema is empty/untyped: {schema!r}"
+    )
+    if schema_type == "object":
+        # A `-> dict[str, Any]` / `response_model=dict` handler documents the
+        # identical untyped `{"type": "object", "additionalProperties": true}`
+        # body the $ref branch rejects; `type` alone would wave it through.
+        assert schema.get("properties"), (
+            f"{where}: inline object schema types nothing "
+            f"(dict passthrough): {schema!r}"
+        )
+    elif schema_type == "array":
+        # `-> list[Any]` documents `{"type": "array", "items": {}}`.
+        items = schema.get("items")
+        assert items, f"{where}: array schema has untyped items: {schema!r}"
+        _assert_typed_body(items, components, f"{where} [items]")
 
 
 def _assert_typed_success_responses(openapi: dict[str, Any]) -> None:
@@ -53,38 +115,9 @@ def _assert_typed_success_responses(openapi: dict[str, Any]) -> None:
                 json_content = content.get("application/json")
                 assert json_content, f"{where}: {status} response is not JSON"
                 schema = json_content.get("schema") or {}
-                ref = schema.get("$ref")
-                if ref is None:
-                    # Inline schema: must actually type something. A bare {}
-                    # or {"title": ...} (an -> Any handler without a
-                    # response_model) fails here.
-                    assert any(
-                        key in schema for key in ("type", "properties", "allOf", "anyOf")
-                    ), f"{where}: {status} schema is empty/untyped: {schema!r}"
-                    if schema.get("type") == "object":
-                        # Same bar as the $ref branch below: a `-> dict[str, Any]`
-                        # / `response_model=dict` handler documents the identical
-                        # untyped `{"type": "object", "additionalProperties": true}`
-                        # body, and `type` alone would wave it through.
-                        assert any(
-                            key in schema for key in ("properties", "allOf", "anyOf")
-                        ), (
-                            f"{where}: {status} inline object schema types nothing "
-                            f"(dict passthrough): {schema!r}"
-                        )
-                    continue
-                name = ref.rsplit("/", 1)[-1]
-                assert name in components, f"{where}: {ref} does not resolve"
-                if name in _COMPONENT_EXEMPTIONS:
-                    continue
-                properties = components[name].get("properties") or {}
-                # Load-bearing (D4): a @model_serializer collapses a model to
-                # {"type": "object", "additionalProperties": true} — non-empty
-                # by a shallow check, yet it types nothing.
-                assert properties, (
-                    f"{where}: component {name!r} has no properties "
-                    "(schema collapsed or untyped)"
-                )
+                # A bare {} or {"title": ...} (an -> Any handler without a
+                # response_model) fails inside the recursive check.
+                _assert_typed_body(schema, components, f"{where}: {status}")
 
 
 def test_every_documented_success_response_is_typed() -> None:
@@ -151,6 +184,28 @@ def test_guard_fails_on_untyped_dict_response() -> None:
         return {}
 
     assert "types nothing" in _guard_message(throwaway)
+
+
+def test_guard_fails_on_untyped_array_response() -> None:
+    """`-> list[Any]` documents `{"type": "array", "items": {}}`."""
+    throwaway = FastAPI(separate_input_output_schemas=False)
+
+    @throwaway.get("/things")
+    async def list_things() -> list[Any]:  # pragma: no cover - schema only
+        return []
+
+    assert "untyped items" in _guard_message(throwaway)
+
+
+def test_guard_accepts_a_typed_list_body() -> None:
+    """The array rule must not fire on a legitimately typed collection."""
+    throwaway = FastAPI(separate_input_output_schemas=False)
+
+    @throwaway.get("/things")
+    async def list_things() -> list[HealthResponse]:  # pragma: no cover - schema only
+        return []
+
+    _assert_typed_success_responses(throwaway.openapi())
 
 
 def test_guard_fails_on_serializer_collapsed_component() -> None:
