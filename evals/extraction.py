@@ -16,14 +16,19 @@ uses: ``validate_hard`` first (a failure means production would persist nothing,
 so the fixture is recorded ``hard_validation_failed`` and never scored), then
 ``validate_soft`` for the ready-vs-needs_review split (DECISIONS #4).
 
-Judge integration (Phase 15.2): when ``judge`` names a committed judge prompt,
-the driver loads it via ``load_judge`` (reusing the *same* injected provider —
-never a second one), replays cached ratings from the on-disk ``JudgeCache``
-keyed by ``(fixture_id, judge_name, judge_version, model)``, calls the judge on
-misses, and records per-fixture ratings plus an aggregate pass rate at
-``results.judge``. A ``JudgeError`` (rejection, truncation, malformed verdict)
-marks the fixture *unrated* — never a silent pass/fail — and the pass rate is
-computed over rated fixtures only.
+Judge integration (Phase 15.2, key extended in Epic 20 Phase 20.1): when
+``judge`` names a committed judge prompt, the driver loads it via
+``load_judge`` (reusing the *same* injected provider — never a second one),
+replays cached ratings from the on-disk ``JudgeCache`` keyed by the eight-part
+``JudgeCacheKey`` ``(fixture_set, fixture_id, fixture_content_hash,
+extraction_prompt_version, artifact_hash, judge_name, judge_version, model)``
+built at the single ``build_judge_cache_key`` site, calls the judge on misses,
+and records per-fixture ratings plus an aggregate pass rate at
+``results.judge``. A fixture edit, an extraction ``PROMPT_VERSION`` bump, or a
+changed judged artifact each invalidate the cached rating; entries for
+different artifacts of one fixture coexist (DECISIONS #10). A ``JudgeError``
+(rejection, truncation, malformed verdict) marks the fixture *unrated* — never
+a silent pass/fail — and the pass rate is computed over rated fixtures only.
 
 ``results.json`` schema (the Epic-14 envelope wraps the payload)::
 
@@ -97,7 +102,7 @@ from typing import Any, cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evals.fixtures import load_recipe_fixtures
-from evals.judge_cache import JudgeCache
+from evals.judge_cache import JudgeCache, JudgeCacheKey
 from evals.judges import Judge, JudgeError, load_judge
 from evals.models import RecipeFixture
 from evals.reports import BASELINES_ROOT, ReportRun, SettingsLike, diff_against_baseline
@@ -126,7 +131,13 @@ from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.storage.enums import ExtractionRunStatus
 from rag_recipes.storage.models.source_span import SourceSpan
 
-__all__ = ["extraction_prompt_version", "run_extraction_eval", "synthetic_span_id"]
+__all__ = [
+    "artifact_hash",
+    "build_judge_cache_key",
+    "extraction_prompt_version",
+    "run_extraction_eval",
+    "synthetic_span_id",
+]
 
 _TIME_FIELDS = ("prep_time", "cook_time", "total_time")
 
@@ -144,6 +155,45 @@ def extraction_prompt_version() -> str:
     the monkeypatch cover only half the system.
     """
     return PROMPT_VERSION
+
+
+def artifact_hash(text: str) -> str:
+    """sha256 hex of the exact string handed to ``judge.judge``.
+
+    The ``artifact_hash`` key part of :class:`JudgeCacheKey` (DECISIONS #10).
+    Both the driver and alignment hash *the string they actually judge* through
+    this one helper, so the key can never assert an artifact identity that was
+    not judged.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_judge_cache_key(
+    *,
+    fixture_set: str,
+    fixture_id: str,
+    fixture_content_hash: str,
+    extraction_prompt_version: str,
+    artifact_hash: str,
+    judge: Judge,
+) -> JudgeCacheKey:
+    """The single ``JudgeCacheKey`` construction site (DECISIONS #2).
+
+    Every key part has exactly one source: the fixture-side provenance is
+    passed in explicitly (the driver uses the working tree, alignment the run's
+    recorded values), and the judge identity — including ``model`` — comes from
+    the ``Judge`` itself. ``evals.judge_cache`` stays storage-only.
+    """
+    return JudgeCacheKey(
+        fixture_set=fixture_set,
+        fixture_id=fixture_id,
+        fixture_content_hash=fixture_content_hash,
+        extraction_prompt_version=extraction_prompt_version,
+        artifact_hash=artifact_hash,
+        judge_name=judge.name,
+        judge_version=judge.version,
+        model=judge.model,
+    )
 
 
 def synthetic_span_id(fixture_name: str) -> str:
@@ -261,9 +311,10 @@ def _mean(values: list[float]) -> float | None:
 class _JudgeSection:
     """Accumulates per-fixture judge outcomes for the ``results.judge`` slot."""
 
-    def __init__(self, judge: Judge, cache: JudgeCache) -> None:
+    def __init__(self, judge: Judge, cache: JudgeCache, fixture_set: str) -> None:
         self._judge = judge
         self._cache = cache
+        self._fixture_set = fixture_set
         self.per_fixture: dict[str, dict[str, Any]] = {}
         self.passes = 0
         self.fails = 0
@@ -271,13 +322,21 @@ class _JudgeSection:
 
     async def rate(self, fixture: RecipeFixture, recipe: ExtractedRecipe) -> None:
         """Rate one scored fixture, replaying the cache; ``JudgeError`` → unrated."""
-        rating = self._cache.get(
-            fixture.name, self._judge.name, self._judge.version, self._judge.model
+        extracted = json.dumps(recipe.model_dump(mode="json", by_alias=True), indent=2)
+        key = build_judge_cache_key(
+            fixture_set=self._fixture_set,
+            fixture_id=fixture.name,
+            fixture_content_hash=fixture.content_hash(),
+            # Module-global lookup at call time, so the monkeypatch seam works.
+            extraction_prompt_version=PROMPT_VERSION,
+            artifact_hash=artifact_hash(extracted),
+            judge=self._judge,
         )
+        rating = self._cache.get(key)
         if rating is None:
             try:
                 rating = await self._judge.judge(
-                    json.dumps(recipe.model_dump(mode="json", by_alias=True), indent=2),
+                    extracted,
                     json.dumps(fixture.expected, indent=2),
                     fixture.source_md,
                 )
@@ -285,7 +344,7 @@ class _JudgeSection:
                 self.unrated += 1
                 self.per_fixture[fixture.name] = {"status": "unrated", "error": str(exc)}
                 return
-            self._cache.put(rating, fixture_id=fixture.name)
+            self._cache.put(rating, key=key)
         if rating.rating == "pass":
             self.passes += 1
         else:
@@ -454,6 +513,7 @@ async def run_extraction_eval(
         judge_section = _JudgeSection(
             load_judge(judge, llm_provider, root=fixtures_root),
             JudgeCache(root=judge_cache_root),
+            fixture_set,
         )
     if thresholds is None or settings is None:
         from rag_recipes.config import get_settings

@@ -512,6 +512,118 @@ async def test_judge_error_counts_fixture_as_unrated(tmp_path: Path) -> None:
     assert "Judge pass rate (summary_quality, v1): n/a" in summary
 
 
+async def test_source_edit_invalidates_cached_judge_rating(tmp_path: Path) -> None:
+    """A fixture ``source.md`` edit must not replay the pre-edit judge rating.
+
+    Note the edit moves *two* key parts at once in general —
+    ``fixture_content_hash`` and, unless the canned output is byte-identical,
+    ``artifact_hash`` — so this driver-level miss is not attributable to either
+    part alone; the per-part attribution lives in ``test_judge_cache.py``'s
+    significance matrix. (Here the canned output *is* identical, so the miss is
+    the content hash's doing.)
+    """
+    from tests.unit.evals.eval_utils import request_hash, soup_output, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    provider = write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    write_judge_prompt(fixtures_root)
+    kwargs: dict[str, Any] = {
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": THRESHOLDS,
+        "settings": SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "first", llm_provider=provider, **kwargs)
+    assert len(_judge_calls(provider)) == 2
+
+    edited_source = STEW_SOURCE + "\nNow with a splash of sherry.\n"
+    (fixtures_root / "synthetic_recipes" / "smoke" / "bean-stew" / "source.md").write_text(
+        edited_source, encoding="utf-8"
+    )
+    # The edit changes the extraction request hash, so the provider is rebuilt
+    # with the re-derived hash serving the same canned output.
+    from tests.unit.evals.eval_utils import SOUP_SOURCE as _SOUP_SOURCE
+
+    edited_provider = FakeLLMProvider(
+        {
+            request_hash("bean-stew", edited_source): stew_output(),
+            request_hash("tomato-soup", _SOUP_SOURCE): soup_output(),
+        },
+        default_output={"rating": "pass", "critique": "OK."},
+    )
+    await run_extraction_eval("smoke", "second", llm_provider=edited_provider, **kwargs)
+    # bean-stew misses (content hash changed); tomato-soup still hits.
+    assert len(_judge_calls(edited_provider)) == 1
+
+
+async def test_extraction_prompt_version_bump_invalidates_cached_judge_rating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``PROMPT_VERSION`` bump invalidates every cached judge rating.
+
+    The monkeypatch changes the *cache-key input* only: the production pipeline
+    global that builds extraction requests, the value stamped into
+    ``RunMetadata``, and ``eval_utils``' separately imported copy are all
+    untouched — which is why ``request_hash(...)`` keeps serving the canned
+    extractions unchanged. No real prompt-version transition is exercised here.
+    """
+    import evals.extraction
+
+    fixtures_root = tmp_path / "fixtures"
+    provider = write_smoke_set(fixtures_root, judge_output={"rating": "pass", "critique": "OK."})
+    write_judge_prompt(fixtures_root)
+    kwargs: dict[str, Any] = {
+        "llm_provider": provider,
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": THRESHOLDS,
+        "settings": SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "first", **kwargs)
+    assert len(_judge_calls(provider)) == 2
+    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v2")
+    await run_extraction_eval("smoke", "second", **kwargs)
+    assert len(_judge_calls(provider)) == 4  # both fixtures re-judged
+
+
+async def test_same_named_fixture_in_two_sets_caches_separately(tmp_path: Path) -> None:
+    # The old key had no fixture_set part, so `smoke/bean-stew` and
+    # `smoke2/bean-stew` would share (and clobber) one cache slot.
+    from tests.unit.evals.eval_utils import request_hash, stew_output
+
+    fixtures_root = tmp_path / "fixtures"
+    write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_fixture(fixtures_root, "smoke2", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
+    write_judge_prompt(fixtures_root)
+    provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): stew_output()},
+        default_output={"rating": "pass", "critique": "OK."},
+    )
+    kwargs: dict[str, Any] = {
+        "llm_provider": provider,
+        "judge": "summary_quality",
+        "fixtures_root": fixtures_root,
+        "reports_root": tmp_path / "reports",
+        "thresholds": THRESHOLDS,
+        "settings": SettingsStandIn(),
+        "judge_cache_root": tmp_path / "judge-cache",
+    }
+    await run_extraction_eval("smoke", "set-a", **kwargs)
+    assert len(_judge_calls(provider)) == 1
+    await run_extraction_eval("smoke2", "set-b", **kwargs)
+    # Identical fixture content and artifact, but a different set: a miss.
+    assert len(_judge_calls(provider)) == 2
+    assert len(list((tmp_path / "judge-cache").glob("*.json"))) == 2
+    # Both entries stay retrievable: re-running either set is free again.
+    await run_extraction_eval("smoke", "set-a-again", **kwargs)
+    await run_extraction_eval("smoke2", "set-b-again", **kwargs)
+    assert len(_judge_calls(provider)) == 2
+
+
 # --- CLI wiring (Epic 15 Phase 15.1 TASK-003) --------------------------------
 
 runner = CliRunner()

@@ -8,18 +8,20 @@ scripted callable, the judge side is served from a seeded 15.2 cache (or a
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 from evals.alignment import run_judge_alignment
-from evals.extraction import run_extraction_eval
+from evals.extraction import artifact_hash, extraction_prompt_version, run_extraction_eval
 from evals.fixtures import load_judge_alignment
-from evals.judge_cache import JudgeCache
+from evals.judge_cache import JudgeCache, JudgeCacheKey
 from evals.judges import JUDGE_SCHEMA_VERSION, JudgeRating
 from evals.models import RecipeFixture
 
+from rag_recipes.ingestion.pipeline.extraction import RecipeExtractionOutput
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputResponse, TokenUsage
 from tests.unit.evals.eval_utils import (
@@ -30,6 +32,7 @@ from tests.unit.evals.eval_utils import (
     THRESHOLDS,
     SettingsStandIn,
     request_hash,
+    soup_output,
     stew_output,
     write_fixture,
     write_judge_prompt,
@@ -69,10 +72,54 @@ def _seed(tmp_path: Path, *, judges: tuple[str, ...] = ("summary_quality",)) -> 
     return root
 
 
+# The interim 20.1 alignment path still re-extracts and judges recipes[0]
+# (rewritten by the alignment task); these helpers reproduce the exact string
+# it judges so seeded cache entries land under the real eight-part key.
+_FIXTURE_DATA: dict[str, tuple[str, dict[str, Any], Any]] = {
+    "bean-stew": (STEW_SOURCE, STEW_EXPECTED, stew_output),
+    "tomato-soup": (SOUP_SOURCE, SOUP_EXPECTED, soup_output),
+}
+
+
+def _judged_artifact(output: dict[str, Any]) -> str:
+    item = RecipeExtractionOutput.model_validate(output).items[0]
+    return json.dumps(item.model_dump(mode="json", by_alias=True), indent=2)
+
+
+def _cache_key(fixture_name: str, judge: str = "summary_quality") -> JudgeCacheKey:
+    source, expected, output = _FIXTURE_DATA[fixture_name]
+    fixture = RecipeFixture(name=fixture_name, source_md=source, expected=expected)
+    return JudgeCacheKey(
+        fixture_set="smoke",
+        fixture_id=fixture_name,
+        fixture_content_hash=fixture.content_hash(),
+        extraction_prompt_version=extraction_prompt_version(),
+        artifact_hash=artifact_hash(_judged_artifact(output())),
+        judge_name=judge,
+        judge_version="v1",
+        model="fake-model",
+    )
+
+
+def _extraction_provider(judge_output: dict[str, Any] | None = None) -> FakeLLMProvider:
+    """Serves both canned extractions; ``judge_output`` (if any) serves judges."""
+    return FakeLLMProvider(
+        {
+            request_hash("bean-stew", STEW_SOURCE): stew_output(),
+            request_hash("tomato-soup", SOUP_SOURCE): soup_output(),
+        },
+        default_output=judge_output,
+    )
+
+
+def _judge_calls(provider: FakeLLMProvider) -> list[Any]:
+    return [c for c in provider.calls if c.schema_version == JUDGE_SCHEMA_VERSION]
+
+
 def _seed_cache(cache_root: Path, ratings: dict[str, str], judge: str = "summary_quality") -> None:
     cache = JudgeCache(root=cache_root)
     for fixture, rating in ratings.items():
-        cache.put(_rating(fixture, rating, judge), fixture_id=fixture)
+        cache.put(_rating(fixture, rating, judge), key=_cache_key(fixture, judge))
 
 
 async def test_agreement_math_and_disagreements_with_both_critiques(tmp_path: Path) -> None:
@@ -85,7 +132,9 @@ async def test_agreement_math_and_disagreements_with_both_critiques(tmp_path: Pa
             "tomato-soup": ("pass", "human: soup is fine"),
         }
     )
-    provider = FakeLLMProvider()  # must never be consulted: both ratings cached
+    # The interim path re-extracts to compute the artifact hash, but the judge
+    # itself must be served from the seeded cache — zero judge calls.
+    provider = _extraction_provider()
 
     report = await run_judge_alignment(
         "summary_quality",
@@ -96,7 +145,7 @@ async def test_agreement_math_and_disagreements_with_both_critiques(tmp_path: Pa
         judge_cache_root=cache_root,
     )
 
-    assert provider.calls == ()
+    assert _judge_calls(provider) == []
     assert report.rated == 2
     assert report.agreements == 1
     assert report.agreement_rate == pytest.approx(0.5)
@@ -124,7 +173,7 @@ async def test_records_persist_with_composite_id_and_critiques_in_run_metadata(
     await run_judge_alignment(
         "summary_quality",
         "smoke",
-        llm_provider=FakeLLMProvider(),
+        llm_provider=_extraction_provider(),
         prompt_human=prompt,
         root=root,
         judge_cache_root=cache_root,
@@ -156,7 +205,7 @@ async def test_two_judges_on_one_fixture_keep_both_records(tmp_path: Path) -> No
         await run_judge_alignment(
             judge,
             "smoke",
-            llm_provider=FakeLLMProvider(),
+            llm_provider=_extraction_provider(),
             prompt_human=_ScriptedPrompt(dict(answers)),
             root=root,
             judge_cache_root=cache_root,
@@ -175,7 +224,7 @@ async def test_rerun_reuses_human_ratings_and_version_bump_reprompts(tmp_path: P
     _seed_cache(cache_root, {"bean-stew": "pass", "tomato-soup": "pass"})
     answers = {"bean-stew": ("pass", "ok"), "tomato-soup": ("fail", "meh")}
     kwargs: dict[str, Any] = {
-        "llm_provider": FakeLLMProvider(),
+        "llm_provider": _extraction_provider(),
         "root": root,
         "judge_cache_root": cache_root,
     }
@@ -207,7 +256,7 @@ async def test_rerun_reuses_human_ratings_and_version_bump_reprompts(tmp_path: P
     cache = JudgeCache(root=cache_root)
     for fixture in ("bean-stew", "tomato-soup"):
         v2 = _rating(fixture, "pass").model_copy(update={"judge_version": "v2"})
-        cache.put(v2, fixture_id=fixture)
+        cache.put(v2, key=dataclasses.replace(_cache_key(fixture), judge_version="v2"))
     third_prompt = _ScriptedPrompt(dict(answers))
     await run_judge_alignment(
         "summary_quality", "smoke", prompt_human=third_prompt, **kwargs
@@ -219,9 +268,11 @@ async def test_unrated_fixture_is_excluded_from_agreement_and_persisted(tmp_path
     root = _seed(tmp_path)
     cache_root = tmp_path / "cache"
     _seed_cache(cache_root, {"bean-stew": "pass"})  # tomato-soup: cache miss
-    # On the miss the provider rejects the extraction call, so the judge never
-    # gets anything to rate → unrated, not a crash and not a fail.
+    # The soup extraction is rejected (default output), so the judge never gets
+    # anything to rate → unrated, not a crash and not a fail; the stew serves
+    # its canned extraction and replays its seeded rating.
     provider = FakeLLMProvider(
+        {request_hash("bean-stew", STEW_SOURCE): stew_output()},
         default_output=StructuredOutputResponse(
             output_json=None,
             parse_error="rejected",
@@ -229,7 +280,7 @@ async def test_unrated_fixture_is_excluded_from_agreement_and_persisted(tmp_path
             usage=TokenUsage(input_tokens=1, output_tokens=1),
             provider="fake",
             model="fake-model",
-        )
+        ),
     )
     prompt = _ScriptedPrompt(
         {"bean-stew": ("pass", "ok"), "tomato-soup": ("pass", "fine")}
@@ -275,7 +326,7 @@ async def test_cache_miss_extracts_judges_and_caches(tmp_path: Path) -> None:
     assert report.agreement_rate == pytest.approx(1.0)
     judge_calls = [c for c in provider.calls if c.schema_version == JUDGE_SCHEMA_VERSION]
     assert len(judge_calls) == 1
-    cached = JudgeCache(root=cache_root).get("bean-stew", "summary_quality", "v1", "fake-model")
+    cached = JudgeCache(root=cache_root).get(_cache_key("bean-stew"))
     assert cached is not None
     assert cached.critique == "judged live"
 

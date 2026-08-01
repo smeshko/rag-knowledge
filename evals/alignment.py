@@ -37,7 +37,13 @@ from typing import Literal, cast
 import typer
 from pydantic import BaseModel
 
-from evals.extraction import _build_synthetic_window, _extract_recipes
+from evals.extraction import (
+    _build_synthetic_window,
+    _extract_recipes,
+    artifact_hash,
+    build_judge_cache_key,
+    extraction_prompt_version,
+)
 from evals.fixtures import load_judge_alignment, load_recipe_fixtures, save_judge_alignment
 from evals.judge_cache import JudgeCache
 from evals.judges import Judge, JudgeError, JudgeRating, load_judge
@@ -118,31 +124,48 @@ def _composite_id(fixture_name: str, judge_name: str) -> str:
 
 
 async def _judge_rating_for(
-    judge: Judge, cache: JudgeCache, fixture: RecipeFixture, llm_provider: LLMProvider
+    judge: Judge,
+    cache: JudgeCache,
+    fixture: RecipeFixture,
+    fixture_set: str,
+    llm_provider: LLMProvider,
 ) -> JudgeRating | None:
-    """The judge's rating for a fixture: cache first, LLM only on a miss.
+    """The judge's rating for a fixture: cache replay, LLM only on a miss.
 
-    A miss re-drives the fixture's extraction through the synthetic-window path
-    (the run's extracted output is not persisted in ``results.json``) and
-    judges the first recipe. Extraction failure or ``JudgeError`` yields
+    Interim Epic 20.1 state (rewritten in the alignment task): this still
+    re-drives the fixture's extraction through the synthetic-window path and
+    judges (and caches) ``recipes[0]`` only — the extraction now runs *before*
+    the cache lookup because the judged artifact's hash is a key part
+    (DECISIONS #10). The prompt version comes from the
+    ``extraction_prompt_version()`` accessor, never a second import of the
+    constant (DECISIONS #2). Extraction failure or ``JudgeError`` yields
     ``None`` — the fixture is *unrated*, never a silent pass/fail.
     """
-    rating = cache.get(fixture.name, judge.name, judge.version, judge.model)
-    if rating is not None:
-        return rating
     window = _build_synthetic_window(fixture.name, fixture.source_md)
     recipes, _error = await _extract_recipes(window, fixture.name, llm_provider)
     if not recipes:
         return None
+    extracted = json.dumps(recipes[0].model_dump(mode="json", by_alias=True), indent=2)
+    key = build_judge_cache_key(
+        fixture_set=fixture_set,
+        fixture_id=fixture.name,
+        fixture_content_hash=fixture.content_hash(),
+        extraction_prompt_version=extraction_prompt_version(),
+        artifact_hash=artifact_hash(extracted),
+        judge=judge,
+    )
+    rating = cache.get(key)
+    if rating is not None:
+        return rating
     try:
         rating = await judge.judge(
-            json.dumps(recipes[0].model_dump(mode="json", by_alias=True), indent=2),
+            extracted,
             json.dumps(fixture.expected, indent=2),
             fixture.source_md,
         )
     except JudgeError:
         return None
-    cache.put(rating, fixture_id=fixture.name)
+    cache.put(rating, key=key)
     return rating
 
 
@@ -209,7 +232,9 @@ async def run_judge_alignment(
                 f"for fixture {fixture.name!r}"
             )
 
-        judge_rating = await _judge_rating_for(judge_runner, cache, fixture, llm_provider)
+        judge_rating = await _judge_rating_for(
+            judge_runner, cache, fixture, fixture_set, llm_provider
+        )
         if judge_rating is None:
             agreement_status = "unrated"
             unrated.append(fixture.name)
