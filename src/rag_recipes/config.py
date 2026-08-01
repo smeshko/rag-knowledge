@@ -133,6 +133,11 @@ class Settings(BaseSettings):
 
     stuck_job_timeout_minutes: int = Field(default=30, ge=1)
     stuck_job_check_interval_minutes: int = Field(default=5, ge=1, le=60)
+    # Phase 21.3 (plan D1b): items stuck in `indexing` past this threshold are
+    # returned to `needs_review` by the item-level pass in sweep_stuck_jobs.
+    # Deliberately shorter than stuck_job_timeout_minutes — a single-item index
+    # job is one chunk+embed round-trip, not a multi-window extraction.
+    stuck_indexing_timeout_minutes: int = Field(default=15, ge=1)
 
     # Soft-validation thresholds (Epic 9 Phase 9.3, doc 4 § Soft validation).
     # Review heuristics, not calibrated truth — a candidate below a confidence
