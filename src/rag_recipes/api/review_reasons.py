@@ -43,11 +43,20 @@ def build_review_reasons(
     JSONB is opaque) a non-string element — is enveloped as ``llm_warning`` with
     the raw value as the message, so free prose never lands in the ``code``
     position and a hand-seeded dict can never 500 the endpoint.
+
+    The ``warnings`` value itself is guarded the same way: only a list is
+    iterated. A degraded row holding a scalar would otherwise raise ``TypeError``
+    (a 500 on the item's own detail/audit endpoint) and a bare string or mapping
+    would iterate per character / per key into nonsense reasons. Anything that is
+    not a list yields ``[]`` — no reasons rather than invented ones.
     """
     if status != "needs_review":
         return []
+    warnings = structured_data.get("warnings")
+    if not isinstance(warnings, list):
+        return []
     reasons: list[ReviewReason] = []
-    for warning in structured_data.get("warnings") or []:
+    for warning in warnings:
         if isinstance(warning, str) and warning in SOFT_WARNING_MESSAGES:
             reasons.append(
                 ReviewReason(code=warning, message=SOFT_WARNING_MESSAGES[warning])

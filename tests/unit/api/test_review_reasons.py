@@ -14,6 +14,8 @@ import ast
 import inspect
 import textwrap
 
+import pytest
+
 from rag_recipes.api.review_reasons import (
     SOFT_WARNING_MESSAGES,
     build_review_reasons,
@@ -69,6 +71,20 @@ def test_ready_status_returns_empty_list_even_with_warnings() -> None:
 def test_missing_or_none_warnings_key_returns_empty_list() -> None:
     assert build_review_reasons("needs_review", {}) == []
     assert build_review_reasons("needs_review", {"warnings": None}) == []
+
+
+@pytest.mark.parametrize(
+    "warnings",
+    [
+        42,  # raised TypeError -> 500 on the item's own detail endpoint
+        "no_steps",  # a bare string iterates per character
+        {"no_steps": 1},  # a mapping iterates per key, inventing real codes
+        True,
+    ],
+)
+def test_malformed_warnings_container_returns_empty_list(warnings: object) -> None:
+    """Only a list is iterated — the container gets the same guard as its elements."""
+    assert build_review_reasons("needs_review", {"warnings": warnings}) == []
 
 
 # --- Drift guard: every validate_soft code has a map entry ---
