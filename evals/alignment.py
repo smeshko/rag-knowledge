@@ -43,6 +43,7 @@ from evals.extraction import (
     artifact_hash,
     build_judge_cache_key,
     extraction_prompt_version,
+    serialize_extracted_artifact,
 )
 from evals.fixtures import load_judge_alignment, load_recipe_fixtures, save_judge_alignment
 from evals.judge_cache import JudgeCache
@@ -133,19 +134,22 @@ async def _judge_rating_for(
     """The judge's rating for a fixture: cache replay, LLM only on a miss.
 
     Interim Epic 20.1 state (rewritten in the alignment task): this still
-    re-drives the fixture's extraction through the synthetic-window path and
-    judges (and caches) ``recipes[0]`` only — the extraction now runs *before*
-    the cache lookup because the judged artifact's hash is a key part
-    (DECISIONS #10). The prompt version comes from the
-    ``extraction_prompt_version()`` accessor, never a second import of the
-    constant (DECISIONS #2). Extraction failure or ``JudgeError`` yields
-    ``None`` — the fixture is *unrated*, never a silent pass/fail.
+    re-drives the fixture's extraction through the synthetic-window path — the
+    extraction runs *before* the cache lookup because the judged artifact's
+    hash is a key part (DECISIONS #10) — and judges the full extracted list
+    through the shared ``serialize_extracted_artifact`` helper. The prompt
+    version comes from the ``extraction_prompt_version()`` accessor, never a
+    second import of the constant (DECISIONS #2). Extraction failure or
+    ``JudgeError`` yields ``None`` — the fixture is *unrated*, never a silent
+    pass/fail.
     """
     window = _build_synthetic_window(fixture.name, fixture.source_md)
     recipes, _error = await _extract_recipes(window, fixture.name, llm_provider)
     if not recipes:
         return None
-    extracted = json.dumps(recipes[0].model_dump(mode="json", by_alias=True), indent=2)
+    extracted = serialize_extracted_artifact(
+        [item.model_dump(mode="json", by_alias=True) for item in recipes]
+    )
     key = build_judge_cache_key(
         fixture_set=fixture_set,
         fixture_id=fixture.name,

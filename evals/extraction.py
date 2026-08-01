@@ -136,6 +136,7 @@ __all__ = [
     "build_judge_cache_key",
     "extraction_prompt_version",
     "run_extraction_eval",
+    "serialize_extracted_artifact",
     "synthetic_span_id",
 ]
 
@@ -155,6 +156,16 @@ def extraction_prompt_version() -> str:
     the monkeypatch cover only half the system.
     """
     return PROMPT_VERSION
+
+
+def serialize_extracted_artifact(recipes: list[dict[str, Any]]) -> str:
+    """Serialize the full extracted item list for judging: ``{"items": [...]}``.
+
+    Literally ``RecipeExtractionOutput``'s wire shape. The one serialization
+    the judge, the human (alignment), and ``artifact_hash`` all see — a second
+    serialization site would make their byte-identity coincidental.
+    """
+    return json.dumps({"items": recipes}, indent=2)
 
 
 def artifact_hash(text: str) -> str:
@@ -320,9 +331,15 @@ class _JudgeSection:
         self.fails = 0
         self.unrated = 0
 
-    async def rate(self, fixture: RecipeFixture, recipe: ExtractedRecipe) -> None:
-        """Rate one scored fixture, replaying the cache; ``JudgeError`` → unrated."""
-        extracted = json.dumps(recipe.model_dump(mode="json", by_alias=True), indent=2)
+    async def rate(self, fixture: RecipeFixture, recipe_payloads: list[dict[str, Any]]) -> None:
+        """Rate one scored fixture's *full* item list; ``JudgeError`` → unrated.
+
+        ``recipe_payloads`` is the hoisted persisted list — never a second
+        ``model_dump`` — serialized once as ``{"items": [...]}`` so
+        ``boundary_correctness`` sees splits (the judged list; the *scored
+        item* stays ``recipes[0]``, DECISIONS #8).
+        """
+        extracted = serialize_extracted_artifact(recipe_payloads)
         key = build_judge_cache_key(
             fixture_set=self._fixture_set,
             fixture_id=fixture.name,
@@ -344,6 +361,9 @@ class _JudgeSection:
                 self.unrated += 1
                 self.per_fixture[fixture.name] = {"status": "unrated", "error": str(exc)}
                 return
+            # Stamped so the cache file is self-describing and alignment can
+            # assert which artifact the rating belongs to (DECISIONS #10).
+            rating.metadata["artifact_hash"] = key.artifact_hash
             self._cache.put(rating, key=key)
         if rating.rating == "pass":
             self.passes += 1
@@ -580,6 +600,11 @@ async def run_extraction_eval(
             # it would have discarded — wrong item_type, blank title, a
             # hallucinated span id — would count it ready and hand it objective
             # scores for a recipe that never reaches the corpus.
+            # The gate deliberately stays on recipes[0] — the *scored item* —
+            # while the judge later sees the full *judged list* (DECISIONS #8):
+            # widening the gate to every item would flip an over-split fixture
+            # to hard_validation_failed and hide the very boundary error
+            # boundary_correctness exists to judge.
             hard_failures = validate_hard(recipe, window)
             if hard_failures:
                 hard_validation_failures += 1
@@ -601,7 +626,7 @@ async def run_extraction_eval(
                 item.model_dump(mode="json", by_alias=True) for item in recipes
             ]
             if judge_section is not None:
-                await judge_section.rate(fixture, recipe)
+                await judge_section.rate(fixture, recipe_payloads)
             warnings = validate_soft(recipe, thresholds=thresholds)
             if warnings:
                 needs_review += 1

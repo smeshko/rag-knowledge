@@ -15,7 +15,12 @@ from typing import Any
 
 import pytest
 from evals.alignment import run_judge_alignment
-from evals.extraction import artifact_hash, extraction_prompt_version, run_extraction_eval
+from evals.extraction import (
+    artifact_hash,
+    extraction_prompt_version,
+    run_extraction_eval,
+    serialize_extracted_artifact,
+)
 from evals.fixtures import load_judge_alignment
 from evals.judge_cache import JudgeCache, JudgeCacheKey
 from evals.judges import JUDGE_SCHEMA_VERSION, JudgeRating
@@ -72,9 +77,10 @@ def _seed(tmp_path: Path, *, judges: tuple[str, ...] = ("summary_quality",)) -> 
     return root
 
 
-# The interim 20.1 alignment path still re-extracts and judges recipes[0]
-# (rewritten by the alignment task); these helpers reproduce the exact string
-# it judges so seeded cache entries land under the real eight-part key.
+# The interim 20.1 alignment path still re-extracts (rewritten by the
+# alignment task) and judges the full extracted list; these helpers reproduce
+# the exact string it judges so seeded cache entries land under the real
+# eight-part key.
 _FIXTURE_DATA: dict[str, tuple[str, dict[str, Any], Any]] = {
     "bean-stew": (STEW_SOURCE, STEW_EXPECTED, stew_output),
     "tomato-soup": (SOUP_SOURCE, SOUP_EXPECTED, soup_output),
@@ -82,8 +88,12 @@ _FIXTURE_DATA: dict[str, tuple[str, dict[str, Any], Any]] = {
 
 
 def _judged_artifact(output: dict[str, Any]) -> str:
-    item = RecipeExtractionOutput.model_validate(output).items[0]
-    return json.dumps(item.model_dump(mode="json", by_alias=True), indent=2)
+    # Must match the shared serialization exactly: the full item list wrapped
+    # as {"items": [...]} (Epic 20.1 — the judge sees every extracted item).
+    items = RecipeExtractionOutput.model_validate(output).items
+    return serialize_extracted_artifact(
+        [item.model_dump(mode="json", by_alias=True) for item in items]
+    )
 
 
 def _cache_key(fixture_name: str, judge: str = "summary_quality") -> JudgeCacheKey:
