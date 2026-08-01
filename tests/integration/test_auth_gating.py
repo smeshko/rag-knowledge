@@ -73,6 +73,16 @@ async def test_documents_route_401s_without_token_when_token_configured(
     assert response.json()["error"]["code"] == "unauthorized"
 
 
+async def test_documents_delete_401s_without_token_when_token_configured(
+    override_settings_with_token: None,
+    client: httpx.AsyncClient,
+) -> None:
+    async with client:
+        response = await client.delete("/api/v1/documents/doc_any")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
 # The valid-token-passes path is covered by:
 #   - tests/unit/api/test_auth_dependency.py (direct dependency call).
 #   - tests/integration/test_health.py (sends a valid bearer header).
