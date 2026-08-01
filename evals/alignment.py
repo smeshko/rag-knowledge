@@ -249,7 +249,15 @@ def load_alignment_run(
             f"{_run_fix_hint(fixture_set)}"
         )
     try:
-        doc = json.loads(results_path.read_text(encoding="utf-8"))
+        raw = results_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # DECISIONS #9 names "unreadable" alongside "missing": a results.json
+        # that exists but cannot be read (permissions, a dangling symlink, an
+        # I/O error) must reach exit 2 like every other bad-run shape, and
+        # OSError is neither FileNotFoundError nor ValueError to the CLI.
+        raise ValueError(f"unreadable results.json in {run_dir}: {exc}") from exc
+    try:
+        doc = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"malformed results.json in {run_dir}: {exc}") from exc
     if not isinstance(doc, dict):
@@ -364,7 +372,13 @@ async def run_judge_alignment(
     # The envelope was just validated; metadata identifies the artifact's
     # producer (the *extraction* provider/model, not the judge's — DECISIONS #6).
     envelope = json.loads((report_path / "results.json").read_text(encoding="utf-8"))
-    run_meta = envelope.get("metadata") or {}
+    # Shape-checked, not just truthiness: a hand-edited `"metadata": "corrupt"`
+    # is truthy and would die on `.get` with an AttributeError — which the CLI
+    # cannot map to exit 2. Provenance is not load-bearing (both reads already
+    # fall back to "unknown"), so an unusable envelope degrades rather than
+    # refuses; the payload we actually rate is validated in load_alignment_run.
+    raw_meta = envelope.get("metadata")
+    run_meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
     extraction_provider = str(run_meta.get("llm_provider", "unknown"))
     extraction_model = str(run_meta.get("llm_model", "unknown"))
     prompt_version = results.get("extraction_prompt_version")

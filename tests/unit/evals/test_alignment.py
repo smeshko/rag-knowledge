@@ -813,6 +813,51 @@ async def test_every_unusable_run_shape_raises_value_error(tmp_path: Path) -> No
         )
         with pytest.raises(ValueError, match="per_fixture is not a list"):
             await align(tmp_path / "shape-run")
+    # An existing but unreadable results.json: OSError is neither
+    # FileNotFoundError nor ValueError, so without translation it escapes the
+    # CLI handler entirely (DECISIONS #9 names "unreadable" explicitly).
+    unreadable = tmp_path / "unreadable-run"
+    unreadable.mkdir()
+    (unreadable / "results.json").write_text("{}", encoding="utf-8")
+    (unreadable / "results.json").chmod(0o000)
+    try:
+        with pytest.raises(ValueError, match="unreadable results.json"):
+            await align(unreadable)
+    finally:
+        (unreadable / "results.json").chmod(0o644)
+
+
+async def test_a_corrupt_metadata_envelope_degrades_to_unknown_provenance(
+    tmp_path: Path,
+) -> None:
+    # `"metadata": "corrupt"` is truthy: a bare `envelope.get(...) or {}` dies
+    # on `.get` with an AttributeError the CLI cannot map to exit 2. Provenance
+    # is not load-bearing, so it degrades to the documented "unknown" fallback.
+    fixtures_root = tmp_path / "fixtures"
+    run_dir = await _seed_run(fixtures_root, tmp_path / "reports", write_smoke_set(fixtures_root))
+    write_judge_prompt(fixtures_root)
+    results_path = run_dir / "results.json"
+    doc = json.loads(results_path.read_text(encoding="utf-8"))
+    doc["metadata"] = "corrupt"
+    results_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+
+    report = await run_judge_alignment(
+        "summary_quality",
+        "smoke",
+        llm_provider=_judge_provider(),
+        prompt_human=_ScriptedPrompt(dict(_ANSWERS)),
+        report_path=run_dir,
+        root=fixtures_root,
+        judge_cache_root=tmp_path / "cache",
+    )
+
+    assert report.rated == 2
+    record = load_judge_alignment(
+        "summary_quality", "smoke__bean-stew__summary_quality__unknown", root=fixtures_root
+    )
+    assert record is not None
+    assert record.run_metadata["extraction_model"] == "unknown"
+    assert record.run_metadata["extraction_provider"] == "unknown"
 
 
 def test_load_alignment_run_returns_the_results_payload(tmp_path: Path) -> None:
