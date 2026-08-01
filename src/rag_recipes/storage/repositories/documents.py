@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import CursorResult, Integer, cast, func, select, update
+from sqlalchemy import CursorResult, Delete, Integer, cast, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.storage.enums import (
@@ -21,7 +21,9 @@ from rag_recipes.storage.enums import (
     UploadStatus,
 )
 from rag_recipes.storage.models.chunk import Chunk
+from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
@@ -33,6 +35,19 @@ class KnowledgeItemCounts:
     total: int
     ready: int
     needs_review: int
+
+
+@dataclass(frozen=True)
+class DocumentDeletion:
+    """Result of ``delete_document_cascade``: what the route needs afterwards.
+
+    ``storage_key`` drives the post-commit best-effort file delete (D6);
+    ``counts`` (per-table deleted-row counts, keyed by table name) is what the
+    route logs at INFO — the only audit trail a body-less 204 leaves (D5).
+    """
+
+    storage_key: str
+    counts: dict[str, int]
 
 
 class DocumentRepository:
@@ -281,6 +296,76 @@ class DocumentRepository:
             )
         )
         return result.scalar_one()
+
+    async def delete_document_cascade(
+        self, document_id: str
+    ) -> DocumentDeletion | None:
+        """Delete a document and every row belonging to it, in FK-safe order.
+
+        Explicit ordered bulk DELETEs, not ORM/relationship cascades and not an
+        ``ON DELETE CASCADE`` migration (D5) — the composite FKs
+        (``fk_chunks_parent_document``,
+        ``fk_knowledge_items_extraction_run_document_version``) dictate the
+        order: embeddings → chunks → knowledge items (all statuses, including
+        ``superseded`` — supersede is a status flip with no pointers to repair,
+        D1/D2) → runs → batch items (all statuses; a late provider result for a
+        vanished item no-ops in ``ingest_batch_result``, and shared
+        ``extraction_batches`` audit rows survive, D4) → spans → document
+        (``ingestion_failures`` go with it via the existing DB-level CASCADE)
+        → asset (deletable only now — ``documents.asset_id`` pointed at it).
+
+        Flush-level only — the caller owns the transaction, consistent with the
+        module's other writes. Returns ``None`` when the document does not
+        exist (the route maps that to 404); no HTTP concerns here.
+        """
+        document = await self._session.get(Document, document_id)
+        if document is None:
+            return None
+        asset = await self.get_source_asset_for_document(document)
+        # documents.asset_id is NOT NULL with an FK — the asset always exists.
+        assert asset is not None
+        storage_key = asset.storage_key
+
+        chunk_ids = select(Chunk.id).where(Chunk.document_id == document_id)
+        ordered_deletes: list[tuple[str, Delete]] = [
+            (
+                "chunk_embeddings",
+                delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(chunk_ids)),
+            ),
+            ("chunks", delete(Chunk).where(Chunk.document_id == document_id)),
+            (
+                "knowledge_items",
+                delete(KnowledgeItem).where(KnowledgeItem.document_id == document_id),
+            ),
+            (
+                "extraction_runs",
+                delete(ExtractionRun).where(ExtractionRun.document_id == document_id),
+            ),
+            (
+                "extraction_batch_items",
+                delete(ExtractionBatchItem).where(
+                    ExtractionBatchItem.document_id == document_id
+                ),
+            ),
+            (
+                "source_spans",
+                delete(SourceSpan).where(SourceSpan.document_id == document_id),
+            ),
+            ("documents", delete(Document).where(Document.id == document_id)),
+            (
+                "source_assets",
+                delete(SourceAsset).where(SourceAsset.id == asset.id),
+            ),
+        ]
+        counts: dict[str, int] = {}
+        for table_name, stmt in ordered_deletes:
+            result = await self._session.execute(
+                stmt.execution_options(synchronize_session=False)
+            )
+            assert isinstance(result, CursorResult)
+            counts[table_name] = result.rowcount
+        await self._session.flush()
+        return DocumentDeletion(storage_key=storage_key, counts=counts)
 
     async def count_knowledge_items(self, document_id: str) -> KnowledgeItemCounts:
         # Single GROUP BY query — one round-trip for total / ready / needs_review.
