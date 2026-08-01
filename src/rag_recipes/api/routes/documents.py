@@ -83,6 +83,31 @@ _TERMINAL_DOCUMENT_STATUSES: frozenset[DocumentStatus] = frozenset(
     {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW, DocumentStatus.FAILED}
 )
 
+# Phase 21.3 (plan D3): the two persisted statuses whose displayed value is
+# derived from pending-review item counts at read time.
+_DERIVED_STATUS_DOMAIN: frozenset[DocumentStatus] = frozenset(
+    {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW}
+)
+
+
+def _derived_status(persisted: DocumentStatus, pending: int) -> str:
+    """Displayed document status under read-time review derivation (D3).
+
+    When the persisted status is READY/NEEDS_REVIEW: ``needs_review`` while
+    the document has ≥1 pending item, else ``ready`` — decisions stay
+    item-local and the pipeline's transition matrix is never touched. Every
+    other persisted status passes through unchanged. Consequence (recorded in
+    D3): ``pending == 0`` displays ``ready`` even for a document with zero
+    surviving items — the counts beside the pill tell the true story.
+    """
+    if persisted in _DERIVED_STATUS_DOMAIN:
+        return (
+            DocumentStatus.NEEDS_REVIEW.value
+            if pending > 0
+            else DocumentStatus.READY.value
+        )
+    return persisted.value
+
 
 async def _best_effort_rollback(session: AsyncSession) -> None:
     try:
@@ -493,8 +518,20 @@ async def list_documents(
         limit=limit_int,
         offset=offset_int,
     )
+    # Read-time review derivation (D3): one grouped count over the page's ids;
+    # only `status` is overridden, every other field byte-identical.
+    pending_counts = await repo.pending_review_counts([doc.id for doc in documents])
     return DocumentListResponse(
-        documents=[DocumentListItem.model_validate(doc) for doc in documents],
+        documents=[
+            DocumentListItem.model_validate(doc).model_copy(
+                update={
+                    "status": _derived_status(
+                        doc.status, pending_counts.get(doc.id, 0)
+                    )
+                }
+            )
+            for doc in documents
+        ],
     )
 
 
@@ -526,7 +563,13 @@ async def get_document(
         chunks=await repo.count_chunks(document_id),
     )
     return DocumentDetailResponse(
-        document=DocumentResponse.model_validate(document),
+        # Derivation (D3) reuses the already-fetched needs_review count, so the
+        # detail status and the detail counts can never disagree.
+        document=DocumentResponse.model_validate(document).model_copy(
+            update={
+                "status": _derived_status(document.status, item_counts.needs_review)
+            }
+        ),
         counts=counts,
     )
 
@@ -587,6 +630,10 @@ async def get_document_status(
     session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> Any:
     """Report ingestion progress for a document.
+
+    Deliberately exempt from Phase 21.3's read-time review derivation (plan
+    D3): this endpoint reports pipeline/ingestion truth (progress, terminal,
+    failure); the review pill reads list/detail.
 
     For a non-terminal doc the in-flight version is the highest existing span
     version (Epic 11.2, DECISIONS #5) — ``max + 1`` work for a new_source_version

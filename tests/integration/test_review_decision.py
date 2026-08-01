@@ -340,3 +340,53 @@ async def test_enqueue_failure_reverts_to_needs_review_and_500s(
     assert resp.json()["error"]["code"] == "internal_error"
     # The compensating revert is observable: the row is back in the queue.
     assert await _reload_status(db_session, item.id) is KnowledgeItemStatus.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_counts_and_derived_status_track_decisions(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Phase 21.3 (D3/D5) consistency flow: counts and the derived pill move
+    together on every decision, and the last decision flips the pill to ready
+    via the POST (list + detail agree)."""
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    first = await _seed_item(db_session, run=run)
+    second = await _seed_item(db_session, run=run)
+
+    async with client:
+        before = await client.get(f"/api/v1/documents/{doc.id}")
+        counts = before.json()["counts"]
+        assert before.json()["document"]["status"] == "needs_review"
+        assert counts["needs_review_items"] == 2
+        assert counts["knowledge_items"] == 2
+
+        reject = await client.post(
+            f"/api/v1/knowledge-items/{first.id}/review",
+            json={"decision": "rejected"},
+        )
+        assert reject.status_code == 200
+        mid = await client.get(f"/api/v1/documents/{doc.id}")
+        counts = mid.json()["counts"]
+        assert mid.json()["document"]["status"] == "needs_review"
+        assert counts["needs_review_items"] == 1
+        # Rejection also drops the row out of the total (D5).
+        assert counts["knowledge_items"] == 1
+
+        approve = await client.post(
+            f"/api/v1/knowledge-items/{second.id}/review",
+            json={"decision": "approved"},
+        )
+        assert approve.status_code == 200
+        after = await client.get(f"/api/v1/documents/{doc.id}")
+        counts = after.json()["counts"]
+        # The last pending item is decided: the pill turns green even while the
+        # approved item is still `indexing` (D3 recorded consequence).
+        assert after.json()["document"]["status"] == "ready"
+        assert counts["needs_review_items"] == 0
+        assert counts["knowledge_items"] == 1
+        assert counts["ready_items"] == 0
+
+        listing = await client.get("/api/v1/documents")
+        by_id = {d["id"]: d["status"] for d in listing.json()["documents"]}
+        assert by_id[doc.id] == "ready"

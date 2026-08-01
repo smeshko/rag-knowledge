@@ -16,9 +16,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.app import app
 from rag_recipes.api.dependencies import get_session
-from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionRunStatus,
+    KnowledgeItemStatus,
+    SourceType,
+    UploadStatus,
+)
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_asset import SourceAsset
 
 
@@ -347,3 +355,154 @@ async def test_negative_offset_returns_400_envelope(client: httpx.AsyncClient) -
         response = await client.get("/api/v1/documents", params={"offset": "-1"})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
+
+
+# ---------------------------------------------------------------------------
+# Phase 21.3 (D3): read-time review-status derivation + filter agreement
+# ---------------------------------------------------------------------------
+
+
+async def _seed_item_with_status(
+    session: AsyncSession, *, document: Document, status: KnowledgeItemStatus
+) -> KnowledgeItem:
+    run = ExtractionRun(
+        document_id=document.id,
+        source_version=1,
+        provider="fake",
+        model="fake-model",
+        prompt_version="test-prompt-v1",
+        schema_version="test-schema-v1",
+        input_source_span_ids=[],
+        input_hash=new_id("hash"),
+        status=ExtractionRunStatus.SUCCESS,
+        output_json=None,
+    )
+    session.add(run)
+    await session.flush()
+    item = KnowledgeItem(
+        document_id=document.id,
+        extraction_run_id=run.id,
+        source_version=1,
+        item_type="recipe",
+        title=f"Item {new_id('t')}",
+        normalized_title="item",
+        summary=None,
+        body_text="body",
+        source_span_ids=[],
+        structured_data={"schema": "recipe.v1", "warnings": ["no_steps"]},
+        confidence=None,
+        status=status,
+    )
+    session.add(item)
+    await session.flush()
+    return item
+
+
+@pytest.mark.asyncio
+async def test_ready_doc_with_pending_item_lists_as_needs_review(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(
+        db_session, content_hash="hash-derive-1", status=DocumentStatus.READY
+    )
+    item = await _seed_item_with_status(
+        db_session, document=doc, status=KnowledgeItemStatus.NEEDS_REVIEW
+    )
+    async with client:
+        before = await client.get("/api/v1/documents")
+        assert before.json()["documents"][0]["status"] == "needs_review"
+
+        # Decide the last pending item: the pill decays to ready — with no
+        # pipeline-status write ever issued (the column stays READY throughout).
+        item.status = KnowledgeItemStatus.REJECTED
+        await db_session.flush()
+        after = await client.get("/api/v1/documents")
+        assert after.json()["documents"][0]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_persisted_needs_review_doc_with_all_decided_lists_as_ready(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(
+        db_session, content_hash="hash-derive-2", status=DocumentStatus.NEEDS_REVIEW
+    )
+    await _seed_item_with_status(
+        db_session, document=doc, status=KnowledgeItemStatus.REJECTED
+    )
+    async with client:
+        response = await client.get("/api/v1/documents")
+    assert response.json()["documents"][0]["status"] == "ready"
+    # No pipeline write: the persisted column is untouched (derivation only).
+    await db_session.refresh(doc)
+    assert doc.status is DocumentStatus.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_status_filter_agrees_with_displayed_status(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    ready_with_pending = await _seed_document(
+        db_session, content_hash="hash-fa-1", status=DocumentStatus.READY
+    )
+    await _seed_item_with_status(
+        db_session,
+        document=ready_with_pending,
+        status=KnowledgeItemStatus.NEEDS_REVIEW,
+    )
+    plain_ready = await _seed_document(
+        db_session, content_hash="hash-fa-2", status=DocumentStatus.READY
+    )
+    nr_all_decided = await _seed_document(
+        db_session, content_hash="hash-fa-3", status=DocumentStatus.NEEDS_REVIEW
+    )
+    await _seed_item_with_status(
+        db_session, document=nr_all_decided, status=KnowledgeItemStatus.REJECTED
+    )
+    nr_pending = await _seed_document(
+        db_session, content_hash="hash-fa-4", status=DocumentStatus.NEEDS_REVIEW
+    )
+    await _seed_item_with_status(
+        db_session, document=nr_pending, status=KnowledgeItemStatus.NEEDS_REVIEW
+    )
+
+    async with client:
+        ready_resp = await client.get("/api/v1/documents", params={"status": "ready"})
+        nr_resp = await client.get(
+            "/api/v1/documents", params={"status": "needs_review"}
+        )
+    ready_docs = ready_resp.json()["documents"]
+    nr_docs = nr_resp.json()["documents"]
+    assert {d["id"] for d in ready_docs} == {plain_ready.id, nr_all_decided.id}
+    assert {d["id"] for d in nr_docs} == {ready_with_pending.id, nr_pending.id}
+    # The filter agrees exactly with the displayed status.
+    assert all(d["status"] == "ready" for d in ready_docs)
+    assert all(d["status"] == "needs_review" for d in nr_docs)
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_and_failed_statuses_pass_through_underived(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    queued = await _seed_document(
+        db_session, content_hash="hash-pt-1", status=DocumentStatus.QUEUED
+    )
+    await _seed_item_with_status(
+        db_session, document=queued, status=KnowledgeItemStatus.NEEDS_REVIEW
+    )
+    failed = await _seed_document(
+        db_session, content_hash="hash-pt-2", status=DocumentStatus.FAILED
+    )
+    await _seed_item_with_status(
+        db_session, document=failed, status=KnowledgeItemStatus.NEEDS_REVIEW
+    )
+    async with client:
+        listing = await client.get("/api/v1/documents")
+        queued_resp = await client.get("/api/v1/documents", params={"status": "queued"})
+        failed_resp = await client.get("/api/v1/documents", params={"status": "failed"})
+    by_id = {d["id"]: d["status"] for d in listing.json()["documents"]}
+    assert by_id[queued.id] == "queued"
+    assert by_id[failed.id] == "failed"
+    # Other status filters keep the plain column semantics.
+    assert {d["id"] for d in queued_resp.json()["documents"]} == {queued.id}
+    assert {d["id"] for d in failed_resp.json()["documents"]} == {failed.id}

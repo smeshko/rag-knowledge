@@ -209,10 +209,36 @@ class DocumentRepository:
         limit: int,
         offset: int,
     ) -> Sequence[Document]:
+        """List documents, newest first, with optional filters.
+
+        Phase 21.3 (plan D3): the ``status`` filter uses *derived* semantics
+        for the two review-facing values so the filter agrees with the status
+        the list response displays — ``needs_review`` matches any doc whose
+        persisted status is READY/NEEDS_REVIEW with ≥1 pending item, ``ready``
+        the same domain with none. Every other status keeps the plain column
+        filter.
+        """
         stmt = select(Document)
         if category is not None:
             stmt = stmt.where(Document.category == category)
-        if status is not None:
+        if status in (DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW):
+            pending_exists = (
+                select(KnowledgeItem.id)
+                .where(
+                    KnowledgeItem.document_id == Document.id,
+                    KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+                )
+                .exists()
+            )
+            stmt = stmt.where(
+                Document.status.in_(
+                    {DocumentStatus.READY, DocumentStatus.NEEDS_REVIEW}
+                ),
+                pending_exists
+                if status is DocumentStatus.NEEDS_REVIEW
+                else ~pending_exists,
+            )
+        elif status is not None:
             stmt = stmt.where(Document.status == status)
         if source_type is not None:
             stmt = stmt.where(Document.source_type == source_type)
@@ -221,6 +247,27 @@ class DocumentRepository:
         stmt = stmt.limit(limit).offset(offset)
         result = await self._session.execute(stmt)
         return result.scalars().all()
+
+    async def pending_review_counts(
+        self, document_ids: Sequence[str]
+    ) -> dict[str, int]:
+        """Count ``needs_review`` items per document for one list page (D3).
+
+        One grouped SELECT over the page's ids (≤200), riding
+        ``ix_knowledge_items_document_id`` + ``ix_knowledge_items_status``.
+        Documents with no pending items are simply absent from the map.
+        """
+        if not document_ids:
+            return {}
+        result = await self._session.execute(
+            select(KnowledgeItem.document_id, func.count())
+            .where(
+                KnowledgeItem.document_id.in_(document_ids),
+                KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+            )
+            .group_by(KnowledgeItem.document_id)
+        )
+        return {document_id: count for document_id, count in result.all()}
 
     async def count_source_spans(self, document_id: str) -> int:
         result = await self._session.execute(

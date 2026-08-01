@@ -299,3 +299,121 @@ async def test_get_unknown_id_returns_404_envelope(
     body = response.json()
     assert body["error"]["code"] == "document_not_found"
     assert "message" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 21.3 (D3/D5): detail review-status derivation + count semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ready_doc_with_pending_item_details_as_needs_review(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    document = await _seed_document(db_session, content_hash="derive-detail-1")
+    document.status = DocumentStatus.READY
+    await db_session.flush()
+    await db_session.refresh(document)
+    run = await _seed_extraction_run(db_session, document=document, source_version=1)
+    await _seed_knowledge_item(
+        db_session, document=document, run=run, status=KnowledgeItemStatus.NEEDS_REVIEW
+    )
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}")
+    body = response.json()
+    assert body["document"]["status"] == "needs_review"
+    assert body["counts"]["needs_review_items"] == 1
+
+
+@pytest.mark.asyncio
+async def test_needs_review_doc_with_all_decided_details_as_ready(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    document = await _seed_document(db_session, content_hash="derive-detail-2")
+    document.status = DocumentStatus.NEEDS_REVIEW
+    await db_session.flush()
+    await db_session.refresh(document)
+    run = await _seed_extraction_run(db_session, document=document, source_version=1)
+    await _seed_knowledge_item(
+        db_session, document=document, run=run, status=KnowledgeItemStatus.READY
+    )
+    await _seed_knowledge_item(
+        db_session, document=document, run=run, status=KnowledgeItemStatus.REJECTED
+    )
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}")
+    body = response.json()
+    assert body["document"]["status"] == "ready"
+    # No pipeline write ever issued — the persisted column is untouched.
+    await db_session.refresh(document)
+    assert document.status is DocumentStatus.NEEDS_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_all_rejected_document_displays_ready_with_zero_counts(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """D3 recorded consequence: 'no pending' is not 'has content' — an
+    all-rejected document shows the green pill with every item count 0.
+    D5 pin: counts.chunks deliberately retains lingering chunks (audit
+    figure, same rule as superseded items' retained chunks)."""
+    document = await _seed_document(db_session, content_hash="derive-detail-3")
+    document.status = DocumentStatus.NEEDS_REVIEW
+    await db_session.flush()
+    await db_session.refresh(document)
+    run = await _seed_extraction_run(db_session, document=document, source_version=1)
+    rejected = await _seed_knowledge_item(
+        db_session, document=document, run=run, status=KnowledgeItemStatus.REJECTED
+    )
+    await _seed_chunk(db_session, document=document, item=rejected, label="lingering")
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}")
+    body = response.json()
+    assert body["document"]["status"] == "ready"
+    assert body["counts"]["knowledge_items"] == 0
+    assert body["counts"]["ready_items"] == 0
+    assert body["counts"]["needs_review_items"] == 0
+    # Deliberately NOT excluded (D5): chunks is a storage/audit figure.
+    assert body["counts"]["chunks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_last_item_still_indexing_displays_ready_with_zero_ready_items(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    document = await _seed_document(db_session, content_hash="derive-detail-4")
+    document.status = DocumentStatus.NEEDS_REVIEW
+    await db_session.flush()
+    await db_session.refresh(document)
+    run = await _seed_extraction_run(db_session, document=document, source_version=1)
+    await _seed_knowledge_item(
+        db_session, document=document, run=run, status=KnowledgeItemStatus.INDEXING
+    )
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}")
+    body = response.json()
+    assert body["document"]["status"] == "ready"
+    assert body["counts"]["ready_items"] == 0
+    assert body["counts"]["knowledge_items"] == 1
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_stays_pipeline_truth(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """D3: GET /documents/{id}/status is exempt from derivation — it reports
+    ingestion truth; the review pill reads list/detail."""
+    document = await _seed_document(db_session, content_hash="derive-detail-5")
+    document.status = DocumentStatus.READY
+    document.active_source_version = 1
+    await db_session.flush()
+    await db_session.refresh(document)
+    run = await _seed_extraction_run(db_session, document=document, source_version=1)
+    await _seed_knowledge_item(
+        db_session, document=document, run=run, status=KnowledgeItemStatus.NEEDS_REVIEW
+    )
+    async with client:
+        detail = await client.get(f"/api/v1/documents/{document.id}")
+        status = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert detail.json()["document"]["status"] == "needs_review"
+    assert status.json()["status"] == "ready"
