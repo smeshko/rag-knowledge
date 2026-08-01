@@ -252,9 +252,10 @@ def load_alignment_run(
         raw = results_path.read_text(encoding="utf-8")
     except OSError as exc:
         # DECISIONS #9 names "unreadable" alongside "missing": a results.json
-        # that exists but cannot be read (permissions, a dangling symlink, an
-        # I/O error) must reach exit 2 like every other bad-run shape, and
-        # OSError is neither FileNotFoundError nor ValueError to the CLI.
+        # that `is_file()` accepts but cannot be read (permissions, an I/O
+        # error, or a race against the check above) must reach exit 2 like
+        # every other bad-run shape, and OSError is neither FileNotFoundError
+        # nor ValueError to the CLI.
         raise ValueError(f"unreadable results.json in {run_dir}: {exc}") from exc
     try:
         doc = json.loads(raw)
