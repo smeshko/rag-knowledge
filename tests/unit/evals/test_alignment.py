@@ -561,6 +561,84 @@ async def test_unrated_path_preserves_a_stored_human_rating(tmp_path: Path) -> N
     assert report.unrated == ["tomato-soup"]
 
 
+@pytest.mark.parametrize(
+    ("mutate", "label"),
+    [
+        (lambda e: e.update({"status": "extraction_failed"}), "stale recipes on a failed entry"),
+        (lambda e: e.update({"recipes": "corrupt"}), "recipes is not a list"),
+        (lambda e: e.update({"recipes": ["not-an-object"]}), "recipes holds a non-object"),
+        (lambda e: e.update({"recipes": []}), "recipes is empty"),
+    ],
+)
+async def test_only_a_well_formed_scored_entry_is_ever_rated(
+    tmp_path: Path, mutate: Any, label: str
+) -> None:
+    # Eligibility is checked by shape, not truthiness: a corrupt or non-scored
+    # entry must never be shown to the human, judged, or written up as if it
+    # meant something — it degrades to unrated like any missing artifact.
+    fixtures_root = tmp_path / "fixtures"
+    run_dir = await _seed_run(fixtures_root, tmp_path / "reports", write_smoke_set(fixtures_root))
+    write_judge_prompt(fixtures_root)
+    results_path = run_dir / "results.json"
+    doc = json.loads(results_path.read_text(encoding="utf-8"))
+    entry = next(e for e in doc["results"]["per_fixture"] if e["name"] == "bean-stew")
+    # Keep the recorded content hash valid so the pre-flight drift check passes
+    # and the fixture reaches the loop, which is what this test is about.
+    mutate(entry)
+    results_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    prompt = _ScriptedPrompt(dict(_ANSWERS))
+    provider = _judge_provider()
+
+    report = await run_judge_alignment(
+        "summary_quality",
+        "smoke",
+        llm_provider=provider,
+        prompt_human=prompt,
+        report_path=run_dir,
+        root=fixtures_root,
+        judge_cache_root=tmp_path / "cache",
+    )
+
+    assert prompt.asked == ["tomato-soup"], label
+    assert len(_judge_calls(provider)) == 1, label
+    assert report.unrated == ["bean-stew"], label
+    record = load_judge_alignment("summary_quality", STEW_ID, root=fixtures_root)
+    assert record is not None
+    assert record.agreement_status == "unrated"
+    assert record.human_rating is None
+
+
+async def test_pre_change_run_reason_names_the_run_not_the_fixture(tmp_path: Path) -> None:
+    # A genuine pre-20.1 run has no run-level extraction_prompt_version, which
+    # is what distinguishes "this run is too old" from "this fixture has
+    # nothing persisted" — the message must not be keyed on `recipes`, which a
+    # pre-20.1 run also lacks.
+    fixtures_root = tmp_path / "fixtures"
+    run_dir = await _seed_run(fixtures_root, tmp_path / "reports", write_smoke_set(fixtures_root))
+    write_judge_prompt(fixtures_root)
+    results_path = run_dir / "results.json"
+    doc = json.loads(results_path.read_text(encoding="utf-8"))
+    del doc["results"]["extraction_prompt_version"]
+    for entry in doc["results"]["per_fixture"]:
+        entry.pop("recipes", None)
+        entry.pop("fixture_content_hash", None)
+    results_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+
+    await run_judge_alignment(
+        "summary_quality",
+        "smoke",
+        llm_provider=FakeLLMProvider(),
+        prompt_human=_ScriptedPrompt(dict(_ANSWERS)),
+        report_path=run_dir,
+        root=fixtures_root,
+        judge_cache_root=tmp_path / "cache",
+    )
+
+    record = load_judge_alignment("summary_quality", STEW_ID, root=fixtures_root)
+    assert record is not None
+    assert record.run_metadata["unrated_reason"] == "run predates persisted artifacts"
+
+
 async def test_judge_error_counts_fixture_as_unrated_but_keeps_human_rating(
     tmp_path: Path,
 ) -> None:

@@ -412,7 +412,22 @@ async def run_judge_alignment(
         recipes_payload = entry.get("recipes")
         content_hash = entry.get("fixture_content_hash")
 
-        if not recipes_payload or content_hash is None or prompt_version is None:
+        if (
+            # Only a `scored` entry's artifact may be rated: DECISIONS #3
+            # persists `recipes` there and nowhere else, and DECISIONS #8 says
+            # a hard-validation failure never reaches the corpus, so rating one
+            # would assert a verdict about output production would discard.
+            entry.get("status") != "scored"
+            # Shape, not truthiness — a corrupt `"recipes": "x"` is truthy and
+            # would be shown to the human and judged as `{"items": "x"}`, then
+            # persisted into the committed judge_alignment/ dir as if it meant
+            # something.
+            or not isinstance(recipes_payload, list)
+            or not recipes_payload
+            or not all(isinstance(item, dict) for item in recipes_payload)
+            or not isinstance(content_hash, str)
+            or not isinstance(prompt_version, str)
+        ):
             # No usable persisted artifact (extraction failed, hard validation
             # failed, missing from the run, or a pre-20.1 run without the
             # provenance keys): unrated, and the human is never prompted —
@@ -423,9 +438,14 @@ async def run_judge_alignment(
                 # Never destroy a collected human rating, and never assert one
                 # about a vanished artifact: leave the record untouched.
                 continue
+            # The run-level key is what tells the two cases apart: a genuine
+            # pre-20.1 run has no `extraction_prompt_version` at all, whereas a
+            # 20.1 run simply has nothing persisted for this fixture. Keying
+            # the message on `recipes_payload` got a real pre-20.1 run — which
+            # has no `recipes` either — the wrong half of this sentence.
             reason = (
                 "run predates persisted artifacts"
-                if recipes_payload
+                if prompt_version is None
                 else f"no persisted artifact for {fixture.name!r} in this run"
             )
             record = JudgeAlignmentRecord(
