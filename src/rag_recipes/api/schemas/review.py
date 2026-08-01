@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from rag_recipes.api.schemas.knowledge_items import ReviewReason
@@ -51,3 +53,26 @@ class ReviewItem(BaseModel):
 
 class ReviewItemListResponse(BaseModel):
     review_items: list[ReviewItem]
+
+
+class ReviewDecision(StrEnum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ReviewRequest(BaseModel):
+    # Closed enum: a bad value 422s through the app's enveloped
+    # RequestValidationError handler (contract §2; the doc's "FastAPI default
+    # HTTPValidationError" line is a known doc defect — see plan D6).
+    decision: ReviewDecision
+
+
+class ReviewedKnowledgeItem(BaseModel):
+    id: str
+    document_id: str
+    status: str
+
+
+class ReviewResponse(BaseModel):
+    knowledge_item: ReviewedKnowledgeItem
+    decision: str

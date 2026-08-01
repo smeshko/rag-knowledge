@@ -21,6 +21,10 @@ class ErrorCode(StrEnum):
     KNOWLEDGE_ITEM_NOT_FOUND = "knowledge_item_not_found"
     UNAUTHORIZED = "unauthorized"
     INGESTION_ALREADY_RUNNING = "ingestion_already_running"
+    # Phase 21.3 review decisions (D6): 404 — item exists but is not awaiting
+    # review; 409 — approve refused on a stale extraction generation (D9).
+    REVIEW_NOT_PENDING = "review_not_pending"
+    REVIEW_ITEM_STALE = "review_item_stale"
     INTERNAL_ERROR = "internal_error"
 
 
