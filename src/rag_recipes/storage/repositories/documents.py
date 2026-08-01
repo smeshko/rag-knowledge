@@ -108,10 +108,23 @@ class DocumentRepository:
         ``transition_to``); this flush-level write does not commit.
         ``synchronize_session=False`` keeps it a single round-trip — the caller
         does not rely on the in-session ORM objects reflecting the new status.
+
+        Phase 21.3 terminal guards (plan D5): ``REJECTED`` rows are never
+        touched — rejection is a terminal audit record and a reprocess handoff
+        must not flip it to superseded (no resurrection, D7). ``INDEXING`` rows
+        are also spared: an in-flight approval flipped to ``SUPERSEDED`` by a
+        concurrent handoff would make its own job's ``status is INDEXING``
+        guard silently no-op — the approval would vanish with no error.
         """
         conditions = [
             KnowledgeItem.document_id == document_id,
-            KnowledgeItem.status != KnowledgeItemStatus.SUPERSEDED,
+            KnowledgeItem.status.notin_(
+                {
+                    KnowledgeItemStatus.SUPERSEDED,
+                    KnowledgeItemStatus.REJECTED,
+                    KnowledgeItemStatus.INDEXING,
+                }
+            ),
             KnowledgeItem.extraction_run_id.notin_(keep_extraction_run_ids),
         ]
         if source_version is not None:
@@ -369,9 +382,16 @@ class DocumentRepository:
 
     async def count_knowledge_items(self, document_id: str) -> KnowledgeItemCounts:
         # Single GROUP BY query — one round-trip for total / ready / needs_review.
+        # Phase 21.3 (plan D5): REJECTED is excluded from the aggregate so
+        # `total` — and therefore DocumentCounts.knowledge_items — drops on
+        # rejection ("excluded from all counts"). superseded/extracting stay in
+        # `total` (pre-existing semantics, untouched).
         result = await self._session.execute(
             select(KnowledgeItem.status, func.count())
-            .where(KnowledgeItem.document_id == document_id)
+            .where(
+                KnowledgeItem.document_id == document_id,
+                KnowledgeItem.status != KnowledgeItemStatus.REJECTED,
+            )
             .group_by(KnowledgeItem.status)
         )
         by_status: dict[KnowledgeItemStatus, int] = {

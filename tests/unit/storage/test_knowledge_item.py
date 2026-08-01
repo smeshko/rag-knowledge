@@ -83,7 +83,15 @@ def test_status_enum_uses_knowledge_item_status_enum_type() -> None:
     col_type = KnowledgeItem.__table__.columns["status"].type
     assert isinstance(col_type, sa.Enum)
     assert col_type.name == "knowledge_item_status_enum"
-    assert col_type.enums == ["ready", "needs_review", "superseded", "extracting"]
+    # Ordered as declared in KnowledgeItemStatus (21.3 appended indexing/rejected).
+    assert col_type.enums == [
+        "ready",
+        "needs_review",
+        "superseded",
+        "extracting",
+        "indexing",
+        "rejected",
+    ]
 
 
 def test_candidate_score_is_float_nullable_and_defaults_to_none() -> None:

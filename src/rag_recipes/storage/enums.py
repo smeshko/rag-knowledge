@@ -70,6 +70,13 @@ class KnowledgeItemStatus(StrEnum):
     # in-flight items invisible to readers querying ready/needs_review until
     # finalize promotes the winners in one atomic transaction.
     EXTRACTING = "extracting"
+    # Phase 21.3 (review decisions): transitional approve state — the review
+    # POST flips needs_review → indexing and the index_knowledge_item job
+    # completes indexing → ready (or the item is reverted to needs_review).
+    INDEXING = "indexing"
+    # Phase 21.3 (review decisions): terminal reject state. Never superseded,
+    # never resurrected, excluded from counts (D5/D7).
+    REJECTED = "rejected"
 
 
 class ChunkType(StrEnum):

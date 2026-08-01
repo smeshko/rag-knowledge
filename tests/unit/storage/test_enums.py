@@ -75,8 +75,13 @@ def test_knowledge_item_status_members() -> None:
         "needs_review",
         "superseded",
         "extracting",
+        "indexing",
+        "rejected",
     }
     assert KnowledgeItemStatus.EXTRACTING.value == "extracting"
+    # Phase 21.3 review decisions: transitional approve + terminal reject.
+    assert KnowledgeItemStatus.INDEXING.value == "indexing"
+    assert KnowledgeItemStatus.REJECTED.value == "rejected"
 
 
 def test_chunk_type_members() -> None:
