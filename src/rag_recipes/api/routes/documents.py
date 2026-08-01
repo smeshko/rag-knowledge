@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from arq.connections import ArqRedis
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -583,6 +583,56 @@ async def get_document(
         document=DocumentResponse.model_validate(document),
         counts=counts,
     )
+
+
+@router.delete("/documents/{document_id}", status_code=204)
+async def delete_document(
+    document_id: str,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+    storage: FileStorageProvider = Depends(get_file_storage),  # noqa: B008
+) -> Response:
+    """Delete a document and everything derived from it (Phase 21.2).
+
+    ``SELECT ... FOR UPDATE`` on the document row serializes this handler
+    against ``transition_to`` (same lock) and the reprocess route's guarded
+    UPDATE, so a document cannot slip from terminal to ``queued`` between the
+    terminal check and the cascade (D3). Non-terminal documents 409 with the
+    same ``ingestion_already_running`` envelope the reprocess guard uses.
+
+    The stored PDF is removed only *after* the commit, best-effort (D6): the
+    DB is the source of truth, and a file deleted before a rolled-back commit
+    would strand a live document pointing at a missing PDF — strictly worse
+    than an orphaned file. On storage failure the key is logged (ERROR) and
+    the 204 stands. 204 carries no body (D7), so the per-table deleted-row
+    counts are logged at INFO as the operation's only audit trail (D5).
+    """
+    document = await session.get(Document, document_id, with_for_update=True)
+    if document is None:
+        raise ApiError(
+            status_code=404,
+            code=ErrorCode.DOCUMENT_NOT_FOUND,
+            message=f"Document {document_id!r} not found.",
+            details={"document_id": document_id},
+        )
+    if not is_terminal(document.status):
+        raise ApiError(
+            status_code=409,
+            code=ErrorCode.INGESTION_ALREADY_RUNNING,
+            message="Document is not in a terminal state.",
+            details={"document_id": document_id, "status": document.status.value},
+        )
+
+    deletion = await DocumentRepository(session).delete_document_cascade(document_id)
+    # The row is locked and was just found — the cascade cannot miss it.
+    assert deletion is not None
+    await session.commit()
+    logger.info(
+        "Deleted document %s; per-table deleted rows: %s",
+        document_id,
+        deletion.counts,
+    )
+    await _best_effort_delete(storage, deletion.storage_key)
+    return Response(status_code=204)
 
 
 @router.get("/documents/{document_id}/status", response_model=IngestionStatusResponse)
