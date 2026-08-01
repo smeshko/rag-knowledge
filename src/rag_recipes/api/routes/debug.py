@@ -41,7 +41,10 @@ def _optional_version(raw: str | None) -> int | None:
     return _parse_int(raw, field="source_version", default=1, minimum=1)
 
 
-@router.get("/documents/{document_id}/extraction-runs")
+@router.get(
+    "/documents/{document_id}/extraction-runs",
+    response_model=ExtractionRunListResponse,
+)
 async def list_extraction_runs(
     document_id: str,
     source_version: str | None = None,
@@ -58,7 +61,7 @@ async def list_extraction_runs(
     )
 
 
-@router.get("/extraction-runs/{run_id}")
+@router.get("/extraction-runs/{run_id}", response_model=ExtractionRunDetail)
 async def get_extraction_run(
     run_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -78,6 +81,7 @@ async def get_extraction_run(
 
 @router.get(
     "/documents/{document_id}/source-spans",
+    response_model=SourceSpanListResponse,
     summary="List a document's source spans (debug-only)",
     description=(
         "Returns full source-span text for a document. WARNING: source span text "

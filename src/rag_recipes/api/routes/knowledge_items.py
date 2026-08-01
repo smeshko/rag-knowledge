@@ -49,7 +49,7 @@ def _pdf_page_label(locator: dict[str, Any]) -> str:
     return f"pages {start}{_EN_DASH}{end}"
 
 
-@router.get("/knowledge-items/{item_id}")
+@router.get("/knowledge-items/{item_id}", response_model=KnowledgeItemResponse)
 async def get_knowledge_item(
     item_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008

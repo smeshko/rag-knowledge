@@ -168,7 +168,7 @@ def _safe_filename(filename: str | None) -> str:
     return filename if filename else _DEFAULT_FILENAME
 
 
-@router.post("/documents", status_code=201)
+@router.post("/documents", status_code=201, response_model=UploadResponse)
 async def upload_document(
     file: Annotated[UploadFile | None, File()] = None,
     category: Annotated[str, Form()] = "recipes",
@@ -410,7 +410,7 @@ def _batch_error_code(code: ErrorCode) -> BatchUploadErrorCode:
         return BatchUploadErrorCode.INTERNAL_ERROR
 
 
-@router.post("/documents/batch", status_code=201)
+@router.post("/documents/batch", status_code=201, response_model=BatchUploadResponse)
 async def upload_documents_batch(
     files: Annotated[list[UploadFile], File()],
     category: Annotated[str, Form()] = "recipes",
@@ -513,7 +513,7 @@ async def upload_documents_batch(
     )
 
 
-@router.get("/documents")
+@router.get("/documents", response_model=DocumentListResponse)
 async def list_documents(
     category: str | None = None,
     status: str | None = None,
@@ -564,7 +564,7 @@ async def _require_document(repo: DocumentRepository, document_id: str) -> Any:
     return document
 
 
-@router.get("/documents/{document_id}")
+@router.get("/documents/{document_id}", response_model=DocumentDetailResponse)
 async def get_document(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -585,7 +585,7 @@ async def get_document(
     )
 
 
-@router.get("/documents/{document_id}/status")
+@router.get("/documents/{document_id}/status", response_model=IngestionStatusResponse)
 async def get_document_status(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -710,7 +710,7 @@ async def _enqueue_reprocess(
         )
 
 
-@router.post("/documents/{document_id}/reprocess")
+@router.post("/documents/{document_id}/reprocess", response_model=ReprocessResponse)
 async def reprocess_document(
     document_id: str,
     body: ReprocessRequest,
