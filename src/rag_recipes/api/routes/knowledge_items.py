@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.dependencies import get_session
 from rag_recipes.api.errors import ApiError, ErrorCode
+from rag_recipes.api.review_reasons import build_review_reasons
 from rag_recipes.api.schemas.knowledge_items import (
     KnowledgeItemDetail,
     KnowledgeItemDisplay,
@@ -48,7 +49,7 @@ def _pdf_page_label(locator: dict[str, Any]) -> str:
     return f"pages {start}{_EN_DASH}{end}"
 
 
-@router.get("/knowledge-items/{item_id}")
+@router.get("/knowledge-items/{item_id}", response_model=KnowledgeItemResponse)
 async def get_knowledge_item(
     item_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -99,6 +100,9 @@ async def get_knowledge_item(
             source_span_ids=span_ids,
             confidence=item.confidence,
             structured_data=item.structured_data or {},
+            review_reasons=build_review_reasons(
+                item.status.value, item.structured_data or {}
+            ),
         ),
         display=KnowledgeItemDisplay(title=item.title, subtitle=subtitle),
         source_citations=citations,

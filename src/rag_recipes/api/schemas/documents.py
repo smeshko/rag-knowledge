@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
@@ -33,13 +34,34 @@ class UploadResponse(BaseModel):
     ingestion: UploadIngestion
 
 
+class BatchUploadItemStatus(StrEnum):
+    """Per-file outcome of a batch cohort upload — closed set (Epic 21.1)."""
+
+    CREATED = "created"
+    DUPLICATE = "duplicate"
+    ERROR = "error"
+
+
+class BatchUploadErrorCode(StrEnum):
+    """Machine-readable code on ``error`` items (Epic 21.1, D2).
+
+    Mirrors the ``ErrorCode`` values actually raisable by the per-file upload
+    helper; anything unexpected maps to ``internal_error``.
+    """
+
+    INVALID_REQUEST = "invalid_request"
+    UNSUPPORTED_FILE_TYPE = "unsupported_file_type"
+    INTERNAL_ERROR = "internal_error"
+
+
 class BatchUploadItemResult(BaseModel):
     """Per-file outcome in a batch cohort upload (Epic 19.2)."""
 
     filename: str
-    status: str  # "created" | "duplicate" | "error"
+    status: BatchUploadItemStatus
     document_id: str | None = None
     error: str | None = None
+    error_code: BatchUploadErrorCode | None = None
 
 
 class BatchUploadResponse(BaseModel):
@@ -90,6 +112,20 @@ class IngestionProgress(BaseModel):
     pages_processed: int | None
 
 
+class IngestionFailureInfo(BaseModel):
+    """Latest ingestion failure for a FAILED document (doc 6 § 5; Epic 21 D1).
+
+    ``stage`` is the status the document failed *from*
+    (``IngestionFailure.last_status``), not its current status.
+    ``error_message`` is deliberately excluded — ``reason`` is the stable,
+    FE-presentable code.
+    """
+
+    reason: str
+    stage: str
+    failed_at: datetime
+
+
 class IngestionStatusResponse(BaseModel):
     document_id: str
     status: str
@@ -97,6 +133,7 @@ class IngestionStatusResponse(BaseModel):
     current_source_version: int | None
     progress: IngestionProgress
     terminal: bool
+    failure: IngestionFailureInfo | None = None
 
 
 class ReprocessRequest(BaseModel):

@@ -69,6 +69,7 @@ async def _seed_item(
     *,
     status: KnowledgeItemStatus = KnowledgeItemStatus.READY,
     with_spans: bool = True,
+    structured_data: dict[str, Any] | None = None,
 ) -> str:
     repo = DocumentRepository(session)
     aid = new_id("asset")
@@ -133,7 +134,7 @@ async def _seed_item(
         summary="A cozy bowl of white beans.",
         body_text="x" * 100,
         source_span_ids=span_ids,
-        structured_data=_FULL_STRUCTURED,
+        structured_data=structured_data if structured_data is not None else _FULL_STRUCTURED,
         confidence={"overall": 0.88},
         status=status,
     )
@@ -168,6 +169,57 @@ async def test_returns_full_structured_data_display_and_citations(
     labels = [c["label"] for c in body["source_citations"]]
     assert labels == ["page 42", "page 43"]
     assert body["source_citations"][0]["locator"]["page_start"] == 42
+    # Ready items carry an empty review_reasons list (Epic 21.1, additive).
+    assert ki["review_reasons"] == []
+
+
+@pytest.mark.asyncio
+async def test_needs_review_item_carries_review_reasons(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """A needs_review item projects its persisted warning codes as
+    {code, message} review_reasons (Epic 21.1, D3)."""
+    structured = dict(_FULL_STRUCTURED)
+    structured["warnings"] = ["no_ingredients", "low_overall_confidence"]
+    item_id = await _seed_item(
+        db_session,
+        status=KnowledgeItemStatus.NEEDS_REVIEW,
+        structured_data=structured,
+    )
+    async with client:
+        resp = await client.get(f"/api/v1/knowledge-items/{item_id}")
+    assert resp.status_code == 200, resp.text
+    ki = resp.json()["knowledge_item"]
+    assert ki["status"] == "needs_review"
+    reasons = ki["review_reasons"]
+    # Codes match the persisted warnings verbatim, with non-empty messages.
+    assert [r["code"] for r in reasons] == ["no_ingredients", "low_overall_confidence"]
+    assert all(r["message"] for r in reasons)
+    # The raw codes still round-trip verbatim in structured_data.
+    assert ki["structured_data"]["warnings"] == [
+        "no_ingredients",
+        "low_overall_confidence",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_needs_review_unknown_warning_projects_llm_warning_envelope(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    structured = dict(_FULL_STRUCTURED)
+    structured["warnings"] = ["model said something odd"]
+    item_id = await _seed_item(
+        db_session,
+        status=KnowledgeItemStatus.NEEDS_REVIEW,
+        structured_data=structured,
+    )
+    async with client:
+        resp = await client.get(f"/api/v1/knowledge-items/{item_id}")
+    assert resp.status_code == 200, resp.text
+    reasons = resp.json()["knowledge_item"]["review_reasons"]
+    assert reasons == [
+        {"code": "llm_warning", "message": "model said something odd"}
+    ]
 
 
 @pytest.mark.asyncio

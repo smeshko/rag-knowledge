@@ -151,6 +151,10 @@ async def test_batch_upload_mixed_cohort(
     by_name = {item["filename"]: item for item in body["items"]}
     assert by_name["ok.pdf"]["status"] == "created"
     assert by_name["bad.txt"]["status"] == "error"
+    # Machine-readable error code on error items; null on success items.
+    assert by_name["bad.txt"]["error_code"] == "unsupported_file_type"
+    assert by_name["ok.pdf"]["error_code"] is None
+    assert by_name["dup.pdf"]["error_code"] is None
     # Same content hash as ok.pdf → duplicate pointing at the existing doc.
     assert by_name["dup.pdf"]["status"] == "duplicate"
     assert by_name["dup.pdf"]["document_id"] == by_name["ok.pdf"]["document_id"]

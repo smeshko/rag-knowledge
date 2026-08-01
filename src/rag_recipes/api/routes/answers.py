@@ -44,7 +44,7 @@ _VALID_MODES = frozenset({"hybrid", "keyword", "vector"})
 _SUPPORTED_STYLES = frozenset({"recommendation", "summary", "comparison", "direct_answer"})
 
 
-@router.post("/answers")
+@router.post("/answers", response_model=AnswerResponse)
 async def answer(
     body: AnswerRequestBody,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -117,7 +117,9 @@ async def answer(
 
     # The service already applies the success-path `include_results` drop and keeps
     # `results` on a fallback, so the route maps the AnswerResult straight through.
-    response = AnswerResponse(
+    # The absent-when-None `debug` key is handled by AnswerResponse's wrap
+    # serializer (D4).
+    return AnswerResponse(
         query=result.query,
         answer=result.answer,
         recommendations=result.recommendations,
@@ -126,7 +128,3 @@ async def answer(
         warnings=result.warnings,
         debug=debug,
     )
-    data = response.model_dump(by_alias=True)
-    if data.get("debug") is None:
-        data.pop("debug", None)
-    return data

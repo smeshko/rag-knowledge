@@ -89,6 +89,12 @@ app = FastAPI(
     title="rag-recipes",
     lifespan=lifespan,
     dependencies=[Depends(require_api_token)],
+    # D4 (Epic 21.1): SearchResponse/AnswerResponse carry a wrap serializer
+    # (absent-when-None `debug`), which collapses their *serialization* JSON
+    # schema. Documenting responses in validation mode instead keeps their full
+    # `properties` in /openapi.json. No-op for today's schema set (no model is
+    # used as both request and response, so no -Input/-Output split exists).
+    separate_input_output_schemas=False,
 )
 app.add_exception_handler(ApiError, _handle_api_error)
 app.add_exception_handler(RequestValidationError, _handle_request_validation_error)

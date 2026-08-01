@@ -36,13 +36,16 @@ from rag_recipes.api.dependencies import (
 )
 from rag_recipes.api.errors import ApiError, ErrorCode
 from rag_recipes.api.schemas.documents import (
+    BatchUploadErrorCode,
     BatchUploadItemResult,
+    BatchUploadItemStatus,
     BatchUploadResponse,
     DocumentCounts,
     DocumentDetailResponse,
     DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
+    IngestionFailureInfo,
     IngestionProgress,
     IngestionStatusResponse,
     ReprocessRequest,
@@ -62,6 +65,7 @@ from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
+from rag_recipes.storage.repositories.failures import FailuresRepository
 
 router = APIRouter(tags=["documents"])
 
@@ -164,7 +168,7 @@ def _safe_filename(filename: str | None) -> str:
     return filename if filename else _DEFAULT_FILENAME
 
 
-@router.post("/documents", status_code=201)
+@router.post("/documents", status_code=201, response_model=UploadResponse)
 async def upload_document(
     file: Annotated[UploadFile | None, File()] = None,
     category: Annotated[str, Form()] = "recipes",
@@ -394,7 +398,19 @@ def _anthropic_batch_enabled(settings: Settings) -> bool:
     return settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key)
 
 
-@router.post("/documents/batch", status_code=201)
+def _batch_error_code(code: ErrorCode) -> BatchUploadErrorCode:
+    """Map an ``ApiError.code`` to the batch-item error code (D2).
+
+    By value, with an ``internal_error`` fallback so a future raise site with
+    a code outside the reachable set cannot break item construction.
+    """
+    try:
+        return BatchUploadErrorCode(code.value)
+    except ValueError:
+        return BatchUploadErrorCode.INTERNAL_ERROR
+
+
+@router.post("/documents/batch", status_code=201, response_model=BatchUploadResponse)
 async def upload_documents_batch(
     files: Annotated[list[UploadFile], File()],
     category: Annotated[str, Form()] = "recipes",
@@ -446,7 +462,10 @@ async def upload_documents_batch(
             # processing the rest of the cohort.
             results.append(
                 BatchUploadItemResult(
-                    filename=filename, status="error", error=exc.message
+                    filename=filename,
+                    status=BatchUploadItemStatus.ERROR,
+                    error=exc.message,
+                    error_code=_batch_error_code(exc.code),
                 )
             )
             continue
@@ -454,7 +473,9 @@ async def upload_documents_batch(
         if is_duplicate:
             results.append(
                 BatchUploadItemResult(
-                    filename=filename, status="duplicate", document_id=document.id
+                    filename=filename,
+                    status=BatchUploadItemStatus.DUPLICATE,
+                    document_id=document.id,
                 )
             )
             continue
@@ -475,20 +496,24 @@ async def upload_documents_batch(
             )
         results.append(
             BatchUploadItemResult(
-                filename=filename, status="created", document_id=document.id
+                filename=filename,
+                status=BatchUploadItemStatus.CREATED,
+                document_id=document.id,
             )
         )
 
     return BatchUploadResponse(
         items=results,
         total=len(results),
-        created=sum(1 for r in results if r.status == "created"),
-        duplicates=sum(1 for r in results if r.status == "duplicate"),
-        errors=sum(1 for r in results if r.status == "error"),
+        created=sum(1 for r in results if r.status is BatchUploadItemStatus.CREATED),
+        duplicates=sum(
+            1 for r in results if r.status is BatchUploadItemStatus.DUPLICATE
+        ),
+        errors=sum(1 for r in results if r.status is BatchUploadItemStatus.ERROR),
     )
 
 
-@router.get("/documents")
+@router.get("/documents", response_model=DocumentListResponse)
 async def list_documents(
     category: str | None = None,
     status: str | None = None,
@@ -539,7 +564,7 @@ async def _require_document(repo: DocumentRepository, document_id: str) -> Any:
     return document
 
 
-@router.get("/documents/{document_id}")
+@router.get("/documents/{document_id}", response_model=DocumentDetailResponse)
 async def get_document(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -560,7 +585,7 @@ async def get_document(
     )
 
 
-@router.get("/documents/{document_id}/status")
+@router.get("/documents/{document_id}/status", response_model=IngestionStatusResponse)
 async def get_document_status(
     document_id: str,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -602,6 +627,17 @@ async def get_document_status(
         pages_processed, pages_total = await repo.get_pages_progress(
             document_id, version_for_progress
         )
+    # Latest failure (D1): fetched only on the FAILED branch; a failed doc with
+    # no failure row (legacy) serializes `failure: null` rather than erroring.
+    failure: IngestionFailureInfo | None = None
+    if document.status is DocumentStatus.FAILED:
+        latest = await FailuresRepository(session).latest_failure(document_id)
+        if latest is not None:
+            failure = IngestionFailureInfo(
+                reason=latest.reason,
+                stage=latest.last_status.value,
+                failed_at=latest.failed_at,
+            )
     return IngestionStatusResponse(
         document_id=document.id,
         status=document.status.value,
@@ -614,6 +650,7 @@ async def get_document_status(
             pages_processed=pages_processed,
         ),
         terminal=is_doc_terminal,
+        failure=failure,
     )
 
 
@@ -673,7 +710,7 @@ async def _enqueue_reprocess(
         )
 
 
-@router.post("/documents/{document_id}/reprocess")
+@router.post("/documents/{document_id}/reprocess", response_model=ReprocessResponse)
 async def reprocess_document(
     document_id: str,
     body: ReprocessRequest,

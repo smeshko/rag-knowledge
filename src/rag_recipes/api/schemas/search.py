@@ -13,7 +13,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 # --- Request ---
 
@@ -114,3 +120,18 @@ class SearchResponse(BaseModel):
     query: str
     results: list[KnowledgeItemResult]
     debug: RetrievalDebugInfo | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_absent_debug(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        """Serialize with the ``debug`` key absent (not null) when gated off (D4).
+
+        Every other legitimately-null field keeps appearing — this is NOT
+        ``exclude_none``. Requires ``separate_input_output_schemas=False`` on
+        the app or this serializer collapses the model's OpenAPI schema.
+        """
+        data: dict[str, Any] = handler(self)
+        if data.get("debug") is None:
+            data.pop("debug", None)
+        return data

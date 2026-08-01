@@ -40,7 +40,7 @@ router = APIRouter(tags=["search"])
 _VALID_MODES = frozenset({"hybrid", "keyword", "vector"})
 
 
-@router.post("/search")
+@router.post("/search", response_model=SearchResponse)
 async def search_documents(
     body: SearchRequestBody,
     session: AsyncSession = Depends(get_session),  # noqa: B008
@@ -77,17 +77,12 @@ async def search_documents(
         session, request, provider=provider, settings=settings, reranker=reranker
     )
 
-    response = SearchResponse(
+    # The schema/yield aliases and the absent-when-None `debug` key are handled by
+    # the response model itself (SearchResponse's wrap serializer, D4).
+    return SearchResponse(
         query=result.debug.normalized_query,
         results=await project_results(session, result),
         debug=build_retrieval_debug(result, settings)
         if (body.include_debug and settings.debug_endpoints_enabled)
         else None,
     )
-
-    # Serialize with the schema/yield aliases; drop `debug` entirely when gated off
-    # (the key is absent, not null), keeping other legitimately-null fields.
-    data = response.model_dump(by_alias=True)
-    if data.get("debug") is None:
-        data.pop("debug", None)
-    return data
