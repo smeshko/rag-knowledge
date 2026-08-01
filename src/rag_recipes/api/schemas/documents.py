@@ -90,6 +90,20 @@ class IngestionProgress(BaseModel):
     pages_processed: int | None
 
 
+class IngestionFailureInfo(BaseModel):
+    """Latest ingestion failure for a FAILED document (doc 6 § 5; Epic 21 D1).
+
+    ``stage`` is the status the document failed *from*
+    (``IngestionFailure.last_status``), not its current status.
+    ``error_message`` is deliberately excluded — ``reason`` is the stable,
+    FE-presentable code.
+    """
+
+    reason: str
+    stage: str
+    failed_at: datetime
+
+
 class IngestionStatusResponse(BaseModel):
     document_id: str
     status: str
@@ -97,6 +111,7 @@ class IngestionStatusResponse(BaseModel):
     current_source_version: int | None
     progress: IngestionProgress
     terminal: bool
+    failure: IngestionFailureInfo | None = None
 
 
 class ReprocessRequest(BaseModel):

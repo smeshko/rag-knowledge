@@ -44,6 +44,17 @@ class FailuresRepository:
         await self._session.refresh(failure, ["failed_at", "metadata_json"])
         return failure
 
+    async def latest_failure(self, document_id: str) -> IngestionFailure | None:
+        """Most recent failure row for a document (same ordering as
+        ``list_failures``: ``failed_at DESC, id DESC``), or ``None``."""
+        result = await self._session.execute(
+            select(IngestionFailure)
+            .where(IngestionFailure.document_id == document_id)
+            .order_by(IngestionFailure.failed_at.desc(), IngestionFailure.id.desc())
+            .limit(1)
+        )
+        return result.scalars().first()
+
     async def list_failures(
         self, document_id: str, limit: int = 10
     ) -> Sequence[IngestionFailure]:

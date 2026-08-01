@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -11,9 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.app import app
 from rag_recipes.api.dependencies import get_session
+from rag_recipes.ingestion.status import mark_failed
 from rag_recipes.storage.enums import DocumentStatus, SourceType, UploadStatus
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.ingestion_failure import IngestionFailure
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -128,9 +131,11 @@ async def test_status_returns_doc_section_5_shape(
         "current_source_version",
         "progress",
         "terminal",
+        "failure",
     }
     assert body["document_id"] == document.id
     assert body["status"] == "queued"
+    assert body["failure"] is None
     assert body["active_source_version"] is None
     # 8.2 rule: non-terminal → current_source_version=1 (doc 6 §5 in-progress
     # example), diverging from active_source_version (null mid-ingestion).
@@ -358,6 +363,113 @@ async def test_status_new_version_in_flight_reports_new_version_progress(
     # Progress is the in-flight v2 spans, not the surviving v1 (5) spans.
     assert body["progress"]["pages_processed"] == 2
     assert body["progress"]["pages_total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_status_failed_document_reports_latest_failure(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """A FAILED doc surfaces the failure row written by the real mark_failed path."""
+    document = await _seed_document(
+        db_session,
+        content_hash="hash-failure-single",
+        status=DocumentStatus.EXTRACTING_ITEMS,
+    )
+    await mark_failed(
+        db_session,
+        document.id,
+        reason="llm_extraction_failed",
+        error_message="boom (must not be exposed)",
+    )
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    failure = body["failure"]
+    assert set(failure.keys()) == {"reason", "stage", "failed_at"}
+    assert failure["reason"] == "llm_extraction_failed"
+    # `stage` is the status the document failed FROM, not the current one.
+    assert failure["stage"] == "extracting_items"
+    # ISO timestamp, parseable.
+    datetime.fromisoformat(failure["failed_at"])
+    # error_message is deliberately excluded (D1).
+    assert "error_message" not in failure
+
+
+@pytest.mark.asyncio
+async def test_status_failed_document_most_recent_failure_wins(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    document = await _seed_document(
+        db_session, content_hash="hash-failure-multi", status=DocumentStatus.FAILED
+    )
+    older = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    newer = datetime(2026, 1, 2, 12, 0, 0, tzinfo=UTC)
+    db_session.add(
+        IngestionFailure(
+            document_id=document.id,
+            failed_at=older,
+            last_status=DocumentStatus.EXTRACTING_TEXT,
+            reason="pdf_empty",
+        )
+    )
+    db_session.add(
+        IngestionFailure(
+            document_id=document.id,
+            failed_at=newer,
+            last_status=DocumentStatus.EXTRACTING_ITEMS,
+            reason="llm_extraction_failed",
+        )
+    )
+    await db_session.flush()
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert response.status_code == 200
+    body = response.json()
+    failure = body["failure"]
+    assert failure["reason"] == "llm_extraction_failed"
+    assert failure["stage"] == "extracting_items"
+    assert datetime.fromisoformat(failure["failed_at"]) == newer
+
+
+@pytest.mark.asyncio
+async def test_status_failed_document_without_failure_row_reports_null(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """A legacy FAILED doc with no failure row serializes failure: null (no 500)."""
+    document = await _seed_document(
+        db_session, content_hash="hash-failure-none", status=DocumentStatus.FAILED
+    )
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert response.status_code == 200
+    assert response.json()["failure"] is None
+
+
+@pytest.mark.asyncio
+async def test_status_non_failed_document_reports_null_failure(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Non-failed docs report failure: null even when failure rows exist."""
+    document = await _seed_document(
+        db_session,
+        content_hash="hash-failure-nonfailed",
+        status=DocumentStatus.READY,
+        active_source_version=1,
+    )
+    db_session.add(
+        IngestionFailure(
+            document_id=document.id,
+            last_status=DocumentStatus.EXTRACTING_TEXT,
+            reason="pdf_empty",
+        )
+    )
+    await db_session.flush()
+    async with client:
+        response = await client.get(f"/api/v1/documents/{document.id}/status")
+    assert response.status_code == 200
+    assert response.json()["failure"] is None
 
 
 @pytest.mark.asyncio

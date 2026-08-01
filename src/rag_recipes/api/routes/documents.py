@@ -43,6 +43,7 @@ from rag_recipes.api.schemas.documents import (
     DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
+    IngestionFailureInfo,
     IngestionProgress,
     IngestionStatusResponse,
     ReprocessRequest,
@@ -62,6 +63,7 @@ from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.repositories.documents import DocumentRepository
+from rag_recipes.storage.repositories.failures import FailuresRepository
 
 router = APIRouter(tags=["documents"])
 
@@ -602,6 +604,17 @@ async def get_document_status(
         pages_processed, pages_total = await repo.get_pages_progress(
             document_id, version_for_progress
         )
+    # Latest failure (D1): fetched only on the FAILED branch; a failed doc with
+    # no failure row (legacy) serializes `failure: null` rather than erroring.
+    failure: IngestionFailureInfo | None = None
+    if document.status is DocumentStatus.FAILED:
+        latest = await FailuresRepository(session).latest_failure(document_id)
+        if latest is not None:
+            failure = IngestionFailureInfo(
+                reason=latest.reason,
+                stage=latest.last_status.value,
+                failed_at=latest.failed_at,
+            )
     return IngestionStatusResponse(
         document_id=document.id,
         status=document.status.value,
@@ -614,6 +627,7 @@ async def get_document_status(
             pages_processed=pages_processed,
         ),
         terminal=is_doc_terminal,
+        failure=failure,
     )
 
 
