@@ -260,7 +260,9 @@ async def test_process_document_is_idempotent_on_duplicate_delivery(
                     )
                 )
             ).scalars().all()
-        assert len(first_spans) == 3
+        # One span per page; the generated sample PDF is 4 pages (page 4 is the
+        # sub-threshold 'Plate 4' caption added in epic 23.1).
+        assert len(first_spans) == 4
 
         # A duplicate / manual re-delivery for the already-terminal document must
         # no-op rather than flip the NEEDS_REVIEW row to FAILED via the
