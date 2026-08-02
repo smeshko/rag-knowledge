@@ -45,15 +45,16 @@ from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 # ``normalize_title`` now lives in the pure ``pipeline/composition`` module (so
 # the Epic 22.1 edit layer can reach it without importing a session or
 # ``Settings``) and is re-exported here for this module's existing callers.
-__all__ = ["normalize_title", "persist_knowledge_item"]
+__all__ = ["normalize_title", "persist_knowledge_item", "thresholds_from_settings"]
 
 
-def _thresholds_from_settings() -> SoftValidationThresholds:
+def thresholds_from_settings() -> SoftValidationThresholds:
     """Build soft-validation thresholds from the application ``Settings``.
 
-    Used only when the caller does not pass ``thresholds`` explicitly. Tests pass
-    their own value object, so they exercise ``persist_knowledge_item`` without
-    needing a populated environment.
+    Used when the caller does not pass ``thresholds`` explicitly, and by the
+    Epic 22.2 edit endpoint, which must re-derive warnings against exactly the
+    thresholds ingest used. Tests pass their own value object, so they exercise
+    ``persist_knowledge_item`` without needing a populated environment.
     """
     settings = get_settings()
     return SoftValidationThresholds(
@@ -102,7 +103,7 @@ async def persist_knowledge_item(
         raise HardValidationError(failures)
 
     if thresholds is None:
-        thresholds = _thresholds_from_settings()
+        thresholds = thresholds_from_settings()
     warnings = validate_soft(extracted, thresholds=thresholds)
 
     # Whole-object assembly (DECISIONS #1, #2): warning codes live alongside the
