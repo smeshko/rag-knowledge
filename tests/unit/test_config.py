@@ -514,6 +514,32 @@ def test_llm_provider_invalid_value_rejected(monkeypatch: pytest.MonkeyPatch) ->
         Settings(_env_file=None)
 
 
+def test_structured_output_mode_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    # None is the "defer to the provider's registry entry" sentinel. A non-None
+    # default could not express that, and would let a provider be paired with a
+    # mode its transport cannot serve (Epic 23.4).
+    assert Settings(_env_file=None).llm_structured_output_mode is None
+
+
+def test_structured_output_mode_invalid_value_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_STRUCTURED_OUTPUT_MODE", "nonsense")
+    with pytest.raises(ValidationError, match="llm_structured_output_mode"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("mode", ["json_schema", "strict_tool", "tool"])
+def test_structured_output_mode_accepts_every_supported_value(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_STRUCTURED_OUTPUT_MODE", mode)
+    assert Settings(_env_file=None).llm_structured_output_mode == mode
+
+
 def test_anthropic_max_tokens_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     _required_env(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_MAX_TOKENS", "0")

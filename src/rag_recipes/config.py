@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     # changing the label would file another vendor's runs under "openai" and let
     # the two satisfy each other's cache lookups.
     llm_base_url: str | None = None
+    # How schema-constrained output is requested (Epic 23.4). None means "let the
+    # selected provider's registry entry choose" — a non-None default could not
+    # express that, and would let llm_provider=deepseek + json_schema (a guaranteed
+    # 400, since DeepSeek's response_format accepts only text/json_object) load
+    # clean and fail at the first request. See providers.llm.openai for the values.
+    llm_structured_output_mode: str | None = None
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request
     # timeout. retries=0 disables retries (raise on the first 429); the timeout
     # is a float so it feeds chat.completions.create(timeout=…) without a cast.
@@ -223,6 +229,21 @@ class Settings(BaseSettings):
         if value not in supported:
             raise ValueError(
                 f"llm_provider must be one of {sorted(supported)}; got {value!r}"
+            )
+        return value
+
+    @field_validator("llm_structured_output_mode")
+    @classmethod
+    def _structured_output_mode_supported(cls, value: str | None) -> str | None:
+        # None is the "defer to the registry entry" sentinel and is always valid.
+        # A typo'd mode must fail at load: an unknown value would otherwise reach
+        # the provider and produce a request shape the vendor rejects mid-run.
+        from rag_recipes.providers.llm.openai import STRUCTURED_OUTPUT_MODES
+
+        if value is not None and value not in STRUCTURED_OUTPUT_MODES:
+            raise ValueError(
+                "llm_structured_output_mode must be one of "
+                f"{sorted(STRUCTURED_OUTPUT_MODES)}; got {value!r}"
             )
         return value
 

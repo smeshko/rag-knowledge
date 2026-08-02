@@ -6,9 +6,16 @@ outcomes are first-class audit data, so the provider never retries: technical
 failures raise ``LLMTechnicalError`` (→ ``ExtractionRun.status = failed``);
 un-parseable / non-object / refused / truncated output is returned with
 ``output_json=None`` and a ``parse_error``, always preserving ``raw_text`` for
-debugging (the extraction layer, Epic 9, decides rejection). Schema conformance
-of a clean-parsed object is enforced on the wire by OpenAI strict mode; 5.1 adds
-no post-parse JSON-Schema validation (``recipe.v1`` validation is Epic 9).
+debugging (the extraction layer, Epic 9, decides rejection). No post-parse
+JSON-Schema validation happens here (``recipe.v1`` validation is Epic 9).
+
+Since Epic 23.4 the class serves any OpenAI-**compatible** endpoint, not just
+OpenAI: ``base_url`` retargets the transport, ``provider`` carries the identity
+that endpoint's runs are recorded under, and ``structured_output_mode`` selects
+how schema-constrained output is requested. How strongly conformance is enforced
+on the wire therefore depends on the mode — ``json_schema`` and ``strict_tool``
+constrain decoding, plain ``tool`` is advisory. All three share one parse path,
+so the *response* contract is identical whichever is in use.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import hashlib
 import json
 import random
 import re
-from typing import Any
+from typing import Any, Literal
 
 import openai
 from openai import AsyncOpenAI
@@ -37,10 +44,29 @@ from rag_recipes.providers.llm.types import (
     TokenUsage,
 )
 
-__all__ = ["OpenAILLMProvider"]
+__all__ = ["STRUCTURED_OUTPUT_MODES", "OpenAILLMProvider", "StructuredOutputMode"]
 
 _DISALLOWED_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 _TRUNCATING_FINISH_REASONS = frozenset({"length", "content_filter"})
+
+#: How the provider asks for schema-constrained output (Epic 23.4).
+#:
+#: - ``json_schema`` — OpenAI's ``response_format={"type": "json_schema", strict: true}``.
+#:   The default, and byte-identical to pre-23.4 behaviour.
+#: - ``strict_tool`` — a forced function call whose schema carries ``strict: true``.
+#:   The only schema-constrained mechanism some OpenAI-compatible vendors offer:
+#:   DeepSeek's ``response_format.type`` accepts ``text`` and ``json_object`` only.
+#: - ``tool`` — the same forced call without ``strict``. The retreat when a strict
+#:   grammar is rejected for size: Epic 19 found Anthropic 400s with "compiled
+#:   grammar is too large" on ``recipe.v1``, and the same ceiling may exist
+#:   elsewhere. Downstream Pydantic + hard/soft validation backstops correctness.
+StructuredOutputMode = Literal["json_schema", "strict_tool", "tool"]
+STRUCTURED_OUTPUT_MODES: frozenset[str] = frozenset({"json_schema", "strict_tool", "tool"})
+
+_TOOL_DESCRIPTION = (
+    "Record the structured result. Call this tool exactly once, passing the result "
+    "as its arguments conforming to the provided parameters schema."
+)
 
 # Phase 9.5 rate-limit retry tuning. base/cap bound the exponential backoff;
 # only an explicit transient ``rate_limit_exceeded`` 429 is retried.
@@ -70,6 +96,68 @@ def _rate_limit_retry_after_seconds(exc: openai.RateLimitError) -> float | None:
     except (TypeError, ValueError):
         return None
     return seconds if seconds >= 0 else None
+
+
+def _request_fields(
+    schema: dict[str, Any], name: str, mode: StructuredOutputMode
+) -> dict[str, Any]:
+    """Build the mode-specific structured-output request fields.
+
+    One half of the strategy pair that keeps the three modes from growing three
+    parse paths (the other half is ``_extract_payload``). The direct analogue of
+    ``anthropic._tool_request_fields``, which exists for the same reason.
+
+    ``json_schema`` emits exactly the fields the pre-23.4 provider emitted, so the
+    default path is unchanged rather than merely equivalent. The tool modes emit a
+    single forced function and **no** ``response_format`` — a vendor that supports
+    one mechanism generally does not accept both in the same request.
+    """
+    if mode == "json_schema":
+        return {
+            "response_format": ResponseFormatJSONSchema(
+                type="json_schema",
+                json_schema=JSONSchema(name=name, strict=True, schema=schema),
+            )
+        }
+    function: dict[str, Any] = {
+        "name": name,
+        "description": _TOOL_DESCRIPTION,
+        "parameters": schema,
+    }
+    if mode == "strict_tool":
+        function["strict"] = True
+    return {
+        "tools": [{"type": "function", "function": function}],
+        "tool_choice": {"type": "function", "function": {"name": name}},
+    }
+
+
+def _extract_payload(
+    message: Any, mode: StructuredOutputMode
+) -> tuple[str | None, str | None, str | None]:
+    """Return ``(payload_text, refusal, extraction_error)`` for a completion message.
+
+    The second half of the strategy pair. It normalises the two transports down to
+    the same three values so exactly one ``_parse_error`` decides the outcome —
+    which is what makes the modes' parse semantics identical *by construction*
+    rather than by test. ``extraction_error`` is the only mode-specific verdict,
+    and it is reachable only from the tool modes.
+
+    Read by attribute so both real SDK objects and unit-test stubs work.
+    """
+    if mode == "json_schema":
+        return message.content, message.refusal, None
+    refusal = getattr(message, "refusal", None)
+    for call in getattr(message, "tool_calls", None) or ():
+        function = getattr(call, "function", None)
+        if function is not None:
+            arguments = getattr(function, "arguments", None)
+            return arguments, refusal, None
+    # A forced tool call that produced no tool_call block is a rejection, not a
+    # technical failure — the same verdict anthropic._parse_error reaches for a
+    # missing tool_use block. Ordered *after* the refusal and truncation checks in
+    # _parse_error, so a refused or truncated response still reports that cause.
+    return None, refusal, "model did not return structured output (no tool_call block)"
 
 
 def _backoff_delay(
@@ -115,6 +203,7 @@ class OpenAILLMProvider(LLMProvider):
         default_model: str,
         provider: str = "openai",
         base_url: str | None = None,
+        structured_output_mode: StructuredOutputMode = "json_schema",
         client: AsyncOpenAI | None = None,
         observability: ProviderObservability | None = None,
         max_rate_limit_retries: int = 5,
@@ -125,6 +214,7 @@ class OpenAILLMProvider(LLMProvider):
         )
         self.provider = provider
         self.default_model = default_model
+        self._mode: StructuredOutputMode = structured_output_mode
         self._obs = observability or ProviderObservability(None, enabled=False)
         # Phase 9.5: explicit retry/timeout, kept separate from the SDK (pinned at
         # max_retries=0) so retries stay inside the one observability span and a
@@ -150,13 +240,8 @@ class OpenAILLMProvider(LLMProvider):
             metadata=metadata,
             trace_context=trace_context,
         ) as observation:
-            response_format = ResponseFormatJSONSchema(
-                type="json_schema",
-                json_schema=JSONSchema(
-                    name=_schema_name(request.schema_version),
-                    strict=True,
-                    schema=request.json_schema,
-                ),
+            request_fields = _request_fields(
+                request.json_schema, _schema_name(request.schema_version), self._mode
             )
             messages: list[ChatCompletionUserMessageParam] = [
                 {"role": "user", "content": request.input}
@@ -175,8 +260,8 @@ class OpenAILLMProvider(LLMProvider):
                     completion = await self._client.chat.completions.create(
                         model=request.model,
                         messages=messages,
-                        response_format=response_format,
                         timeout=self._request_timeout,
+                        **request_fields,
                     )
                     break
                 except openai.RateLimitError as exc:
@@ -198,8 +283,7 @@ class OpenAILLMProvider(LLMProvider):
 
             choice = completion.choices[0]
             message = choice.message
-            content = message.content
-            refusal = message.refusal
+            content, refusal, extraction_error = _extract_payload(message, self._mode)
             raw_text = content if content is not None else (refusal or "")
 
             usage = completion.usage
@@ -208,7 +292,9 @@ class OpenAILLMProvider(LLMProvider):
                 output_tokens=usage.completion_tokens if usage is not None else 0,
             )
 
-            parse_error = self._parse_error(content, refusal, choice.finish_reason, raw_text)
+            parse_error = self._parse_error(
+                content, refusal, choice.finish_reason, raw_text, extraction_error
+            )
             output_json = None if parse_error else json.loads(raw_text)
             response = StructuredOutputResponse(
                 output_json=output_json,
@@ -237,12 +323,27 @@ class OpenAILLMProvider(LLMProvider):
 
     @staticmethod
     def _parse_error(
-        content: str | None, refusal: str | None, finish_reason: str, raw_text: str
+        content: str | None,
+        refusal: str | None,
+        finish_reason: str,
+        raw_text: str,
+        extraction_error: str | None = None,
     ) -> str | None:
+        """The single parse verdict, shared by every structured-output mode.
+
+        Check order is load-bearing for cross-mode identity: refusal and truncation
+        are decided from fields both transports carry, *before* the tool-only
+        ``extraction_error``. A refused or truncated tool response therefore reports
+        that cause rather than the (also true, but less useful) absence of a
+        tool_call block — which is what makes a refusal in ``strict_tool`` mode
+        produce the same ``parse_error`` string as a refusal in ``json_schema`` mode.
+        """
         if content is None and refusal is not None:
             return f"model refused to generate output: {refusal}"
         if finish_reason in _TRUNCATING_FINISH_REASONS:
             return f"output truncated by provider (finish_reason={finish_reason})"
+        if extraction_error is not None:
+            return extraction_error
         try:
             parsed = json.loads(raw_text)
         except ValueError:
