@@ -399,6 +399,11 @@ async def run_judge_alignment(
         return {
             "judge_name": judge_runner.name,
             "judge_version": judge_runner.version,
+            # Both providers, explicitly. Epic 23.6 commits these records under
+            # data/fixtures/judge_alignment/, and after the 23.3 split a record
+            # reading `extraction_provider: deepseek` + `model: claude-sonnet-4-6`
+            # would never state which vendor served that model.
+            "judge_provider": judge_runner.provider,
             "model": judge_runner.model,
             "fixture_set": fixture_set,
             "judge_dimension": dimension,

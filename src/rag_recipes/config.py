@@ -332,11 +332,46 @@ class Settings(BaseSettings):
         from rag_recipes.providers.llm.registry import unsupported_structured_output_modes
 
         mode = self.llm_structured_output_mode
-        unsupported = unsupported_structured_output_modes(self.llm_provider)
-        if mode is not None and mode in unsupported:
+        if mode is None:
+            return self
+        # Both roles, because the setting is global but the providers need not
+        # be. LLM_PROVIDER=openai + json_schema + JUDGE_LLM_PROVIDER=deepseek
+        # would otherwise load clean and die at the first *judge* call — after
+        # extraction has already spent the money (Epic 23.3).
+        for field, provider in (
+            ("llm_provider", self.llm_provider),
+            ("judge_llm_provider", self.judge_llm_provider),
+        ):
+            if provider is None:
+                continue
+            if mode in unsupported_structured_output_modes(provider):
+                raise ValueError(
+                    f"llm_structured_output_mode={mode!r} is not supported by "
+                    f"{field}={provider!r}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _judge_provider_must_not_inherit_a_retargeted_endpoint(self) -> Settings:
+        # llm_base_url and llm_provider_label are read by the `openai` registry
+        # entry regardless of *who* is asking for it, so with the endpoint
+        # retargeted, JUDGE_LLM_PROVIDER=openai builds a judge pointed at the
+        # very same third-party endpoint under the very same identity label.
+        # The run is then self-judged while looking correctly configured, and
+        # the judge cache key cannot detect it either — both sides carry the
+        # same label. Since a self-judged comparison is exactly what Epic 23.3
+        # exists to prevent, refuse the combination rather than document it.
+        if (
+            self.llm_base_url
+            and self.judge_llm_provider == "openai"
+            and self.llm_provider == "openai"
+        ):
             raise ValueError(
-                f"llm_structured_output_mode={mode!r} is not supported by "
-                f"llm_provider={self.llm_provider!r}"
+                "judge_llm_provider='openai' is ambiguous while llm_base_url is set: "
+                "the OpenAI transport is shared, so the judge would be built against "
+                "the same retargeted endpoint and identity label as the model under "
+                "test — a self-judged run that looks correctly configured. Point the "
+                "judge at a different registered provider, or clear llm_base_url."
             )
         return self
 

@@ -192,8 +192,12 @@ def build_judge_cache_key(
 
     Every key part has exactly one source: the fixture-side provenance is
     passed in explicitly (the driver uses the working tree, alignment the run's
-    recorded values), and the judge identity — including ``model`` — comes from
-    the ``Judge`` itself. ``evals.judge_cache`` stays storage-only.
+    recorded values), and the judge identity — including ``provider`` and
+    ``model`` — comes from the ``Judge`` itself. ``evals.judge_cache`` stays
+    storage-only.
+
+    Because this is the sole construction site, ``evals.alignment`` inherited the
+    Epic 23.3 ``provider`` part with no edit of its own.
     """
     return JudgeCacheKey(
         fixture_set=fixture_set,
@@ -203,6 +207,7 @@ def build_judge_cache_key(
         artifact_hash=artifact_hash,
         judge_name=judge.name,
         judge_version=judge.version,
+        provider=judge.provider,
         model=judge.model,
     )
 

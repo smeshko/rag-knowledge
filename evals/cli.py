@@ -83,6 +83,13 @@ def _build_judge_provider(settings: Settings) -> LLMProvider | None:
         return None
     name = settings.judge_llm_provider or settings.llm_provider
     model = settings.judge_llm_model or resolve_extraction_model(settings, name)
+    if (name, model) == (settings.llm_provider, resolve_extraction_model(settings)):
+        # Explicitly configured to match the extractor — a natural way to write
+        # "judge pinned to Claude" in a runbook when Claude is also the model
+        # under test. Collapse to None rather than construct a second, equivalent
+        # client: two clients would split the rate-limit retry budget and produce
+        # the equivalent-but-distinct object the identity guarantee avoids.
+        return None
     return build_llm_provider(settings, provider_name=name, model=model)
 
 

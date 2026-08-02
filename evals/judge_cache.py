@@ -6,8 +6,9 @@ as a plain string). One JSON file per :class:`JudgeCacheKey` under
 ``evals/reports/.judge_cache/`` (covered by the existing ``evals/reports/*``
 gitignore rule).
 
-The eight-part key is ``(fixture_set, fixture_id, fixture_content_hash,
-extraction_prompt_version, artifact_hash, judge_name, judge_version, model)``:
+The nine-part key is ``(fixture_set, fixture_id, fixture_content_hash,
+extraction_prompt_version, artifact_hash, judge_name, judge_version, provider,
+model)``:
 
 - ``fixture_set`` + ``fixture_id`` — same-named fixtures in different sets can
   never collide.
@@ -19,9 +20,15 @@ extraction_prompt_version, artifact_hash, judge_name, judge_version, model)``:
   (DECISIONS #10): a rating is replayed only for the byte-identical artifact it
   was produced from, and ratings for different artifacts of the same fixture
   coexist as separate files instead of clobbering each other.
-- ``judge_name``/``judge_version``/``model`` — the judge identity; a prompt
-  edit MUST bump the prompt's front-matter version (the contract note in each
-  prompt file).
+- ``judge_name``/``judge_version``/``provider``/``model`` — the judge identity;
+  a prompt edit MUST bump the prompt's front-matter version (the contract note
+  in each prompt file). ``provider`` joined the key in Epic 23.3, when the judge
+  became separately configurable: two providers can serve the same model name —
+  an OpenAI-compatible endpoint advertises whatever model id it likes — so
+  ``(judge_name, judge_version, model)`` stopped identifying who produced a
+  rating. Without this part, an Anthropic judge and a DeepSeek judge would
+  silently share ratings, which is the precise cross-vendor contamination the
+  split exists to remove.
 
 File naming: a bounded readable slug prefix (each part truncated to 32 chars,
 the joined prefix to 120) plus a 32-hex digest of the full key tuple — a hard
@@ -56,11 +63,16 @@ def slugify_key_part(value: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class JudgeCacheKey:
-    """The full eight-part cache key; every part is significant.
+    """The full nine-part cache key; every part is significant.
 
     All parts are caller-supplied opaque strings — this module never computes a
     hash or reads a version itself (storage-only contract). The single
     construction site is ``evals.extraction.build_judge_cache_key``.
+
+    Adding ``provider`` in Epic 23.3 changed every cache path (``_path`` hashes
+    the whole tuple), orphaning previously cached ratings. Deliberate: a cache
+    that can serve one vendor's rating for another vendor's request is worse
+    than a cold one, and ratings are cheap to regenerate.
     """
 
     fixture_set: str
@@ -70,6 +82,7 @@ class JudgeCacheKey:
     artifact_hash: str
     judge_name: str
     judge_version: str
+    provider: str
     model: str
 
 

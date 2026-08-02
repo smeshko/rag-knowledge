@@ -629,6 +629,7 @@ async def test_cached_rating_for_a_different_artifact_is_not_served(tmp_path: Pa
         artifact_hash=artifact_hash(serialize_extracted_artifact(payloads)),
         judge_name="summary_quality",
         judge_version="v1",
+        provider="fake",
         model="fake-model",
     )
     stale_key = dataclasses.replace(real_key, artifact_hash="0" * 64)

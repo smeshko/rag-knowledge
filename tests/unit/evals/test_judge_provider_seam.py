@@ -155,3 +155,113 @@ def test_explicit_judge_model_wins_over_the_provider_default(
 
     assert judge is not None
     assert judge.default_model == "claude-opus-4-6"
+
+
+# --- holes found by adversarial review of the plan ---------------------------
+
+
+def test_structured_output_mode_is_validated_against_the_judge_provider_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact twin of the API-key hole, on the mode setting.
+
+    `llm_structured_output_mode` is global but the two providers need not be.
+    openai + json_schema + a DeepSeek judge would otherwise load clean and die
+    at the first *judge* call — after extraction has already spent the money.
+    """
+    with pytest.raises(ValidationError, match="judge_llm_provider"):
+        _settings(
+            monkeypatch,
+            LLM_PROVIDER="openai",
+            LLM_STRUCTURED_OUTPUT_MODE="json_schema",
+            JUDGE_LLM_PROVIDER="deepseek",
+            DEEPSEEK_API_KEY="sk-ds-test",
+        )
+
+
+def test_the_extraction_side_of_the_mode_rule_still_fires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError, match="llm_provider"):
+        _settings(
+            monkeypatch,
+            LLM_PROVIDER="deepseek",
+            DEEPSEEK_API_KEY="sk-ds-test",
+            LLM_STRUCTURED_OUTPUT_MODE="json_schema",
+        )
+
+
+def test_an_openai_judge_is_refused_when_the_endpoint_is_retargeted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The subtlest way this phase could have failed silently.
+
+    `llm_base_url` / `llm_provider_label` are read by the `openai` registry entry
+    whoever asks for it. So with the endpoint retargeted, an "openai" judge is
+    built against the *same* third-party endpoint under the *same* identity
+    label — a self-judged run that looks correctly configured, and which the
+    judge cache key cannot distinguish because both sides carry that one label.
+    """
+    with pytest.raises(ValidationError, match="ambiguous while llm_base_url is set"):
+        _settings(
+            monkeypatch,
+            LLM_BASE_URL="https://api.together.xyz/v1",
+            LLM_PROVIDER_LABEL="together",
+            JUDGE_LLM_PROVIDER="openai",
+        )
+
+
+def test_a_genuinely_different_judge_is_fine_with_a_retargeted_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative control: only the ambiguous pairing is refused."""
+    settings = _settings(
+        monkeypatch,
+        LLM_BASE_URL="https://api.together.xyz/v1",
+        LLM_PROVIDER_LABEL="together",
+        JUDGE_LLM_PROVIDER="anthropic",
+        ANTHROPIC_API_KEY="sk-ant-test",
+    )
+    judge = _build_judge_provider(settings)
+    assert judge is not None
+    assert judge.provider == "anthropic"
+
+
+def test_a_judge_configured_identically_to_the_extractor_collapses_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Writing the judge out explicitly is a natural runbook habit.
+
+    `LLM_PROVIDER=anthropic JUDGE_LLM_PROVIDER=anthropic` is how someone spells
+    "judge pinned to Claude" when Claude is also under test. Building a second,
+    equivalent client would split the rate-limit retry budget for no benefit.
+    """
+    settings = _settings(
+        monkeypatch,
+        LLM_PROVIDER="anthropic",
+        JUDGE_LLM_PROVIDER="anthropic",
+        ANTHROPIC_API_KEY="sk-ant-test",
+    )
+    assert _build_judge_provider(settings) is None
+
+
+def test_importing_the_cli_does_not_import_a_vendor_sdk() -> None:
+    """A real assertion, not "the help text rendered".
+
+    `evals/cli.py`'s docstring promises that importing the module — and so
+    rendering `--help` — can never reach a provider. Now that there are *two*
+    construction seams, that promise has twice the surface. Checked in a clean
+    subprocess: an in-process check would pass trivially, since this test module
+    imports both providers at the top.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; import evals.cli; "
+        "print(int('openai' in sys.modules), int('anthropic' in sys.modules))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "0 0", result.stdout
