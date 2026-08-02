@@ -78,9 +78,9 @@ from rag_recipes.providers.errors import (
     PdfExtractionError,
 )
 from rag_recipes.providers.file_storage.local import LocalFileStorage
-from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider, _sanitize_schema
+from rag_recipes.providers.llm.anthropic import _sanitize_schema
 from rag_recipes.providers.llm.base import LLMProvider
-from rag_recipes.providers.llm.openai import OpenAILLMProvider
+from rag_recipes.providers.llm.registry import build_llm_provider
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
 from rag_recipes.storage.enums import (
     DocumentStatus,
@@ -166,32 +166,11 @@ def _build_llm_provider(
 
     Mirrors how 8.1 builds ``PyMuPdfExtractor`` / ``LocalFileStorage`` in-job; the
     seam lets an integration test substitute a ``FakeLLMProvider`` via
-    ``ctx["llm_provider"]`` without a real API key. Dispatches on
-    ``settings.llm_provider`` (Epic 19.1): ``"anthropic"`` builds Claude on the
-    Anthropic settings, anything else stays OpenAI (the default). The config
-    validator already guarantees ``anthropic_api_key`` when Anthropic is
-    selected; the ``None`` narrow here is defense-in-depth and satisfies mypy
-    when passing ``str | None`` to the ``str`` constructor param.
+    ``ctx["llm_provider"]`` without a real API key. Construction itself goes
+    through the provider registry (Epic 23.4) — this wrapper survives only to keep
+    that ``ctx`` seam and the observability injection at the job boundary.
     """
-    if settings.llm_provider == "anthropic":
-        api_key = settings.anthropic_api_key
-        if api_key is None:
-            raise ValueError("anthropic_api_key is required when llm_provider == 'anthropic'")
-        return AnthropicLLMProvider(
-            api_key,
-            default_model=settings.anthropic_llm_model,
-            observability=observability,
-            max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-            request_timeout=settings.llm_request_timeout_seconds,
-            max_tokens=settings.anthropic_max_tokens,
-        )
-    return OpenAILLMProvider(
-        settings.openai_api_key,
-        default_model=settings.llm_model,
-        observability=observability,
-        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-        request_timeout=settings.llm_request_timeout_seconds,
-    )
+    return build_llm_provider(settings, observability=observability)
 
 
 def _build_embedding_provider(

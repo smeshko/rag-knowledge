@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     # 400, since DeepSeek's response_format accepts only text/json_object) load
     # clean and fail at the first request. See providers.llm.openai for the values.
     llm_structured_output_mode: str | None = None
+    # The identity label runs against llm_base_url are recorded under. Required
+    # whenever llm_base_url is set (enforced below): the label is written to every
+    # ExtractionRun row and is part of the extraction cache key, so retargeting the
+    # URL while leaving the label at "openai" would file another vendor's runs as
+    # OpenAI's and let the two satisfy each other's cache lookups.
+    llm_provider_label: str | None = None
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request
     # timeout. retries=0 disables retries (raise on the first 429); the timeout
     # is a float so it feeds chat.completions.create(timeout=…) without a cast.
@@ -224,8 +230,12 @@ class Settings(BaseSettings):
     @classmethod
     def _llm_provider_supported(cls, value: str) -> str:
         # Reject an unsupported provider at load so a typo (e.g. "gemini") fails
-        # fast rather than falling through to the OpenAI branch at runtime.
-        supported = {"openai", "anthropic"}
+        # fast rather than falling through to the OpenAI branch at runtime. The
+        # allow-list is the provider registry itself (Epic 23.4), so registering a
+        # provider does not also require editing a literal set here.
+        from rag_recipes.providers.llm.registry import supported_providers
+
+        supported = supported_providers()
         if value not in supported:
             raise ValueError(
                 f"llm_provider must be one of {sorted(supported)}; got {value!r}"
@@ -248,15 +258,38 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
-    def _anthropic_api_key_required_when_selected(self) -> Settings:
+    def _provider_api_key_required_when_selected(self) -> Settings:
         # A class default can't reference a sibling field, so the cross-field rule
-        # (key required when Anthropic is selected) lives here. Fails at Settings
-        # load with a message naming the missing field rather than at the first
-        # call. Note this does NOT narrow anthropic_api_key to str for mypy, so
-        # the factories (TASK-003) still narrow str | None → str before use.
-        if self.llm_provider == "anthropic" and not self.anthropic_api_key:
+        # (key required when the provider needing it is selected) lives here. Fails
+        # at Settings load with a message naming the missing field rather than at
+        # the first call. Generic over the registry since Epic 23.4, but the message
+        # is byte-identical to the pre-registry Anthropic-specific one — it is
+        # user-facing config feedback, and that refactor changed no behaviour.
+        # api_key_field is None for providers whose key is already unconditionally
+        # required (openai), so this never fires on an empty-string openai_api_key.
+        # Note this does NOT narrow the key to str for mypy; the registry factories
+        # still narrow str | None → str before use.
+        from rag_recipes.providers.llm.registry import get_spec
+
+        field = get_spec(self.llm_provider).api_key_field
+        if field is not None and not getattr(self, field):
             raise ValueError(
-                "anthropic_api_key is required when llm_provider == 'anthropic'"
+                f"{field} is required when llm_provider == {self.llm_provider!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _base_url_requires_a_provider_label(self) -> Settings:
+        # The identity label a built-in registry entry uses is a constant. Setting
+        # llm_base_url alone would therefore file another vendor's generations under
+        # "openai" — and since the label is part of the extraction cache key, let the
+        # two vendors serve each other cached runs. That is the single hazard Epic
+        # 23.4 exists to prevent, so it must not be reachable with one env var.
+        if self.llm_base_url and not self.llm_provider_label:
+            raise ValueError(
+                "llm_provider_label is required when llm_base_url is set; the label "
+                "is recorded on every ExtractionRun and is part of the extraction "
+                "cache key, so a retargeted endpoint must carry its own identity"
             )
         return self
 
