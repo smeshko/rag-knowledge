@@ -85,6 +85,17 @@ class KnowledgeItem(Base):
     # so select_best can run over committed rows in the separate finalize
     # transaction. Nullable and ignored after finalize — purely a dedup signal.
     candidate_score: Mapped[float | None] = mapped_column(sa.Double, nullable=True)
+    # Epic 22.1: the audit trail for in-place review edits. ``pre_edit_snapshot``
+    # holds the ORIGINAL extraction (title, summary, body_text, structured_data,
+    # confidence) and is written once, on the first edit only — so it stays the
+    # model's output rather than the previous revision. It exists as an undo path
+    # and so the extraction evals keep scoring the model, not a human's
+    # correction of it. Both null means "never edited".
+    pre_edit_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    edited_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=False,

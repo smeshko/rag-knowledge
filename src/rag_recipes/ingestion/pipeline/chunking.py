@@ -26,16 +26,25 @@ chunks, never an empty chunk):
 
 ``text_hash`` reuses the canonical SHA-256-of-text approach (DECISIONS #3),
 matching ``pipeline/pdf_text._sha256_text``.
+
+The per-type text resolution itself lives in ``pipeline/composition`` (Epic
+22.1), shared with the ``body_text`` rebuild an edit performs, so the chunked
+text and the stored ``body_text`` cannot drift apart.
 """
 
 from __future__ import annotations
 
 import hashlib
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rag_recipes.ingestion.pipeline.composition import (
+    compose_body_text,
+    is_present,
+    resolve_ingredients_text,
+    resolve_steps_text,
+)
 from rag_recipes.storage.enums import ChunkParentType, ChunkType, KnowledgeItemStatus
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
@@ -45,34 +54,6 @@ __all__ = ["build_chunks", "persist_chunks_for_ready_items"]
 
 def _sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _is_present(text: str | None) -> bool:
-    """A source text counts only when it has non-whitespace content."""
-    return bool(text and text.strip())
-
-
-def _resolve_ingredients(structured: dict[str, Any]) -> str:
-    """``ingredients_text`` when present, else the ingredient list's ``raw_text``."""
-    text = structured.get("ingredients_text")
-    if _is_present(text):
-        return text  # type: ignore[return-value]
-    ingredients = structured.get("ingredients") or []
-    return "\n".join(item.get("raw_text", "") for item in ingredients)
-
-
-def _resolve_steps(structured: dict[str, Any]) -> str:
-    """``steps_text`` when present, else the step list's ``text`` fields."""
-    text = structured.get("steps_text")
-    if _is_present(text):
-        return text  # type: ignore[return-value]
-    steps = structured.get("steps") or []
-    return "\n".join(step.get("text", "") for step in steps)
-
-
-def _join_blocks(blocks: list[str]) -> str:
-    """Concatenate the non-empty text blocks separated by a blank line."""
-    return "\n\n".join(block for block in blocks if _is_present(block))
 
 
 def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
@@ -93,12 +74,12 @@ def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
 
     title_text = item.title or ""
     summary_text = item.summary or ""
-    ingredients_text = _resolve_ingredients(structured)
-    steps_text = _resolve_steps(structured)
+    ingredients_text = resolve_ingredients_text(structured)
+    steps_text = resolve_steps_text(structured)
 
     body_text = item.body_text or ""
-    if not _is_present(body_text):
-        body_text = _join_blocks([title_text, ingredients_text, steps_text])
+    if not is_present(body_text):
+        body_text = compose_body_text(title=title_text, structured=structured)
 
     candidates: list[tuple[ChunkType, str]] = [
         (ChunkType.RECIPE_TITLE, title_text),
@@ -110,7 +91,7 @@ def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
 
     chunks: list[Chunk] = []
     for chunk_type, text in candidates:
-        if not _is_present(text):
+        if not is_present(text):
             continue
         chunks.append(
             Chunk(

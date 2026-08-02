@@ -27,11 +27,10 @@ The caller owns the transaction: this module ``flush()``es (to surface FK /
 
 from __future__ import annotations
 
-import unicodedata
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.config import get_settings
+from rag_recipes.ingestion.pipeline.composition import normalize_title
 from rag_recipes.ingestion.pipeline.extraction import ExtractedRecipe
 from rag_recipes.ingestion.pipeline.windows import Window
 from rag_recipes.ingestion.validation import (
@@ -43,18 +42,10 @@ from rag_recipes.ingestion.validation import (
 from rag_recipes.storage.enums import KnowledgeItemStatus
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
+# ``normalize_title`` now lives in the pure ``pipeline/composition`` module (so
+# the Epic 22.1 edit layer can reach it without importing a session or
+# ``Settings``) and is re-exported here for this module's existing callers.
 __all__ = ["normalize_title", "persist_knowledge_item"]
-
-
-def normalize_title(title: str) -> str:
-    """Deterministically normalize a title for dedup/lookup (doc 2 § 4).
-
-    Unicode-NFC → lowercase → collapse internal whitespace runs to a single
-    space → strip. Pure, locale-independent, and idempotent
-    (``"Tomato and White Bean Soup"`` → ``"tomato and white bean soup"``).
-    """
-    folded = unicodedata.normalize("NFC", title).lower()
-    return " ".join(folded.split())
 
 
 def _thresholds_from_settings() -> SoftValidationThresholds:

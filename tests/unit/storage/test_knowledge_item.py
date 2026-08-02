@@ -29,6 +29,9 @@ def test_table_columns_match_doc_2() -> None:
         "confidence",
         "status",
         "candidate_score",
+        # Epic 22.1 review-edit audit trail.
+        "pre_edit_snapshot",
+        "edited_at",
         "created_at",
         "updated_at",
     ]
@@ -61,6 +64,10 @@ def test_nullable_columns() -> None:
     assert cols["summary"].nullable is True
     assert cols["confidence"].nullable is True
     assert cols["candidate_score"].nullable is True
+    # Both null together means "never edited" — no backfill, so every
+    # pre-existing row reads back as unedited (Epic 22.1).
+    assert cols["pre_edit_snapshot"].nullable is True
+    assert cols["edited_at"].nullable is True
     for name in [
         "id",
         "document_id",
