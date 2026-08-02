@@ -30,18 +30,18 @@ a delete-and-re-embed path that does not exist; the caller enforces the status.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from rag_recipes.ingestion.pipeline.composition import compose_body_text
+from rag_recipes.ingestion.pipeline.composition import compose_body_text, normalize_title
 from rag_recipes.ingestion.pipeline.extraction import (
     SCHEMA_VERSION,
     ExtractedRecipe,
     RecipeConfidence,
     RecipeV1StructuredData,
 )
-from rag_recipes.ingestion.pipeline.persist import normalize_title
 from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
 
 __all__ = [
@@ -182,7 +182,7 @@ def _edit_ingredients(existing: list[dict[str, Any]], lines: list[str]) -> list[
     for index, line in enumerate(lines, start=1):
         pool = available.get(line)
         if pool:
-            rows.append({**pool.popleft(), "position": index})
+            rows.append({**deepcopy(pool.popleft()), "position": index})
             continue
         rows.append(
             {
@@ -208,7 +208,7 @@ def _edit_steps(existing: list[dict[str, Any]], lines: list[str]) -> list[dict[s
     for index, line in enumerate(lines, start=1):
         pool = available.get(line)
         if pool:
-            rows.append({**pool.popleft(), "step_number": index})
+            rows.append({**deepcopy(pool.popleft()), "step_number": index})
             continue
         rows.append(
             {
@@ -228,6 +228,17 @@ def _rows(structured: dict[str, Any], key: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [row for row in value if isinstance(row, dict)]
+
+
+def _text(row: dict[str, Any], key: str) -> str:
+    """One row's text, coerced — a null in JSONB must not raise on a join."""
+    value = row.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _join_lines(structured: dict[str, Any], list_key: str, text_key: str) -> str:
+    """Recompose a text block from its row list."""
+    return "\n".join(_text(row, text_key) for row in _rows(structured, list_key))
 
 
 def apply_edit(
@@ -256,7 +267,11 @@ def apply_edit(
     new_title = title if isinstance(edit.title, Unset) else edit.title
     new_summary = summary if isinstance(edit.summary, Unset) else edit.summary
 
-    structured: dict[str, Any] = dict(structured_data)
+    # Deep copy, not `dict(...)`: the caller passes a SQLAlchemy-loaded JSONB
+    # dict, and sharing a nested list or confidence dict between the input and
+    # the result means a later in-place tweak of one silently rewrites the other
+    # — including the pre-edit snapshot the caller builds from the input.
+    structured: dict[str, Any] = deepcopy(structured_data)
     for attr, key in (
         ("yield_", "yield"),
         ("prep_time", "prep_time"),
@@ -267,28 +282,30 @@ def apply_edit(
         if not isinstance(value, Unset):
             structured[key] = value
 
-    lines_changed = False
+    ingredients_changed = False
+    steps_changed = False
     if not isinstance(edit.ingredients, Unset):
         existing = _rows(structured, "ingredients")
         rows = _edit_ingredients(existing, edit.ingredients)
-        if rows != existing:
-            lines_changed = True
+        ingredients_changed = rows != existing
         structured["ingredients"] = rows
     if not isinstance(edit.steps, Unset):
         existing = _rows(structured, "steps")
         rows = _edit_steps(existing, edit.steps)
-        if rows != existing:
-            lines_changed = True
+        steps_changed = rows != existing
         structured["steps"] = rows
 
+    # Only the submitted list's own text block is refreshed. Rewriting the other
+    # one would destroy content that lives in the blob but not in the rows — an
+    # item flagged ``no_steps`` keeps its method prose in ``steps_text``, and an
+    # ingredients-only edit must not wipe it.
+    if ingredients_changed:
+        structured["ingredients_text"] = _join_lines(structured, "ingredients", "raw_text")
+    if steps_changed:
+        structured["steps_text"] = _join_lines(structured, "steps", "text")
+
     new_body_text = body_text
-    if lines_changed:
-        structured["ingredients_text"] = "\n".join(
-            row.get("raw_text", "") for row in _rows(structured, "ingredients")
-        )
-        structured["steps_text"] = "\n".join(
-            row.get("text", "") for row in _rows(structured, "steps")
-        )
+    if ingredients_changed or steps_changed:
         new_body_text = compose_body_text(title=new_title, structured=structured)
 
     return EditedItem(
@@ -297,7 +314,7 @@ def apply_edit(
         summary=new_summary,
         body_text=new_body_text,
         structured_data=structured,
-        body_text_rebuilt=lines_changed,
+        body_text_rebuilt=ingredients_changed or steps_changed,
     )
 
 
@@ -309,13 +326,30 @@ def _confidence_value(source: dict[str, Any], key: str) -> float:
     return float(value)
 
 
+def _int_or(value: Any, fallback: int) -> int:
+    """Coerce a persisted integer, tolerating a null or a junk value.
+
+    Every guard in this reconstruction exists because a raise here would be a
+    500 on the edit endpoint. Nothing in the ingest path writes these shapes —
+    they are defence against hand-edited or future rows, not a known case.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return fallback
+    return value
+
+
+def _str_or_none(value: Any) -> str | None:
+    """Coerce a persisted optional string, mapping any other type to ``None``."""
+    return value if isinstance(value, str) else None
+
+
 def _ingredient_for_validation(row: dict[str, Any], position: int) -> dict[str, Any]:
     """Project a persisted ingredient row onto the ``recipe.v1`` model shape."""
     confidence = row.get("confidence")
     confidence = confidence if isinstance(confidence, dict) else {}
     return {
-        "position": row.get("position", position),
-        "raw_text": str(row.get("raw_text", "")),
+        "position": _int_or(row.get("position"), position),
+        "raw_text": _text(row, "raw_text"),
         **{name: row.get(name) for name in _NULLED_INGREDIENT_FIELDS},
         "confidence": {
             name: _confidence_value(confidence, name)
@@ -330,9 +364,11 @@ def _step_for_validation(row: dict[str, Any], step_number: int) -> dict[str, Any
     confidence = confidence if isinstance(confidence, dict) else {}
     span_ids = row.get("source_span_ids")
     return {
-        "step_number": row.get("step_number", step_number),
-        "text": str(row.get("text", "")),
-        "source_span_ids": list(span_ids) if isinstance(span_ids, list) else [],
+        "step_number": _int_or(row.get("step_number"), step_number),
+        "text": _text(row, "text"),
+        "source_span_ids": [s for s in span_ids if isinstance(s, str)]
+        if isinstance(span_ids, list)
+        else [],
         "confidence": {
             name: _confidence_value(confidence, name) for name in ("overall", "ordering")
         },
@@ -377,17 +413,17 @@ def warnings_for_item(
         source_span_ids=list(source_span_ids),
         structured_data=RecipeV1StructuredData.model_validate(
             {
-                "schema": structured_data.get("schema", SCHEMA_VERSION),
-                "yield": structured_data.get("yield"),
-                "prep_time": structured_data.get("prep_time"),
-                "cook_time": structured_data.get("cook_time"),
-                "total_time": structured_data.get("total_time"),
-                "ingredients_text": structured_data.get("ingredients_text"),
+                "schema": _str_or_none(structured_data.get("schema")) or SCHEMA_VERSION,
+                "yield": _str_or_none(structured_data.get("yield")),
+                "prep_time": _str_or_none(structured_data.get("prep_time")),
+                "cook_time": _str_or_none(structured_data.get("cook_time")),
+                "total_time": _str_or_none(structured_data.get("total_time")),
+                "ingredients_text": _str_or_none(structured_data.get("ingredients_text")),
                 "ingredients": [
                     _ingredient_for_validation(row, index)
                     for index, row in enumerate(_rows(structured_data, "ingredients"), start=1)
                 ],
-                "steps_text": structured_data.get("steps_text"),
+                "steps_text": _str_or_none(structured_data.get("steps_text")),
                 "steps": [
                     _step_for_validation(row, index)
                     for index, row in enumerate(_rows(structured_data, "steps"), start=1)

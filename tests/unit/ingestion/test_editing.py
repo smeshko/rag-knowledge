@@ -9,7 +9,9 @@ the soft-validation warning codes), so what these tests feed ``apply_edit`` and
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -386,6 +388,83 @@ def test_editing_lines_refreshes_the_precomputed_text_blocks() -> None:
     assert "1 onion, diced" not in result.body_text
 
 
+def test_editing_one_list_leaves_the_other_list_text_block_untouched() -> None:
+    """An ingredients-only edit must not wipe the method prose.
+
+    ``steps_text`` wins over the ``steps`` rows wherever text is resolved, so an
+    item flagged ``no_steps`` keeps its whole method in that blob. Rewriting it
+    from an empty row list would destroy the item's steps — content the edit
+    never named.
+    """
+    row = _persist(_recipe(steps=[]))
+    row["structured_data"]["steps_text"] = "1. Preheat the oven.\n2. Roast for 40 minutes."
+
+    result = apply_edit(
+        **_edit_fields(row),
+        edit=RecipeEdit(ingredients=["2 tbsp olive oil", "3 ripe tomatoes"]),
+    )
+
+    assert result.structured_data["steps_text"] == (
+        "1. Preheat the oven.\n2. Roast for 40 minutes."
+    )
+    assert "Roast for 40 minutes" in result.body_text
+
+
+def test_editing_steps_leaves_the_ingredients_text_block_untouched() -> None:
+    """The symmetric case: section headings in ``ingredients_text`` survive."""
+    row = _persist(_recipe())
+    row["structured_data"]["ingredients_text"] = (
+        "For the soup:\n2 tbsp olive oil\n\nFor the garnish:\nchives"
+    )
+
+    result = apply_edit(
+        **_edit_fields(row),
+        edit=RecipeEdit(steps=["Heat the oil in a large pot.", "Simmer for 20 minutes."]),
+    )
+
+    assert result.structured_data["ingredients_text"] == (
+        "For the soup:\n2 tbsp olive oil\n\nFor the garnish:\nchives"
+    )
+    assert "For the garnish:" in result.body_text
+
+
+def test_the_result_shares_no_mutable_state_with_the_input() -> None:
+    """The caller builds a pre-edit snapshot from the same row it passes in.
+
+    If the two shared a nested dict or list, a later in-place tweak of the new
+    value would silently rewrite the snapshot of the original extraction.
+    """
+    row = _persist(_recipe())
+    structured_in = row["structured_data"]
+
+    result = apply_edit(**_edit_fields(row), edit=RecipeEdit(title="Renamed"))
+    out = result.structured_data
+
+    assert out is not structured_in
+    assert out["ingredients"] is not structured_in["ingredients"]
+    assert out["steps"] is not structured_in["steps"]
+    assert out["ingredients"][0]["confidence"] is not structured_in["ingredients"][0]["confidence"]
+
+    out["ingredients"][0]["confidence"]["overall"] = 0.0
+    out["steps"][0]["source_span_ids"].append("span_999")
+    assert structured_in["ingredients"][0]["confidence"]["overall"] == 0.9
+    assert structured_in["steps"][0]["source_span_ids"] == ["span_001"]
+
+
+def test_reordered_rows_are_copies_too() -> None:
+    row = _persist(_recipe())
+    structured_in = row["structured_data"]
+
+    result = apply_edit(
+        **_edit_fields(row),
+        edit=RecipeEdit(ingredients=["1 onion, diced", "2 tbsp olive oil"]),
+    )
+
+    moved = result.structured_data["ingredients"][1]
+    assert moved["raw_text"] == "2 tbsp olive oil"
+    assert moved["confidence"] is not structured_in["ingredients"][0]["confidence"]
+
+
 def test_resubmitting_identical_lines_does_not_rebuild_the_body() -> None:
     row = _persist(_recipe())
 
@@ -579,18 +658,86 @@ def test_warnings_are_recomputed_not_carried_forward() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_editing_module_imports_no_session_provider_or_settings() -> None:
-    """``editing`` is pure, on the same contract as ``validation``."""
-    source = inspect.getsource(editing_module)
+_FORBIDDEN_ROOTS = ("sqlalchemy", "arq", "redis", "fastapi", "httpx")
+_FORBIDDEN_MODULES = ("rag_recipes.config", "rag_recipes.providers", "rag_recipes.storage")
+# The declared home of the recipe.v1 models (Epic 9) also holds `run_extraction`,
+# so it carries a session import. `validation.py` — the module this purity
+# contract mirrors — depends on it for exactly the same reason, so it is the
+# boundary of the pure layer rather than a violation of it.
+_MODEL_HOME = (
+    "rag_recipes.ingestion.pipeline.extraction",
+    "rag_recipes.ingestion.pipeline.windows",
+)
+
+
+def _direct_imports(module: ModuleType) -> set[str]:
     imported: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module)
+    return imported
 
-    forbidden = {"sqlalchemy", "arq", "redis", "fastapi", "rag_recipes.config"}
-    assert not {name for name in imported if name.split(".")[0] in {"sqlalchemy", "arq", "fastapi"}}
-    assert not (imported & forbidden)
-    assert not any(name.startswith("rag_recipes.providers") for name in imported)
-    assert not any(name.startswith("rag_recipes.storage") for name in imported)
+
+def test_editing_module_imports_no_session_provider_or_settings() -> None:
+    """``editing`` is pure, on the same contract as ``validation``.
+
+    Walked **transitively** across first-party modules: importing a pure-looking
+    helper out of a module that itself drags in ``get_settings`` would satisfy a
+    direct-imports-only check while breaking the contract in fact — which is
+    exactly how ``normalize_title`` was first wired.
+    """
+    seen: set[str] = set()
+    queue = [editing_module]
+    offenders: list[str] = []
+    while queue:
+        module = queue.pop()
+        if module.__name__ in seen:
+            continue
+        seen.add(module.__name__)
+        for name in _direct_imports(module):
+            if name.split(".")[0] in _FORBIDDEN_ROOTS or name.startswith(_FORBIDDEN_MODULES):
+                offenders.append(f"{module.__name__} -> {name}")
+            elif name.startswith("rag_recipes.") and not name.startswith(_MODEL_HOME):
+                queue.append(importlib.import_module(name))
+
+    assert offenders == []
+
+
+# --------------------------------------------------------------------------- #
+# Robustness — a raise here would be a 500 on the edit endpoint
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda s: s["ingredients"][0].update(position=None), id="null-position"),
+        pytest.param(lambda s: s["ingredients"][0].update(raw_text=None), id="null-raw-text"),
+        pytest.param(lambda s: s["steps"][0].update(step_number=None), id="null-step-number"),
+        pytest.param(lambda s: s["steps"][0].update(text=None), id="null-step-text"),
+        pytest.param(lambda s: s["steps"][0].update(source_span_ids=[None]), id="junk-span-id"),
+        pytest.param(lambda s: s.update(schema=None), id="null-schema"),
+        pytest.param(lambda s: s.update(**{"yield": 4}), id="non-string-yield"),
+        pytest.param(lambda s: s.update(ingredients="not a list"), id="ingredients-not-a-list"),
+        pytest.param(lambda s: s.update(confidence_junk=object()), id="unknown-key"),
+    ],
+)
+def test_junk_in_a_persisted_row_never_raises(mutate: Any) -> None:
+    row = _persist(_recipe())
+    mutate(row["structured_data"])
+
+    warnings = warnings_for_item(
+        title=row["title"],
+        summary=row["summary"],
+        body_text=row["body_text"],
+        source_span_ids=row["source_span_ids"],
+        structured_data=row["structured_data"],
+        confidence=row["confidence"],
+        thresholds=THRESHOLDS,
+    )
+    edited = apply_edit(**_edit_fields(row), edit=RecipeEdit(steps=["A new step."]))
+
+    assert isinstance(warnings, list)
+    assert isinstance(edited.body_text, str)

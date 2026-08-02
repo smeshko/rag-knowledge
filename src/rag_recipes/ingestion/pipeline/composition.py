@@ -19,20 +19,61 @@ The resolution rules are doc 5's per-type source rules:
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
 __all__ = [
     "compose_body_text",
     "is_present",
     "join_blocks",
+    "normalize_title",
     "resolve_ingredients_text",
     "resolve_steps_text",
 ]
 
 
-def is_present(text: str | None) -> bool:
-    """A source text counts only when it has non-whitespace content."""
-    return bool(text and text.strip())
+def normalize_title(title: str) -> str:
+    """Deterministically normalize a title for dedup/lookup (doc 2 § 4).
+
+    Unicode-NFC → lowercase → collapse internal whitespace runs to a single
+    space → strip. Pure, locale-independent, and idempotent
+    (``"Tomato and White Bean Soup"`` → ``"tomato and white bean soup"``).
+
+    Lives here rather than in ``pipeline/persist`` (which re-exports it for its
+    existing callers) so the pure edit layer can reach it without importing a
+    module that pulls in a session and ``Settings``.
+    """
+    folded = unicodedata.normalize("NFC", title).lower()
+    return " ".join(folded.split())
+
+
+def is_present(text: object) -> bool:
+    """A source text counts only when it is a string with non-whitespace content.
+
+    Typed against ``object`` rather than ``str | None`` because the callers read
+    unwrapped ``JSONB``, where a number or a list is structurally possible; a
+    non-string is simply absent rather than an exception.
+    """
+    return isinstance(text, str) and bool(text.strip())
+
+
+def _row_texts(structured: dict[str, Any], list_key: str, text_key: str) -> str:
+    """Join one field across a JSONB row list, tolerating junk entries.
+
+    ``structured_data`` is unwrapped ``JSONB``: nothing at the database level
+    stops a hand-edited row from holding a scalar where a list belongs, or a
+    null where a string does. Anything that is not a string is skipped rather
+    than raised on — a degraded row must not take down chunking or an edit.
+    """
+    rows = structured.get(list_key)
+    if not isinstance(rows, list):
+        return ""
+    texts = [
+        row.get(text_key)
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get(text_key), str)
+    ]
+    return "\n".join(text for text in texts if isinstance(text, str))
 
 
 def resolve_ingredients_text(structured: dict[str, Any]) -> str:
@@ -40,8 +81,7 @@ def resolve_ingredients_text(structured: dict[str, Any]) -> str:
     text = structured.get("ingredients_text")
     if is_present(text):
         return text  # type: ignore[return-value]
-    ingredients = structured.get("ingredients") or []
-    return "\n".join(item.get("raw_text", "") for item in ingredients)
+    return _row_texts(structured, "ingredients", "raw_text")
 
 
 def resolve_steps_text(structured: dict[str, Any]) -> str:
@@ -49,8 +89,7 @@ def resolve_steps_text(structured: dict[str, Any]) -> str:
     text = structured.get("steps_text")
     if is_present(text):
         return text  # type: ignore[return-value]
-    steps = structured.get("steps") or []
-    return "\n".join(step.get("text", "") for step in steps)
+    return _row_texts(structured, "steps", "text")
 
 
 def join_blocks(blocks: list[str]) -> str:
