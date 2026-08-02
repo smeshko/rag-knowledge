@@ -7,11 +7,13 @@ sub-app cuts real cookbook page ranges into fixture candidates (Epic 23.1).
 Provider/``Settings`` imports stay lazy inside the command bodies, so importing
 this module (and rendering ``--help``) can never issue a live call — that
 includes ``evals.fixture_cutter``, which pulls in the PyMuPDF provider.
-``_build_llm_provider`` below is the **only** live-provider construction site
-in the extraction harness — the driver takes the provider injected, and tests
-monkeypatch this seam with ``FakeLLMProvider``. **Running** ``retrieval``
-builds the default in-process search caller, which reaches real providers and
-therefore needs operator credentials, a reachable database and Redis (see
+``_build_llm_provider`` and ``_build_judge_provider`` below are the **only**
+live-provider construction sites in the extraction harness — the drivers take
+providers injected, and tests monkeypatch these seams with ``FakeLLMProvider``.
+The two are separate so a cross-provider comparison is not each candidate
+grading itself (Epic 23.3). **Running** ``retrieval`` builds the default
+in-process search caller, which reaches real providers and therefore needs
+operator credentials, a reachable database and Redis (see
 ``evals.retrieval._default_search``).
 """
 
@@ -55,6 +57,33 @@ def _build_llm_provider(settings: Settings) -> LLMProvider:
     from rag_recipes.providers.llm.registry import build_llm_provider
 
     return build_llm_provider(settings)
+
+
+def _build_judge_provider(settings: Settings) -> LLMProvider | None:
+    """Construct a separate provider for the LLM judge, or ``None`` (Epic 23.3).
+
+    ``None`` when neither ``judge_llm_provider`` nor ``judge_llm_model`` is set —
+    and that is deliberately ``None`` rather than "a second provider configured
+    identically". The driver then reuses the *same object* for both roles, which
+    is exactly today's behaviour, rather than an equivalent-but-distinct one that
+    would double provider construction for no benefit.
+
+    When set, the provider name and model are resolved independently. The model
+    falls back to the **judge provider's own** extraction model, never to
+    ``llm_model`` — sending the extraction provider's model id to a different
+    vendor is the failure Epic 19.1 DECISIONS #5 exists to prevent, and it would
+    reappear here for anyone who set ``JUDGE_LLM_PROVIDER`` alone.
+
+    Why this exists at all: with one provider serving both roles, a cross-provider
+    comparison grades every candidate with itself.
+    """
+    from rag_recipes.providers.llm.registry import build_llm_provider, resolve_extraction_model
+
+    if settings.judge_llm_provider is None and settings.judge_llm_model is None:
+        return None
+    name = settings.judge_llm_provider or settings.llm_provider
+    model = settings.judge_llm_model or resolve_extraction_model(settings, name)
+    return build_llm_provider(settings, provider_name=name, model=model)
 
 
 @app.command("extraction")

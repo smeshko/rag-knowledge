@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     deepseek_llm_model: str = "deepseek-v4-pro"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
 
+    # Judge provider/model for the eval harness (Epic 23.3). Both None by default,
+    # meaning "the judge runs on the same provider as the model under test" — i.e.
+    # today's behaviour. Setting them is what makes a cross-provider comparison
+    # meaningful: with one provider serving both roles, every candidate grades
+    # itself. `None` rather than a concrete default on purpose, so an Anthropic
+    # deployment's behaviour does not silently change the moment this ships.
+    judge_llm_provider: str | None = None
+    judge_llm_model: str | None = None
+
     llm_model: str = "gpt-4.1"
     # Retarget the OpenAI SDK at any OpenAI-*compatible* endpoint (Epic 23.4).
     # None keeps the SDK's own default (api.openai.com). This is transport only:
@@ -252,6 +261,22 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("judge_llm_provider")
+    @classmethod
+    def _judge_llm_provider_supported(cls, value: str | None) -> str | None:
+        # Same registry allow-list as llm_provider, but None is meaningful here:
+        # it is the "judge on the extraction provider" sentinel, not an absence.
+        from rag_recipes.providers.llm.registry import supported_providers
+
+        if value is None:
+            return value
+        supported = supported_providers()
+        if value not in supported:
+            raise ValueError(
+                f"judge_llm_provider must be one of {sorted(supported)}; got {value!r}"
+            )
+        return value
+
     @field_validator("llm_structured_output_mode")
     @classmethod
     def _structured_output_mode_supported(cls, value: str | None) -> str | None:
@@ -286,6 +311,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"{field} is required when llm_provider == {self.llm_provider!r}"
             )
+        # Epic 23.3: the judge may run on a different provider, which needs its own
+        # key. Checked here rather than at the first judge call because that call
+        # happens *after* extraction has already spent money on the run.
+        judge_provider = self.judge_llm_provider
+        if judge_provider is not None:
+            judge_field = get_spec(judge_provider).api_key_field
+            if judge_field is not None and not getattr(self, judge_field):
+                raise ValueError(
+                    f"{judge_field} is required when judge_llm_provider == {judge_provider!r}"
+                )
         return self
 
     @model_validator(mode="after")
