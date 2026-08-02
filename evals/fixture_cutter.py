@@ -391,21 +391,34 @@ async def cut_fixtures(
 
         results: list[CutResult] = []
         for staged_dir, result in staged:
-            _publish(staged_dir, result.path, staging)
+            _publish(staged_dir, result.path)
             results.append(result)
         return results
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _publish(staged_dir: Path, target: Path, staging: Path) -> None:
-    """Move a fully-rendered staging dir onto ``target`` atomically."""
-    if target.exists():
-        # os.replace refuses a non-empty destination directory, so the existing
-        # fixture is renamed aside (atomic) and only then deleted.
-        displaced = staging / f".replaced-{target.name}"
-        os.replace(target, displaced)
+def _publish(staged_dir: Path, target: Path) -> None:
+    """Move a fully-rendered staging dir onto ``target`` atomically.
+
+    On overwrite the existing fixture is displaced to a sibling **inside the
+    set directory**, never into the staging dir: staging is ``rmtree``-d by
+    :func:`cut_fixtures`'s ``finally``, so a failure between the two
+    ``os.replace`` calls would take the original fixture — and any hand-authored
+    ``expected.json`` it carries — down with it. Displaced-aside stays on disk
+    until the new fixture is in place, and is restored if publishing fails.
+    """
+    if not target.exists():
         os.replace(staged_dir, target)
-        shutil.rmtree(displaced, ignore_errors=True)
-    else:
+        return
+    # os.replace refuses a non-empty destination directory, so the existing
+    # fixture is renamed aside (atomic) and only deleted once the new one lands.
+    displaced = target.parent / f".replaced-{target.name}"
+    shutil.rmtree(displaced, ignore_errors=True)  # stale leftover from a crash
+    os.replace(target, displaced)
+    try:
         os.replace(staged_dir, target)
+    except BaseException:
+        os.replace(displaced, target)
+        raise
+    shutil.rmtree(displaced, ignore_errors=True)

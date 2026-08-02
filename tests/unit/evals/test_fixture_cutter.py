@@ -9,6 +9,7 @@ real cookbook under ``~/Downloads/books``.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import evals.fixture_cutter
@@ -394,11 +395,11 @@ async def test_publish_failure_leaves_no_half_written_fixture(
     real_publish = evals.fixture_cutter._publish
     calls: list[Path] = []
 
-    def _flaky(staged_dir: Path, target: Path, staging: Path) -> None:
+    def _flaky(staged_dir: Path, target: Path) -> None:
         calls.append(target)
         if len(calls) == 2:
             raise OSError("simulated interruption")
-        real_publish(staged_dir, target, staging)
+        real_publish(staged_dir, target)
 
     monkeypatch.setattr(evals.fixture_cutter, "_publish", _flaky)
     with pytest.raises(OSError, match="simulated interruption"):
@@ -409,6 +410,53 @@ async def test_publish_failure_leaves_no_half_written_fixture(
     # The first fixture is whole; the second never appeared, half-written or not.
     assert published == ["sample-recipe-p1-1"]
     validate_candidate_layout(set_dir / "sample-recipe-p1-1")
+
+
+async def test_failed_overwrite_leaves_the_original_fixture_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive the *real* ``_publish`` overwrite branch through a mid-publish failure.
+
+    The sibling test above monkeypatches ``_publish`` wholesale, so this branch
+    would otherwise be untested. Displacing the old fixture into the staging dir
+    (its earlier shape) hands it to the ``finally: rmtree(staging)`` when the
+    second ``os.replace`` fails: the new fixture is never published *and* the
+    original — with any hand-authored ``expected.json`` — is destroyed.
+    """
+    [first] = await _cut(tmp_path, [(1, 1)], rationales=["original"])
+    original_source = (first.path / "source.md").read_text(encoding="utf-8")
+    golden = first.path / "expected.json"
+    golden.write_text('{"recipes": []}', encoding="utf-8")
+
+    real_replace = os.replace
+    replaces: list[object] = []
+
+    def _flaky_replace(src: object, dst: object, **kwargs: object) -> None:
+        replaces.append(dst)
+        # 1st: displace the original aside. 2nd: move the new fixture in — boom.
+        if len(replaces) == 2:
+            raise OSError("simulated interruption mid-publish")
+        real_replace(src, dst, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", _flaky_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        await _cut(
+            tmp_path,
+            [(1, 1)],
+            rationales=["replacement"],
+            overwrite=True,
+            invalidate_goldens=True,
+        )
+    monkeypatch.undo()
+
+    # The original is still on disk, whole, and still the *original*.
+    validate_candidate_layout(first.path)
+    assert (first.path / "source.md").read_text(encoding="utf-8") == original_source
+    assert golden.read_text(encoding="utf-8") == '{"recipes": []}'
+    notes = parse_notes_fields((first.path / "notes.md").read_text(encoding="utf-8"))
+    assert notes["rationale"] == "original"
+    # Nothing displaced was left lying around beside it.
+    assert sorted(p.name for p in _set_dir(tmp_path).iterdir()) == ["sample-recipe-p1-1"]
 
 
 async def test_staging_directory_is_cleaned_up_on_failure(tmp_path: Path) -> None:
