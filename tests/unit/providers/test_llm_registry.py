@@ -234,3 +234,95 @@ def test_openai_spec_has_no_conditional_key_field(monkeypatch: pytest.MonkeyPatc
 def test_get_spec_names_the_supported_set() -> None:
     with pytest.raises(ValueError, match="llm_provider must be one of"):
         get_spec("gemini")
+
+
+# --- deepseek: the third provider that proves the registry generalises -------
+
+
+def _deepseek_settings(monkeypatch: pytest.MonkeyPatch, **env: str) -> Settings:
+    return _settings(
+        monkeypatch, LLM_PROVIDER="deepseek", DEEPSEEK_API_KEY="sk-ds-test", **env
+    )
+
+
+def test_deepseek_builds_an_openai_transport_with_its_own_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _capture)
+    provider = build_llm_provider(_deepseek_settings(monkeypatch))
+
+    assert isinstance(provider, OpenAILLMProvider)
+    # Shared transport, separate identity. If this said "openai", DeepSeek's runs
+    # would satisfy OpenAI's extraction-cache lookups and vice versa.
+    assert provider.provider == "deepseek"
+    assert provider.default_model == "deepseek-v4-pro"
+    assert captured["base_url"] == "https://api.deepseek.com/v1"
+    assert captured["max_retries"] == 0
+
+
+def test_deepseek_defaults_to_strict_tool_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Its response_format offers text/json_object only — no json_schema variant."""
+    provider = build_llm_provider(_deepseek_settings(monkeypatch))
+    assert isinstance(provider, OpenAILLMProvider)
+    assert provider._mode == "strict_tool"
+
+
+def test_deepseek_rejects_json_schema_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A guaranteed 400 must fail at load, not mid-run during a paid eval."""
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-test")
+    monkeypatch.setenv("LLM_STRUCTURED_OUTPUT_MODE", "json_schema")
+    with pytest.raises(ValidationError, match="not supported by"):
+        Settings(_env_file=None)
+
+
+def test_deepseek_accepts_the_non_strict_tool_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 23.5's retreat if strict grammar compilation rejects recipe.v1.
+
+    Epic 19 hit exactly that on Anthropic ("compiled grammar is too large"), so
+    the fallback has to be reachable by config change, not by code change.
+    """
+    settings = _deepseek_settings(monkeypatch, LLM_STRUCTURED_OUTPUT_MODE="tool")
+    provider = build_llm_provider(settings)
+    assert isinstance(provider, OpenAILLMProvider)
+    assert provider._mode == "tool"
+
+
+def test_deepseek_key_is_required_when_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None)
+    assert "deepseek_api_key is required when llm_provider == 'deepseek'" in str(
+        excinfo.value
+    )
+
+
+def test_deepseek_answer_model_ignores_the_openai_shaped_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ANSWER_LLM_MODEL is a GPT id by convention; it must never reach DeepSeek.
+
+    Epic 19.1 DECISIONS #5 established this for Claude. Registering a third
+    provider without extending the rule would reintroduce the identical bug —
+    /answers under LLM_PROVIDER=deepseek routing `gpt-4.1-mini` to DeepSeek.
+    """
+    from rag_recipes.api.dependencies import resolve_answer_model
+
+    settings = _deepseek_settings(monkeypatch, ANSWER_LLM_MODEL="gpt-4.1-mini")
+    assert resolve_answer_model(settings) == "deepseek-v4-pro"
+
+
+def test_deepseek_is_in_the_allow_list() -> None:
+    assert "deepseek" in supported_providers()
+    assert get_spec("deepseek").api_key_field == "deepseek_api_key"

@@ -184,9 +184,56 @@ _ANTHROPIC = ProviderSpec(
     default_structured_output_mode="tool",
 )
 
+def _build_deepseek(
+    settings: Settings,
+    *,
+    model: str,
+    observability: ProviderObservability | None,
+) -> LLMProvider:
+    from rag_recipes.providers.llm.openai import OpenAILLMProvider, StructuredOutputMode
+
+    mode: StructuredOutputMode = _resolve_mode(settings, _DEEPSEEK)  # type: ignore[assignment]
+    return OpenAILLMProvider(
+        _require_key(settings, "deepseek_api_key"),
+        default_model=model,
+        # Its own identity, NOT "openai" — the transport is shared but the cache
+        # key and every ExtractionRun audit row must distinguish the two vendors.
+        provider="deepseek",
+        base_url=settings.deepseek_base_url,
+        structured_output_mode=mode,
+        observability=observability,
+        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
+        request_timeout=settings.llm_request_timeout_seconds,
+    )
+
+
+_DEEPSEEK = ProviderSpec(
+    name="deepseek",
+    factory=_build_deepseek,
+    model_field="deepseek_llm_model",
+    api_key_field="deepseek_api_key",
+    # DeepSeek's response_format accepts "text" and "json_object" only — there is
+    # no json_schema variant — so schema-constrained output has to go through a
+    # forced tool call. Pairing this entry with json_schema is rejected at load.
+    default_structured_output_mode="strict_tool",
+)
+
+#: Modes a provider's transport cannot serve, rejected at Settings load rather
+#: than at the first (possibly paid) request.
+_UNSUPPORTED_MODES: dict[str, frozenset[str]] = {
+    "deepseek": frozenset({"json_schema"}),
+}
+
+
+def unsupported_structured_output_modes(provider_name: str) -> frozenset[str]:
+    """Modes ``provider_name`` cannot serve. Read by ``Settings``' validator."""
+    return _UNSUPPORTED_MODES.get(provider_name, frozenset())
+
+
 _REGISTRY: dict[str, ProviderSpec] = {
     _OPENAI.name: _OPENAI,
     _ANTHROPIC.name: _ANTHROPIC,
+    _DEEPSEEK.name: _DEEPSEEK,
 }
 
 

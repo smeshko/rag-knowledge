@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     anthropic_batch_poll_interval_minutes: int = Field(default=5, ge=1)
     anthropic_batch_max_submit_attempts: int = Field(default=2, ge=1)
 
+    # DeepSeek (Epic 23.4) — OpenAI-compatible transport on its own endpoint, so
+    # it reuses OpenAILLMProvider rather than adding a client. deepseek_api_key is
+    # only required when selected (the registry-driven cross-field validator
+    # enforces that). The model id and base URL are settings, not constants,
+    # because both were established from a dated docs check rather than from a
+    # live call — Phase 23.5 may need to retarget without a code change.
+    deepseek_api_key: str | None = None
+    deepseek_llm_model: str = "deepseek-v4-pro"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+
     llm_model: str = "gpt-4.1"
     # Retarget the OpenAI SDK at any OpenAI-*compatible* endpoint (Epic 23.4).
     # None keeps the SDK's own default (api.openai.com). This is transport only:
@@ -275,6 +285,23 @@ class Settings(BaseSettings):
         if field is not None and not getattr(self, field):
             raise ValueError(
                 f"{field} is required when llm_provider == {self.llm_provider!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _structured_output_mode_serveable_by_provider(self) -> Settings:
+        # A mode the selected vendor's API does not offer is a guaranteed 400 on
+        # the first request. Rejecting it at load matters because that first
+        # request may be a paid eval run mid-flight (Phase 23.5), where the
+        # cheapest possible failure is one that happens before any spend.
+        from rag_recipes.providers.llm.registry import unsupported_structured_output_modes
+
+        mode = self.llm_structured_output_mode
+        unsupported = unsupported_structured_output_modes(self.llm_provider)
+        if mode is not None and mode in unsupported:
+            raise ValueError(
+                f"llm_structured_output_mode={mode!r} is not supported by "
+                f"llm_provider={self.llm_provider!r}"
             )
         return self
 

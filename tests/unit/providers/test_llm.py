@@ -206,6 +206,55 @@ class TestOpenAILLM(LLMContract):
         )
 
 
+_DEEPSEEK_REQUEST = StructuredOutputRequest(
+    provider="deepseek",
+    model="deepseek-v4-pro",
+    prompt_version="recipe-v1",
+    schema_version="recipe.v1",
+    input="Return ok=true",
+    json_schema=_STRICT_SCHEMA,
+)
+
+
+class TestDeepSeekLLM(LLMContract):
+    """The DeepSeek configuration must satisfy the same interface guarantees.
+
+    Same transport class as OpenAI, different endpoint, different identity, and
+    a forced tool call instead of response_format — so it is a genuinely
+    different code path through the provider, not a relabelled duplicate.
+
+    Note `LLMContract.test_reports_provider_and_model` asserts
+    `response.provider == sample_request.provider`, while the provider returns
+    `self.provider`. Both must therefore say "deepseek"; a mismatch here is the
+    contract checking label agreement, not the transport being broken.
+    """
+
+    @pytest.fixture
+    def provider(self) -> OpenAILLMProvider:
+        return OpenAILLMProvider(
+            api_key="sk-ds-test",
+            default_model="deepseek-v4-pro",
+            provider="deepseek",
+            base_url="https://api.deepseek.com/v1",
+            structured_output_mode="strict_tool",
+            client=_client(response=_tool_completion(arguments='{"ok": true}')),
+        )
+
+    @pytest.fixture
+    def sample_request(self) -> StructuredOutputRequest:
+        return _DEEPSEEK_REQUEST
+
+    @pytest.fixture
+    def failure_provider(self) -> OpenAILLMProvider:
+        return OpenAILLMProvider(
+            api_key="sk-ds-test",
+            default_model="deepseek-v4-pro",
+            provider="deepseek",
+            structured_output_mode="strict_tool",
+            client=_client(error=APITimeoutError(request=_REQUEST_OBJ)),
+        )
+
+
 # --- bespoke OpenAILLMProvider tests ----------------------------------------
 
 
