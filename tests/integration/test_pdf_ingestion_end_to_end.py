@@ -235,7 +235,9 @@ async def test_full_upload_to_needs_review_pathway(
                     )
                 )
             ).scalars().all()
-            assert len(spans) == 3
+            # One span per page; the generated sample PDF is 4 pages (page 4 is
+            # the sub-threshold 'Plate 4' caption added in epic 23.1).
+            assert len(spans) == 4
             failures = await FailuresRepository(session).list_failures(document_id)
             assert failures == []
     finally:
