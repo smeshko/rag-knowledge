@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -49,6 +50,9 @@ class ReviewItem(BaseModel):
     extraction: ReviewItemExtraction
     # 21.1's canonical {code, message} projection, reused verbatim.
     flags: list[ReviewReason]
+    # Null until a reviewer corrects the item in place (Epic 22.2), so the queue
+    # can mark a row as already corrected.
+    edited_at: datetime | None = None
 
 
 class ReviewItemListResponse(BaseModel):

@@ -1,0 +1,660 @@
+"""Integration tests for PATCH /api/v1/knowledge-items/{item_id} (Epic 22.2).
+
+The third review verb: correct a flagged item in place instead of waving it
+through broken or rejecting it. Editing never decides — the item is still
+``needs_review`` afterwards, with its content warnings re-derived.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
+
+import httpx
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from rag_recipes.api.app import app
+from rag_recipes.api.dependencies import get_session
+from rag_recipes.ingestion.pipeline.chunking import build_chunks
+from rag_recipes.storage.enums import (
+    DocumentStatus,
+    ExtractionRunStatus,
+    KnowledgeItemStatus,
+    SourceType,
+    UploadStatus,
+)
+from rag_recipes.storage.ids import new_id
+from rag_recipes.storage.models.chunk import Chunk
+from rag_recipes.storage.models.document import Document
+from rag_recipes.storage.models.extraction_run import ExtractionRun
+from rag_recipes.storage.models.knowledge_item import KnowledgeItem
+from rag_recipes.storage.models.source_span import SourceSpan
+from rag_recipes.storage.repositories.documents import DocumentRepository
+
+pytestmark = pytest.mark.asyncio
+
+_BODY_TEXT = "Bean Stew\n\n" + ("a slow-simmered pot of beans for a cold evening. " * 6)
+
+_STRUCTURED: dict[str, Any] = {
+    "schema": "recipe.v1",
+    "yield": "Serves 4",
+    "prep_time": None,
+    "cook_time": None,
+    "total_time": None,
+    "ingredients_text": None,
+    "ingredients": [
+        {
+            "position": 1,
+            "raw_text": "1 cup dried beans",
+            "quantity_text": "1",
+            "quantity_value": 1.0,
+            "unit_raw": "cup",
+            "unit_normalized": "cup",
+            "item_text": "dried beans",
+            "item_normalized": "beans",
+            "preparation": None,
+            "notes": None,
+            "confidence": {
+                "overall": 0.9,
+                "quantity": 0.9,
+                "unit": 0.9,
+                "item": 0.9,
+                "normalization": 0.9,
+            },
+        }
+    ],
+    "steps_text": None,
+    "steps": [],
+    "warnings": ["no_steps"],
+}
+
+_CONFIDENCE: dict[str, Any] = {
+    "overall": 0.9,
+    "boundary": 0.9,
+    "fields": {"title": 0.9, "summary": 0.9, "yield": 0.9, "ingredients": 0.9, "steps": 0.9},
+}
+
+
+@pytest.fixture
+def client(
+    db_session: AsyncSession,
+    override_settings_with_token: None,
+    auth_headers: dict[str, str],
+) -> Iterator[httpx.AsyncClient]:
+    async def _override_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    transport = httpx.ASGITransport(app=app)
+    try:
+        yield httpx.AsyncClient(
+            transport=transport, base_url="http://testserver", headers=auth_headers
+        )
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+
+
+async def _seed_document(
+    session: AsyncSession, *, status: DocumentStatus = DocumentStatus.NEEDS_REVIEW
+) -> Document:
+    repo = DocumentRepository(session)
+    aid = new_id("asset")
+    asset = await repo.add_source_asset(
+        id=aid,
+        source_type=SourceType.PDF,
+        original_filename="cookbook.pdf",
+        storage_provider="fake",
+        storage_key=f"source-assets/{aid}/original.pdf",
+        content_hash=hashlib.sha256(new_id("h").encode()).hexdigest(),
+        upload_status=UploadStatus.UPLOADED,
+    )
+    return await repo.add_document(
+        asset_id=asset.id,
+        category="recipes",
+        subcategory=None,
+        title="Edits Cookbook",
+        author="",
+        source_type=SourceType.PDF,
+        language=None,
+        active_source_version=None,
+        status=status,
+    )
+
+
+async def _seed_run(
+    session: AsyncSession, *, document_id: str, source_version: int = 1
+) -> ExtractionRun:
+    run = ExtractionRun(
+        document_id=document_id,
+        source_version=source_version,
+        provider="fake",
+        model="fake-model",
+        prompt_version="test-prompt-v1",
+        schema_version="test-schema-v1",
+        input_source_span_ids=[],
+        input_hash=new_id("hash"),
+        status=ExtractionRunStatus.SUCCESS,
+        output_json=None,
+    )
+    session.add(run)
+    await session.flush()
+    return run
+
+
+async def _seed_span(session: AsyncSession, *, document_id: str) -> SourceSpan:
+    text = "page text for the bean stew"
+    locator = {"type": "pdf_page_range", "page_start": 12, "page_end": 12}
+    span = SourceSpan(
+        id=new_id("span"),
+        document_id=document_id,
+        source_version=1,
+        source_type=SourceType.PDF,
+        locator=locator,
+        locator_hash=hashlib.sha256(str(locator).encode()).hexdigest(),
+        text=text,
+        text_hash=hashlib.sha256(text.encode()).hexdigest(),
+    )
+    session.add(span)
+    await session.flush()
+    return span
+
+
+async def _seed_item(
+    session: AsyncSession,
+    *,
+    run: ExtractionRun,
+    status: KnowledgeItemStatus = KnowledgeItemStatus.NEEDS_REVIEW,
+    span_ids: list[str] | None = None,
+    structured: dict[str, Any] | None = None,
+) -> KnowledgeItem:
+    item = KnowledgeItem(
+        document_id=run.document_id,
+        extraction_run_id=run.id,
+        source_version=run.source_version,
+        item_type="recipe",
+        title="Bean Stew",
+        normalized_title="bean stew",
+        summary="A hearty stew.",
+        body_text=_BODY_TEXT,
+        source_span_ids=span_ids or [],
+        structured_data=structured if structured is not None else _deep_copy(_STRUCTURED),
+        confidence=dict(_CONFIDENCE),
+        status=status,
+    )
+    session.add(item)
+    await session.flush()
+    return item
+
+
+def _deep_copy(value: dict[str, Any]) -> dict[str, Any]:
+    import copy
+
+    return copy.deepcopy(value)
+
+
+async def _reload(session: AsyncSession, item_id: str) -> KnowledgeItem:
+    """Re-read the row through a cleared identity map.
+
+    Every persistence assertion goes through this: it is what catches an
+    in-place JSONB mutation that was never dirty-tracked and silently vanished
+    at commit.
+    """
+    session.expunge_all()
+    item = await session.get(KnowledgeItem, item_id)
+    assert item is not None
+    return item
+
+
+# Long enough that the rebuilt body_text clears `extraction_min_recipe_chars`
+# (200) — a rebuild composes title + ingredients + steps, so a terse correction
+# genuinely trips `recipe_too_short`, and these tests are about the other rules.
+_FIXED_STEPS = [
+    "Soak the beans overnight in plenty of cold water, then drain them well.",
+    "Simmer with the aromatics for two hours, topping up the water as needed.",
+    "Season generously and rest the pot off the heat for a further ten minutes.",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Happy path
+# --------------------------------------------------------------------------- #
+
+
+async def test_partial_patch_changes_only_the_named_fields(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+    before = _deep_copy(item.structured_data)
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"title": "Smoky Bean Stew"}
+        )
+
+    assert resp.status_code == 200, resp.text
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.title == "Smoky Bean Stew"
+    assert reloaded.normalized_title == "smoky bean stew"
+    # Untouched columns stay exactly as they were.
+    assert reloaded.summary == "A hearty stew."
+    assert reloaded.body_text == _BODY_TEXT
+    assert reloaded.structured_data["ingredients"] == before["ingredients"]
+    assert reloaded.confidence == _CONFIDENCE
+    assert reloaded.source_span_ids == []
+
+
+async def test_response_carries_recomputed_reasons_and_the_item_stays_pending(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Editing never decides — it only makes the item correct."""
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+    assert item.structured_data["warnings"] == ["no_steps"]
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"steps": _FIXED_STEPS}
+        )
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()["knowledge_item"]
+    assert payload["review_reasons"] == []
+    assert payload["status"] == "needs_review"
+    assert payload["edited_at"] is not None
+
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.status is KnowledgeItemStatus.NEEDS_REVIEW
+    assert reloaded.structured_data["warnings"] == []
+    assert reloaded.edited_at is not None
+
+
+async def test_the_edit_survives_a_fresh_session_reload(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """The JSONB dirty-tracking regression test.
+
+    ``structured_data`` is unwrapped ``JSONB``: an in-place edit of a loaded
+    row's dict is not dirty-tracked and is silently dropped at commit. Reading
+    the row back through a cleared identity map is what proves the write landed.
+    """
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}",
+            json={
+                "ingredients": ["1 cup dried beans", "2 smoked ham hocks"],
+                "steps": _FIXED_STEPS,
+            },
+        )
+    assert resp.status_code == 200, resp.text
+
+    reloaded = await _reload(db_session, item.id)
+    assert [i["raw_text"] for i in reloaded.structured_data["ingredients"]] == [
+        "1 cup dried beans",
+        "2 smoked ham hocks",
+    ]
+    assert [s["text"] for s in reloaded.structured_data["steps"]] == _FIXED_STEPS
+    assert "2 smoked ham hocks" in reloaded.body_text
+    assert reloaded.structured_data["warnings"] == []
+
+
+async def test_untouched_ingredient_keeps_its_parse_and_the_edited_one_loses_it(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+    original = _deep_copy(item.structured_data)["ingredients"][0]
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}",
+            json={"ingredients": ["1 cup dried beans", "2 smoked ham hocks"]},
+        )
+    assert resp.status_code == 200, resp.text
+
+    rows = (await _reload(db_session, item.id)).structured_data["ingredients"]
+    assert rows[0] == original
+    assert rows[1]["edited"] is True
+    assert rows[1]["item_normalized"] is None
+    assert rows[1]["confidence"]["normalization"] == 1.0
+
+
+async def test_summary_is_cleared_by_an_explicit_null_and_left_alone_when_absent(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        absent = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"title": "Bean Stew II"}
+        )
+        assert absent.status_code == 200, absent.text
+        assert (await _reload(db_session, item.id)).summary == "A hearty stew."
+
+        cleared = await client.patch(f"/api/v1/knowledge-items/{item.id}", json={"summary": None})
+
+    assert cleared.status_code == 200, cleared.text
+    assert (await _reload(db_session, item.id)).summary is None
+
+
+async def test_confidence_warnings_survive_a_content_edit(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    structured = _deep_copy(_STRUCTURED)
+    structured["warnings"] = ["no_steps", "low_boundary_confidence"]
+    item = await _seed_item(db_session, run=run, structured=structured)
+    item.confidence = {**_CONFIDENCE, "boundary": 0.1}
+    await db_session.flush()
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"steps": _FIXED_STEPS}
+        )
+
+    assert resp.status_code == 200, resp.text
+    warnings = (await _reload(db_session, item.id)).structured_data["warnings"]
+    assert warnings == ["low_boundary_confidence"]
+
+
+# --------------------------------------------------------------------------- #
+# The snapshot is the original extraction, not the previous revision
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_second_edit_leaves_the_snapshot_at_the_original_extraction(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        first = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"title": "First Edit"}
+        )
+        assert first.status_code == 200, first.text
+        second = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"title": "Second Edit"}
+        )
+
+    assert second.status_code == 200, second.text
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.title == "Second Edit"
+    assert reloaded.pre_edit_snapshot is not None
+    assert reloaded.pre_edit_snapshot["title"] == "Bean Stew"
+    assert reloaded.pre_edit_snapshot["body_text"] == _BODY_TEXT
+    assert reloaded.pre_edit_snapshot["structured_data"]["warnings"] == ["no_steps"]
+    assert reloaded.pre_edit_snapshot["confidence"] == _CONFIDENCE
+
+
+async def test_an_unedited_item_carries_no_snapshot(db_session: AsyncSession) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.pre_edit_snapshot is None
+    assert reloaded.edited_at is None
+
+
+# --------------------------------------------------------------------------- #
+# Chunking
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_edit_creates_no_chunks_and_the_edited_text_is_what_would_be_indexed(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """``needs_review`` items carry no chunks, which is what makes an edit cheap.
+
+    The corrected text only reaches the index on approve — so this asserts the
+    edit wrote nothing, and that the chunks ``build_chunks`` *would* produce for
+    the approved row carry the correction rather than the original.
+    """
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}",
+            json={
+                "ingredients": ["1 cup dried beans", "2 smoked ham hocks"],
+                "steps": _FIXED_STEPS,
+            },
+        )
+    assert resp.status_code == 200, resp.text
+
+    chunk_count = (
+        await db_session.execute(select(Chunk).where(Chunk.parent_id == item.id))
+    ).scalars().all()
+    assert chunk_count == []
+
+    reloaded = await _reload(db_session, item.id)
+    reloaded.status = KnowledgeItemStatus.READY
+    texts = [chunk.text for chunk in build_chunks(reloaded, category="recipes")]
+    assert any("2 smoked ham hocks" in text for text in texts)
+    assert any(_FIXED_STEPS[0] in text for text in texts)
+
+
+# --------------------------------------------------------------------------- #
+# Guards — each individually reachable, in the POST's order
+# --------------------------------------------------------------------------- #
+
+
+async def test_unknown_item_is_404_knowledge_item_not_found(client: httpx.AsyncClient) -> None:
+    async with client:
+        resp = await client.patch("/api/v1/knowledge-items/item_nope", json={"title": "X"})
+
+    assert resp.status_code == 404
+    body = resp.json()["error"]
+    assert body["code"] == "knowledge_item_not_found"
+    assert body["details"] == {"item_id": "item_nope"}
+
+
+async def test_mid_reprocess_document_is_409_ingestion_already_running(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session, status=DocumentStatus.EXTRACTING_ITEMS)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(f"/api/v1/knowledge-items/{item.id}", json={"title": "X"})
+
+    assert resp.status_code == 409
+    body = resp.json()["error"]
+    assert body["code"] == "ingestion_already_running"
+    assert body["details"] == {"document_id": doc.id, "status": "extracting_items"}
+
+
+async def test_stale_generation_is_409_review_item_stale(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    old_run = await _seed_run(db_session, document_id=doc.id, source_version=1)
+    new_run = await _seed_run(db_session, document_id=doc.id, source_version=2)
+    stale = await _seed_item(db_session, run=old_run)
+    await _seed_item(db_session, run=new_run)
+
+    async with client:
+        resp = await client.patch(f"/api/v1/knowledge-items/{stale.id}", json={"title": "X"})
+
+    assert resp.status_code == 409
+    body = resp.json()["error"]
+    assert body["code"] == "review_item_stale"
+    assert body["details"] == {
+        "item_id": stale.id,
+        "source_version": 1,
+        "current_source_version": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        KnowledgeItemStatus.READY,
+        KnowledgeItemStatus.REJECTED,
+        KnowledgeItemStatus.INDEXING,
+        KnowledgeItemStatus.SUPERSEDED,
+    ],
+)
+async def test_a_non_pending_item_is_404_review_not_pending(
+    client: httpx.AsyncClient, db_session: AsyncSession, status: KnowledgeItemStatus
+) -> None:
+    """Editing an indexed item would need a delete-and-re-embed path (out of scope)."""
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run, status=status)
+
+    async with client:
+        resp = await client.patch(f"/api/v1/knowledge-items/{item.id}", json={"title": "X"})
+
+    assert resp.status_code == 404
+    body = resp.json()["error"]
+    assert body["code"] == "review_not_pending"
+    assert body["details"] == {"item_id": item.id, "status": status.value}
+
+
+async def test_a_patch_losing_to_a_decide_gets_review_not_pending(
+    client: httpx.AsyncClient, db_session: AsyncSession, fake_arq_redis: Any
+) -> None:
+    """Edit and decide race on the same guarded UPDATE: exactly one winner."""
+    from rag_recipes.api.dependencies import get_arq_redis
+
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    app.dependency_overrides[get_arq_redis] = lambda: fake_arq_redis
+    try:
+        async with client:
+            decided = await client.post(
+                f"/api/v1/knowledge-items/{item.id}/review", json={"decision": "rejected"}
+            )
+            assert decided.status_code == 200, decided.text
+            losing_edit = await client.patch(
+                f"/api/v1/knowledge-items/{item.id}", json={"title": "Too late"}
+            )
+    finally:
+        app.dependency_overrides.pop(get_arq_redis, None)
+
+    assert losing_edit.status_code == 404
+    assert losing_edit.json()["error"]["code"] == "review_not_pending"
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.title == "Bean Stew"
+    assert reloaded.edited_at is None
+
+
+# --------------------------------------------------------------------------- #
+# Request validation
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_empty_patch_is_rejected(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(f"/api/v1/knowledge-items/{item.id}", json={})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"title": None}, id="null-title"),
+        pytest.param({"title": "   "}, id="blank-title"),
+        pytest.param({"ingredients": ["1 cup beans", "  "]}, id="blank-ingredient"),
+        pytest.param({"steps": [""]}, id="blank-step"),
+        pytest.param({"confidence": {"overall": 1.0}}, id="machine-owned-field"),
+        pytest.param({"warnings": []}, id="warnings-not-writable"),
+        pytest.param({"source_span_ids": ["span_1"]}, id="provenance-not-writable"),
+    ],
+)
+async def test_invalid_payloads_are_422(
+    client: httpx.AsyncClient, db_session: AsyncSession, payload: dict[str, Any]
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(f"/api/v1/knowledge-items/{item.id}", json=payload)
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "invalid_request"
+
+
+# --------------------------------------------------------------------------- #
+# Read-side exposure
+# --------------------------------------------------------------------------- #
+
+
+async def test_edited_at_is_exposed_by_the_detail_and_the_queue(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    span = await _seed_span(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run, span_ids=[span.id])
+
+    async with client:
+        before_detail = await client.get(f"/api/v1/knowledge-items/{item.id}")
+        before_queue = await client.get("/api/v1/review-items", params={"document_id": doc.id})
+        assert before_detail.json()["knowledge_item"]["edited_at"] is None
+        assert before_queue.json()["review_items"][0]["edited_at"] is None
+
+        patched = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"steps": _FIXED_STEPS}
+        )
+        assert patched.status_code == 200, patched.text
+
+        after_detail = await client.get(f"/api/v1/knowledge-items/{item.id}")
+        after_queue = await client.get("/api/v1/review-items", params={"document_id": doc.id})
+
+    edited_at = patched.json()["knowledge_item"]["edited_at"]
+    assert edited_at is not None
+    assert after_detail.json()["knowledge_item"]["edited_at"] == edited_at
+    assert after_queue.json()["review_items"][0]["edited_at"] == edited_at
+    # The queue's flag list is derived from the rewritten warnings.
+    assert after_queue.json()["review_items"][0]["flags"] == []
+
+
+async def test_the_patch_response_matches_the_detail_endpoint(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """One envelope: an edit cannot answer with a shape the GET would not."""
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    span = await _seed_span(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run, span_ids=[span.id])
+
+    async with client:
+        patched = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"steps": _FIXED_STEPS}
+        )
+        detail = await client.get(f"/api/v1/knowledge-items/{item.id}")
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json() == detail.json()
+    assert patched.json()["source_citations"][0]["label"] == "page 12"

@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from redis.asyncio import from_url as redis_from_url
@@ -71,7 +72,11 @@ async def _handle_request_validation_error(
         content=error_body(
             code=ErrorCode.INVALID_REQUEST,
             message="Request validation failed.",
-            details={"errors": exc.errors()},
+            # jsonable_encoder (FastAPI's own default-handler idiom): a
+            # validator that raises ValueError puts the exception object itself
+            # in the error's `ctx`, which json.dumps cannot serialize — without
+            # this, a 422 turns into a 500.
+            details={"errors": jsonable_encoder(exc.errors())},
         ),
     )
 
