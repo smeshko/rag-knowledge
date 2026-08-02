@@ -629,6 +629,7 @@ async def test_cached_rating_for_a_different_artifact_is_not_served(tmp_path: Pa
         artifact_hash=artifact_hash(serialize_extracted_artifact(payloads)),
         judge_name="summary_quality",
         judge_version="v1",
+        provider="fake",
         model="fake-model",
     )
     stale_key = dataclasses.replace(real_key, artifact_hash="0" * 64)
@@ -788,10 +789,18 @@ runner = CliRunner()
 
 
 class _CliSettingsStandIn(SettingsStandIn):
-    """Extends the metadata stand-in with the soft-validation threshold fields."""
+    """Extends the metadata stand-in with the fields the CLI path reads.
+
+    Duck-typed, so it must carry every attribute production reads — adding one
+    here is a fixture change, not a behaviour change. ``judge_llm_provider`` /
+    ``judge_llm_model`` are None so ``_build_judge_provider`` returns None and
+    the run keeps using a single provider for both roles (Epic 23.3).
+    """
 
     def __init__(self) -> None:
         super().__init__()
+        self.judge_llm_provider: str | None = None
+        self.judge_llm_model: str | None = None
         self.extraction_min_overall_confidence = 0.5
         self.extraction_min_boundary_confidence = 0.5
         self.extraction_min_normalization_confidence = 0.5

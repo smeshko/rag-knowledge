@@ -145,6 +145,17 @@ class Judge:
         """The model the injected provider resolves to (feeds the cache key)."""
         return self._llm_provider.default_model
 
+    @property
+    def provider(self) -> str:
+        """The identity of the injected provider (Epic 23.3).
+
+        Read-only, and read *from* the provider — the judge still never learns
+        how to construct one. Surfaced because ``model`` alone stopped
+        identifying a judge once two providers can serve the same model name:
+        it is both run provenance and, from TASK-003, a cache-key part.
+        """
+        return self._llm_provider.provider
+
     async def judge(self, extracted: str, expected: str, source_text: str) -> JudgeRating:
         """Rate one fixture's extraction; raises ``JudgeError`` on any bad verdict."""
         request = StructuredOutputRequest(

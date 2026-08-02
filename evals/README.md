@@ -6,6 +6,46 @@ Offline evaluation harness for retrieval and extraction quality.
 
 Background reading: [`docs/architecture/12-evaluation-and-testing.md`](../docs/architecture/12-evaluation-and-testing.md) (§ 5 judge alignment, § 6 confidence calibration, § 9 regression testing, § 10 report shapes) and [`docs/architecture/13-implementation-decisions.md`](../docs/architecture/13-implementation-decisions.md) (topics 10–12: report/baseline storage, retrieval metrics, LLM-judge fixtures).
 
+## Judging with a different provider than the model under test
+
+By default the eval harness builds **one** LLM provider and uses it for both
+extraction and judging. That is fine for a single-provider run and wrong for a
+comparison: with one provider in both roles, every candidate grades itself, and
+a "provider A scores higher than provider B" result says as much about the
+judges as about the models.
+
+Set the judge separately for any cross-provider run:
+
+```bash
+# Extract with DeepSeek, judge with Claude.
+LLM_PROVIDER=deepseek JUDGE_LLM_PROVIDER=anthropic rag-evals extraction \
+    --fixtures cookbooks --label deepseek-judged-by-claude --judge summary_quality
+```
+
+Rules worth knowing:
+
+- **Unset means "same provider as extraction"** — today's behaviour, unchanged.
+- **Hold the judge fixed across a comparison.** Running candidate A judged by A
+  and candidate B judged by B is the original confound with extra steps. Both
+  baselines in a comparison must record the same judge provider.
+- `JUDGE_LLM_MODEL` alone (provider unset) judges with a different model on the
+  same vendor. Setting only `JUDGE_LLM_PROVIDER` picks that provider's own
+  model — never `LLM_MODEL`, which would send one vendor's model id to another.
+- A judge provider needs its own API key, checked at `Settings` load rather than
+  at the first judge call — which happens after extraction has already run.
+- The run's `results.json` records `judge.provider` alongside `judge.model`, so a
+  committed baseline states who graded it.
+
+### This change invalidated the existing judge cache
+
+The judge-rating cache key now includes the judge's provider. Without it, two
+providers serving the same model name would share cached ratings — the exact
+cross-vendor contamination the split exists to remove. The cache path is a hash
+over the key, so **every previously cached rating is orphaned** and the first run
+after this change re-issues every judge call. That is expected, not a bug. The
+orphaned files are harmless and are left in place.
+
+
 ## Running the harness
 
 The CLI is installed as the `rag-evals` console script (`uv sync` links it):
@@ -37,7 +77,7 @@ The full loop (doc 12 § 5 / § 9), in command order — the order matters becau
 ## Judge prompts, cache, and alignment records
 
 - **Judge prompts** live at `data/fixtures/judge_prompts/<name>.md`. Three ship with Epic 15: `summary_quality`, `boundary_correctness`, `step_text_quality`. Each carries a `# version: v1` header line — **required for judges** (the harness refuses a version-less judge prompt) and load-bearing: any observable prompt change MUST bump it, because the version keys the cache and appears in every report line.
-- **Judge cache** — `evals/reports/.judge_cache/` (gitignored), one JSON file per eight-part key `(fixture_set, fixture_name, fixture_content_hash, extraction_prompt_version, artifact_hash, judge_name, judge_version, model)`. A hit skips the LLM call entirely. Invalidation is no longer only judge-prompt version bumps: a fixture `source.md`/`expected.json` edit, an extraction prompt-version bump, and **any change to the judged artifact itself** each miss by construction. What that buys and costs: a cached rating is replayed only for the byte-identical artifact it was produced from — so a fresh live extraction re-pays its judge calls, while re-running `judge-alignment` against an existing run stays free — and the cache grows by one entry per distinct artifact instead of replacing entries (gitignored and disposable; delete it any time).
+- **Judge cache** — `evals/reports/.judge_cache/` (gitignored), one JSON file per nine-part key `(fixture_set, fixture_name, fixture_content_hash, extraction_prompt_version, artifact_hash, judge_name, judge_version, provider, model)`. A hit skips the LLM call entirely. Invalidation is no longer only judge-prompt version bumps: a fixture `source.md`/`expected.json` edit, an extraction prompt-version bump, and **any change to the judged artifact itself**, and a change of judge *provider* each miss by construction. What that buys and costs: a cached rating is replayed only for the byte-identical artifact it was produced from — so a fresh live extraction re-pays its judge calls, while re-running `judge-alignment` against an existing run stays free — and the cache grows by one entry per distinct artifact instead of replacing entries (gitignored and disposable; delete it any time).
 - **The judge rates the full item list.** The judged string is the run's persisted `recipes` payload serialized as `{"items": [...]}` — so `boundary_correctness` actually sees splits instead of only item 0. Note the three committed prompts are still worded for a *single* item; how a judge aggregates a multi-item payload into one verdict is an open Phase 20.3 question (every synthetic fixture holds one recipe by design, so the wrapper is a one-element list in the normal case).
 - **Alignment records** — `data/fixtures/judge_alignment/<set>__<fixture>__<judge>__<extraction_model>.json` (committed). The id is scoped by fixture set, judge, **and the model that produced the artifact** (the run's `metadata.llm_model`, not the judge's) so two sets with a same-named fixture, two judges on one fixture, and two extraction providers over the same set all keep distinct records. `human_rating`/`judge_rating` hold bare `"pass"`/`"fail"`; both critiques plus `{judge_name, judge_version, model, fixture_name, fixture_set, artifact_hash, judge_dimension, extraction_provider, extraction_model, aligned_run, rated_at}` live under `run_metadata`. Human ratings are reused only while the judge version **and** the artifact hash both match; a version bump *or* a changed artifact re-prompts.
 

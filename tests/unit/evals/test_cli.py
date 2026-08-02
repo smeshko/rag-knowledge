@@ -114,9 +114,12 @@ def test_judge_alignment_bad_run_exits_2_without_provider_or_settings(
 ) -> None:
     """Every unusable run exits 2 before ``get_settings``/provider construction.
 
-    Both seams are monkeypatched to raise: ``get_settings()`` is where a
-    missing API key would blow up, so proving only the provider half would
-    leave the original failure mode uncovered.
+    All three seams are monkeypatched to raise: ``get_settings()`` is where a
+    missing API key would blow up, so proving only the provider half would leave
+    the original failure mode uncovered. ``_build_judge_provider`` is listed too
+    (Epic 23.3) — it is evaluated at the same call site, and relying on argument
+    evaluation order to reach ``_build_llm_provider`` first would let a future
+    reordering regress the DECISIONS #9 invariant silently.
     """
     fixtures_root = tmp_path / "fixtures"
     write_fixture(fixtures_root, "smoke", "bean-stew", STEW_SOURCE, STEW_EXPECTED)
@@ -125,6 +128,9 @@ def test_judge_alignment_bad_run_exits_2_without_provider_or_settings(
     fired: list[str] = []
     monkeypatch.setattr(
         evals.cli, "_build_llm_provider", _forbid(fired, "_build_llm_provider")
+    )
+    monkeypatch.setattr(
+        evals.cli, "_build_judge_provider", _forbid(fired, "_build_judge_provider")
     )
     monkeypatch.setattr("rag_recipes.config.get_settings", _forbid(fired, "get_settings"))
 

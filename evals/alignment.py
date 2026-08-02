@@ -338,6 +338,7 @@ async def run_judge_alignment(
     fixture_set: str,
     *,
     llm_provider: LLMProvider,
+    judge_provider: LLMProvider | None = None,
     prompt_human: PromptHuman | None = None,
     report_path: Path | None = None,
     root: Path | None = None,
@@ -350,13 +351,16 @@ async def run_judge_alignment(
     ``None`` or any unusable run (DECISIONS #9). ``llm_provider`` is injected,
     never constructed (only the CLI builds a real one), and is consulted only
     on a judge-cache miss — alignment performs **zero** extraction calls.
+    ``judge_provider`` mirrors ``run_extraction_eval``'s: ``None`` reuses
+    ``llm_provider``, so alignment grades with whatever the run was graded by
+    unless told otherwise (Epic 23.3).
     ``root`` covers fixtures, judge prompts, and alignment records;
     ``judge_cache_root`` the 15.2 cache — both injectable so tests stay in
     ``tmp_path``. The agreement section is merged into the run's
     ``results.json``/``summary.md``.
     """
     ask_human = _default_prompt_human if prompt_human is None else prompt_human
-    judge_runner = load_judge(judge, llm_provider, root=root)
+    judge_runner = load_judge(judge, judge_provider or llm_provider, root=root)
     dimension = _judge_dimension(load_judge_prompt(judge, root=root).text, judge_runner.name)
     cache = JudgeCache(root=judge_cache_root)
     fixtures = load_recipe_fixtures(fixture_set, root=root)
@@ -395,6 +399,11 @@ async def run_judge_alignment(
         return {
             "judge_name": judge_runner.name,
             "judge_version": judge_runner.version,
+            # Both providers, explicitly. Epic 23.6 commits these records under
+            # data/fixtures/judge_alignment/, and after the 23.3 split a record
+            # reading `extraction_provider: deepseek` + `model: claude-sonnet-4-6`
+            # would never state which vendor served that model.
+            "judge_provider": judge_runner.provider,
             "model": judge_runner.model,
             "fixture_set": fixture_set,
             "judge_dimension": dimension,

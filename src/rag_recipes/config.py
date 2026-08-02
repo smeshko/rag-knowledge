@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     deepseek_llm_model: str = "deepseek-v4-pro"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
 
+    # Judge provider/model for the eval harness (Epic 23.3). Both None by default,
+    # meaning "the judge runs on the same provider as the model under test" — i.e.
+    # today's behaviour. Setting them is what makes a cross-provider comparison
+    # meaningful: with one provider serving both roles, every candidate grades
+    # itself. `None` rather than a concrete default on purpose, so an Anthropic
+    # deployment's behaviour does not silently change the moment this ships.
+    judge_llm_provider: str | None = None
+    judge_llm_model: str | None = None
+
     llm_model: str = "gpt-4.1"
     # Retarget the OpenAI SDK at any OpenAI-*compatible* endpoint (Epic 23.4).
     # None keeps the SDK's own default (api.openai.com). This is transport only:
@@ -252,6 +261,22 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("judge_llm_provider")
+    @classmethod
+    def _judge_llm_provider_supported(cls, value: str | None) -> str | None:
+        # Same registry allow-list as llm_provider, but None is meaningful here:
+        # it is the "judge on the extraction provider" sentinel, not an absence.
+        from rag_recipes.providers.llm.registry import supported_providers
+
+        if value is None:
+            return value
+        supported = supported_providers()
+        if value not in supported:
+            raise ValueError(
+                f"judge_llm_provider must be one of {sorted(supported)}; got {value!r}"
+            )
+        return value
+
     @field_validator("llm_structured_output_mode")
     @classmethod
     def _structured_output_mode_supported(cls, value: str | None) -> str | None:
@@ -286,6 +311,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"{field} is required when llm_provider == {self.llm_provider!r}"
             )
+        # Epic 23.3: the judge may run on a different provider, which needs its own
+        # key. Checked here rather than at the first judge call because that call
+        # happens *after* extraction has already spent money on the run.
+        judge_provider = self.judge_llm_provider
+        if judge_provider is not None:
+            judge_field = get_spec(judge_provider).api_key_field
+            if judge_field is not None and not getattr(self, judge_field):
+                raise ValueError(
+                    f"{judge_field} is required when judge_llm_provider == {judge_provider!r}"
+                )
         return self
 
     @model_validator(mode="after")
@@ -297,11 +332,46 @@ class Settings(BaseSettings):
         from rag_recipes.providers.llm.registry import unsupported_structured_output_modes
 
         mode = self.llm_structured_output_mode
-        unsupported = unsupported_structured_output_modes(self.llm_provider)
-        if mode is not None and mode in unsupported:
+        if mode is None:
+            return self
+        # Both roles, because the setting is global but the providers need not
+        # be. LLM_PROVIDER=openai + json_schema + JUDGE_LLM_PROVIDER=deepseek
+        # would otherwise load clean and die at the first *judge* call — after
+        # extraction has already spent the money (Epic 23.3).
+        for field, provider in (
+            ("llm_provider", self.llm_provider),
+            ("judge_llm_provider", self.judge_llm_provider),
+        ):
+            if provider is None:
+                continue
+            if mode in unsupported_structured_output_modes(provider):
+                raise ValueError(
+                    f"llm_structured_output_mode={mode!r} is not supported by "
+                    f"{field}={provider!r}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _judge_provider_must_not_inherit_a_retargeted_endpoint(self) -> Settings:
+        # llm_base_url and llm_provider_label are read by the `openai` registry
+        # entry regardless of *who* is asking for it, so with the endpoint
+        # retargeted, JUDGE_LLM_PROVIDER=openai builds a judge pointed at the
+        # very same third-party endpoint under the very same identity label.
+        # The run is then self-judged while looking correctly configured, and
+        # the judge cache key cannot detect it either — both sides carry the
+        # same label. Since a self-judged comparison is exactly what Epic 23.3
+        # exists to prevent, refuse the combination rather than document it.
+        if (
+            self.llm_base_url
+            and self.judge_llm_provider == "openai"
+            and self.llm_provider == "openai"
+        ):
             raise ValueError(
-                f"llm_structured_output_mode={mode!r} is not supported by "
-                f"llm_provider={self.llm_provider!r}"
+                "judge_llm_provider='openai' is ambiguous while llm_base_url is set: "
+                "the OpenAI transport is shared, so the judge would be built against "
+                "the same retargeted endpoint and identity label as the model under "
+                "test — a self-judged run that looks correctly configured. Point the "
+                "judge at a different registered provider, or clear llm_base_url."
             )
         return self
 

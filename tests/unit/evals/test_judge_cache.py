@@ -1,7 +1,7 @@
 """Tests for the on-disk judge cache (Epic 15 Phase 15.2, Epic 20 Phase 20.1).
 
 Every test constructs the cache with a ``tmp_path`` root — never the repo's
-``evals/reports/.judge_cache/``. The key is the eight-part ``JudgeCacheKey``;
+``evals/reports/.judge_cache/``. The key is the nine-part ``JudgeCacheKey``;
 the significance matrix below proves every part participates in addressing.
 """
 
@@ -33,6 +33,7 @@ def _key(**overrides: str) -> JudgeCacheKey:
         "artifact_hash": "b" * 64,
         "judge_name": "summary_quality",
         "judge_version": "v1",
+        "provider": "fake",
         "model": "fake-model",
     }
     defaults.update(overrides)
@@ -52,9 +53,10 @@ def test_get_misses_when_nothing_stored(tmp_path: Path) -> None:
 
 
 def test_every_key_part_is_significant(tmp_path: Path) -> None:
-    # Changing any single one of the eight parts must miss — an insignificant
+    # Changing any single one of the nine parts must miss — an insignificant
     # part would let a stale rating (other set, edited fixture, bumped prompt,
-    # different artifact, other judge/version/model) be replayed silently.
+    # different artifact, other judge/version/provider/model) be replayed
+    # silently.
     cache = JudgeCache(root=tmp_path)
     cache.put(_rating(), key=_key())
     assert cache.get(_key()) is not None
@@ -66,10 +68,41 @@ def test_every_key_part_is_significant(tmp_path: Path) -> None:
         "artifact_hash": "d" * 64,
         "judge_name": "boundary_correctness",
         "judge_version": "v2",
+        "provider": "other-vendor",
         "model": "other-model",
     }
     for part, value in changed.items():
         assert cache.get(_key(**{part: value})) is None, part
+
+
+def test_two_providers_at_the_same_model_name_do_not_share_a_rating(
+    tmp_path: Path,
+) -> None:
+    """The Epic 23.3 case, spelled out rather than left to the matrix.
+
+    Once the judge is separately configurable, two vendors can serve the same
+    model name — an OpenAI-compatible endpoint advertises whatever id it likes.
+    Without ``provider`` in the key, an Anthropic judge and a DeepSeek judge
+    would silently share ratings, which is the exact cross-vendor contamination
+    the split exists to remove.
+    """
+    cache = JudgeCache(root=tmp_path)
+    cache.put(_rating(), key=_key(provider="anthropic", model="shared-model"))
+
+    assert cache.get(_key(provider="deepseek", model="shared-model")) is None
+
+
+def test_the_same_provider_still_hits_its_own_rating(tmp_path: Path) -> None:
+    """The negative control for the test above.
+
+    A cache that never hit at all would satisfy the isolation assertion while
+    silently re-paying for every judge call.
+    """
+    cache = JudgeCache(root=tmp_path)
+    rating = _rating()
+    cache.put(rating, key=_key(provider="anthropic", model="shared-model"))
+
+    assert cache.get(_key(provider="anthropic", model="shared-model")) == rating
 
 
 def test_version_bump_invalidates(tmp_path: Path) -> None:

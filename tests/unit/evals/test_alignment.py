@@ -112,7 +112,11 @@ def _persisted_artifact(run_dir: Path, fixture_name: str) -> str:
 
 
 def _run_key(
-    run_dir: Path, fixture_name: str, judge: str = "summary_quality", model: str = "fake-model"
+    run_dir: Path,
+    fixture_name: str,
+    judge: str = "summary_quality",
+    model: str = "fake-model",
+    provider: str = "fake",
 ) -> JudgeCacheKey:
     """The cache key alignment builds from the run's recorded provenance."""
     results = _results(run_dir)
@@ -125,6 +129,7 @@ def _run_key(
         artifact_hash=artifact_hash(serialize_extracted_artifact(entry["recipes"])),
         judge_name=judge,
         judge_version="v1",
+        provider=provider,
         model=model,
     )
 
