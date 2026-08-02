@@ -243,6 +243,33 @@ def test_bad_pages_exit_2_with_the_problem_named(
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
+def test_an_all_plate_range_exits_2(fixtures_root: Path) -> None:
+    """Page 3 of the sample is empty; a fixture of it alone would be an empty prompt."""
+    result = runner.invoke(
+        app,
+        ["fixtures", "cut", "--pdf", str(SAMPLE_PDF), "--set", "cookbooks",
+         "--pages", "3", "--rationale", "nothing but a plate"],
+    )
+    assert result.exit_code == 2, result.output
+    assert "yields no text" in result.output
+    assert not _set_dir(fixtures_root).exists() or list(_set_dir(fixtures_root).iterdir()) == []
+
+
+def test_rationale_help_documents_the_positional_pairing() -> None:
+    """--pages/--rationale pair positionally and only counts are checked, so the
+    strict-interleave requirement has to be stated where the operator will read it."""
+    result = runner.invoke(app, ["fixtures", "cut", "--help"])
+    assert result.exit_code == 0
+    assert "positionally" in result.output
+    assert "interleave" in result.output
+
+
+def test_readme_documents_the_positional_pairing() -> None:
+    readme = (_REPO_ROOT / "evals" / "README.md").read_text(encoding="utf-8")
+    assert "positionally" in readme
+    assert "strictly interleaved" in readme
+
+
 def test_missing_pdf_exits_2_without_a_traceback(fixtures_root: Path, tmp_path: Path) -> None:
     result = runner.invoke(
         app,

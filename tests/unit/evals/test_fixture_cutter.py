@@ -33,6 +33,7 @@ from evals.fixture_cutter import (
     validate_candidate_layout,
 )
 
+from rag_recipes.config import Settings
 from rag_recipes.ingestion.pipeline.windows import format_window_for_llm
 from rag_recipes.providers.pdf_extractor.base import PdfTextExtractor
 from rag_recipes.providers.pdf_extractor.pymupdf import PyMuPdfExtractor
@@ -155,6 +156,27 @@ def test_validate_candidate_layout_tolerates_a_golden(tmp_path: Path) -> None:
     for name in ("source.md", "notes.md", "expected.json"):
         (candidate / name).write_text("x", encoding="utf-8")
     validate_candidate_layout(candidate)
+
+
+@pytest.mark.parametrize("body", ["", "   \n\n\t"])
+def test_validate_candidate_layout_rejects_an_empty_source_md(
+    tmp_path: Path, body: str
+) -> None:
+    """Presence alone is not a layout: an empty source.md is an empty prompt."""
+    candidate = tmp_path / "cand"
+    candidate.mkdir()
+    (candidate / "source.md").write_text(body, encoding="utf-8")
+    (candidate / "notes.md").write_text("# Fixture provenance\n", encoding="utf-8")
+    with pytest.raises(FixtureLayoutError, match="empty source.md"):
+        validate_candidate_layout(candidate)
+
+
+async def test_an_all_plate_range_is_refused_at_cut_time(tmp_path: Path) -> None:
+    """Page 3 is the sample's empty page; a fixture of it alone has no text."""
+    with pytest.raises(FixtureRangeError, match="yields no text"):
+        await _cut(tmp_path, [(3, 3)])
+    set_dir = _set_dir(tmp_path)
+    assert not set_dir.exists() or list(set_dir.iterdir()) == []
 
 
 # --- AC3 / AC3b: text identity with production extraction --------------------
@@ -550,6 +572,18 @@ async def test_staging_directory_is_cleaned_up_on_failure(tmp_path: Path) -> Non
 
 
 # --- Module invariants -------------------------------------------------------
+
+
+def test_default_min_text_chars_tracks_the_settings_default() -> None:
+    """The constant's docstring claims it mirrors ``Settings``; pin the claim.
+
+    Read as a *field default* rather than via ``Settings()`` so the assertion
+    needs no operator credentials — the whole reason the cutter holds a constant
+    in the first place. Without this, changing the config default silently
+    drifts fixture flagging away from ingestion flagging.
+    """
+    configured = Settings.model_fields["pdf_min_text_chars_for_page"].default
+    assert configured == DEFAULT_MIN_TEXT_CHARS
 
 
 def test_cutter_imports_nothing_from_evals_fixtures() -> None:

@@ -36,6 +36,9 @@ byte-identical to what ingestion sees for the same pages. Sub-threshold pages
 (``confidence == 0.0``) are **kept with their text**, exactly as production
 keeps them (``providers/pdf_extractor/pymupdf.py:77`` flags, never drops); they
 are merely reported in :attr:`CutResult.flagged_pages` so the curator can re-cut.
+A range in which *every* page is sub-threshold is the one exception: it would
+render an empty ``source.md``, and therefore an empty prompt in 23.2, so it is
+refused rather than written.
 """
 
 from __future__ import annotations
@@ -96,7 +99,7 @@ class FixtureCutterError(ValueError):
 
 
 class FixtureRangeError(FixtureCutterError):
-    """A page range is malformed, inverted, or outside the document."""
+    """A page range is malformed, inverted, outside the document, or yields no text."""
 
 
 class FixtureRationaleError(FixtureCutterError):
@@ -154,12 +157,16 @@ def derive_fixture_name(pdf_path: Path | str, first_page: int, last_page: int) -
 
 
 def validate_candidate_layout(directory: Path) -> None:
-    """Assert a candidate dir carries both ``source.md`` and ``notes.md``.
+    """Assert a candidate dir carries a non-empty ``source.md`` and a ``notes.md``.
 
     Phase 23.1's acceptance gate, standing in for ``load_recipe_fixtures``,
     which reads ``expected.json`` unguarded and so raises for every goldenless
     candidate. Extra files are tolerated — Phase 23.2 adds ``expected.json``
     beside these two.
+
+    ``source.md`` must hold something other than whitespace: an all-image-plate
+    window produces a structurally valid but *empty* candidate, which would pass
+    a presence-only gate and then become an empty prompt in 23.2.
     """
     if not directory.is_dir():
         raise FixtureLayoutError(f"candidate directory does not exist: {directory}")
@@ -167,6 +174,11 @@ def validate_candidate_layout(directory: Path) -> None:
     if missing:
         raise FixtureLayoutError(
             f"candidate {directory} is missing required file(s): {', '.join(missing)}"
+        )
+    if not (directory / "source.md").read_text(encoding="utf-8").strip():
+        raise FixtureLayoutError(
+            f"candidate {directory} has an empty source.md: a fixture with no text "
+            f"would be scored as an empty prompt"
         )
 
 
@@ -376,6 +388,14 @@ async def cut_fixtures(
             selected = pages[first_page - 1 : last_page]
             source_md = render_source_md(selected)
             flagged = tuple(page.page_number for page in selected if page.confidence == 0.0)
+            if not source_md.strip():
+                # Caught here rather than only by the layout gate so the operator
+                # is told which range is unusable, not which staging path is.
+                raise FixtureRangeError(
+                    f"page range {first_page}-{last_page} of {pdf.name} yields no text: "
+                    f"every selected page is below {min_text_chars} characters "
+                    f"(image plates?) — pick a different range"
+                )
             staged_dir = staging / name
             staged_dir.mkdir()
             (staged_dir / "source.md").write_text(source_md, encoding="utf-8")

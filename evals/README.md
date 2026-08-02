@@ -123,7 +123,7 @@ uv run rag-evals fixtures cut \
   --rationale "one complete recipe with headnote; ingredient table"
 ```
 
-Batch — repeat `--pages` and `--rationale` in matching order:
+Batch — repeat `--pages` and `--rationale`, **strictly interleaved**:
 
 ```bash
 uv run rag-evals fixtures cut \
@@ -134,20 +134,22 @@ uv run rag-evals fixtures cut \
   --pages 88 --rationale "hard case: ingredients as a table"
 ```
 
+The two options are collected independently and paired **positionally**: the Nth `--rationale` is attached to the Nth `--pages`, wherever the flags sit on the command line. Only the *counts* are checked, so `--rationale A --pages 1 --rationale B --pages 2` is accepted with exit 0 and the rationales attached the way the parser saw them, not the way you meant them. Always write one `--pages` immediately followed by its `--rationale`, as above, and read back the `rationale:` field in each `notes.md` before authoring goldens.
+
 Batch mode is not a convenience: `PdfTextExtractor.extract_pages` takes whole-file bytes, so one invocation per range re-parses the entire book. At 190 MB (`eatdrinkpaleocookbook.pdf`) that is one parse versus eight. Cut every window you want from a book in a single command.
 
 Rules the cutter enforces:
 
 - **Names are derived, never supplied**: `<book-stem>-p<first>-<last>`. The name becomes `span_eval_<name>` (`evals.extraction.synthetic_span_id`), the span id goldens cite — so a collision exits 2 unless `--overwrite`, and overwriting a fixture that already carries `expected.json` additionally needs `--invalidate-goldens` (the golden then describes text that no longer exists: re-author it).
 - **Pages are inclusive and 1-based**; `--pages 42` is shorthand for `42-42`. An inverted, zero/negative, unparseable, or out-of-document range exits 2 with the problem named, as do a missing `--pdf`, an unsafe `--set`, and a `--rationale` count that does not match `--pages`. Nothing is written unless the whole batch validates.
-- **Text is production's text.** The cutter runs the same `PyMuPdfExtractor` ingestion uses and slices one whole-document extraction; `source.md` is exactly the selected pages' text joined by `\n\n`. Pages below `PDF_MIN_TEXT_CHARS_FOR_PAGE` (image plates) are *kept with their text*, matching production, and reported on stderr as a warning so you can re-cut a bad window.
+- **Text is production's text.** The cutter runs the same `PyMuPdfExtractor` ingestion uses and slices one whole-document extraction; `source.md` is exactly the selected pages' text joined by `\n\n`. Pages below `PDF_MIN_TEXT_CHARS_FOR_PAGE` (image plates) are *kept with their text*, matching production, and reported on stderr as a warning so you can re-cut a bad window. A range where *every* page is sub-threshold would yield an empty `source.md` — and, in 23.2, an empty prompt — so it exits 2 instead of writing the fixture.
 
 Curation rules for the curator:
 
 - **Exactly one complete recipe per fixture** — title, ingredients, steps. The extraction driver scores `recipes[0]`, so a window holding two recipes punishes a model for correctly returning both.
 - **Prefer single-page ranges.** The eval harness collapses a whole `source.md` into a *single* span stamped `page_start: 1`, whereas production emits one `[SOURCE_SPAN … | PDF page N]` block per page. A multi-page fixture therefore exercises a prompt shape production never emits, and `source_span_ids_f1` is degenerate (there is only one span to cite). Known and documented, not hidden.
 - **Spread the picks.** Draw across books rather than mining one, and include deliberately awkward windows (dense prose, ingredient tables, long headnotes) — a curator who only picks clean pages inflates measured accuracy.
-- Record why you chose the window in `--rationale`; it lands in `notes.md` as a parseable field alongside the source filename, page range, extractor identity, and any flagged pages.
+- Record why you chose the window in `--rationale`; it lands in `notes.md` as a parseable field alongside the source filename, page range, extractor identity, and any flagged pages. `notes.md`'s provenance block is line-oriented, so the rationale is collapsed to a single line — a multi-line rationale is kept whole, not truncated, but it will not read as multiple lines in the file.
 
 ## Reports and baselines
 

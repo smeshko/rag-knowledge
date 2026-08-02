@@ -364,8 +364,12 @@ def fixtures_cut(
         typer.Option(
             "--rationale",
             help=(
-                "Why this window was chosen, recorded in notes.md. "
-                "Repeat once per --pages, in the same order."
+                "Why this window was chosen, recorded in notes.md. Repeat once per "
+                "--pages. Rationales are paired with ranges positionally — the Nth "
+                "--rationale goes with the Nth --pages, regardless of where they sit "
+                "on the command line — so always interleave them strictly: "
+                "--pages A --rationale a --pages B --rationale b. Only the counts "
+                "are checked, so a mispaired batch is accepted silently."
             ),
         ),
     ],
