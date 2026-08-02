@@ -175,16 +175,27 @@ def parse_notes_fields(notes_md: str) -> dict[str, str]:
 
     Provenance is recorded as discrete fields rather than free prose so a stale
     or mis-cut fixture is diagnosable — and assertable — later.
+
+    Only the **first** ``- key: value`` block is parsed: the first blank line
+    after it ends the scan. Together with the whitespace collapsing applied to
+    the rationale at cut time, that stops prose further down the file from
+    passing itself off as provenance.
     """
     fields: dict[str, str] = {}
+    started = False
     for line in notes_md.splitlines():
         stripped = line.strip()
+        if not stripped:
+            if started:
+                break  # header block ended; everything below is prose
+            continue
         if not stripped.startswith("- ") or ":" not in stripped:
             continue
         key, _, value = stripped[2:].partition(":")
         key = key.strip()
         if key and key not in fields:
             fields[key] = value.strip()
+            started = True
     return fields
 
 
@@ -203,6 +214,11 @@ def _render_notes_md(
     flagged_pages: Sequence[int],
 ) -> str:
     flagged = ", ".join(str(page) for page in flagged_pages) if flagged_pages else "none"
+    # Collapsed to a single line: notes.md's provenance block is line-oriented
+    # and first-wins, so a raw multi-line rationale would either truncate at its
+    # first newline or — worse — inject a `- extractor: ...` line that shadows
+    # the real one and falsifies the fixture's provenance.
+    rationale = " ".join(rationale.split())
     return (
         "# Fixture provenance\n"
         "\n"

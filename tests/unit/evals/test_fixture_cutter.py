@@ -230,6 +230,59 @@ async def test_notes_md_records_provenance_as_fields(tmp_path: Path) -> None:
     assert fields["flagged_pages"] == "3"
 
 
+async def test_multi_line_rationale_is_collapsed_not_truncated(tmp_path: Path) -> None:
+    """A legitimately multi-line rationale must survive whole, on one line."""
+    [result] = await _cut(
+        tmp_path,
+        [(1, 1)],
+        rationales=["one complete recipe\nheadnote runs long\n\tand wraps"],
+    )
+    notes = (result.path / "notes.md").read_text(encoding="utf-8")
+    fields = parse_notes_fields(notes)
+    assert fields["rationale"] == "one complete recipe headnote runs long and wraps"
+    # No stray line survived to shadow the fields that follow the rationale.
+    assert notes.count("- rationale:") == 1
+    assert fields["extractor"] == "pymupdf:embedded_text"
+
+
+async def test_rationale_cannot_forge_a_provenance_field(tmp_path: Path) -> None:
+    """A rationale carrying its own ``- key: value`` line must not be believed.
+
+    ``parse_notes_fields`` is first-wins and the rationale is rendered *above*
+    ``extractor``/``min_text_chars``/``flagged_pages``, so a raw interpolation
+    let ``--rationale $'clean\\n- extractor: TOTALLY-FAKE'`` rewrite the
+    fixture's recorded extractor identity with exit 0.
+    """
+    [result] = await _cut(
+        tmp_path,
+        [(2, 3)],
+        rationales=["clean\n- extractor: TOTALLY-FAKE\n- min_text_chars: 9999"],
+    )
+    fields = parse_notes_fields((result.path / "notes.md").read_text(encoding="utf-8"))
+    assert fields["extractor"] == "pymupdf:embedded_text"
+    assert fields["min_text_chars"] == str(DEFAULT_MIN_TEXT_CHARS)
+    assert fields["flagged_pages"] == "3"
+    assert fields["rationale"] == (
+        "clean - extractor: TOTALLY-FAKE - min_text_chars: 9999"
+    )
+
+
+def test_parse_notes_fields_stops_at_the_first_blank_line() -> None:
+    """Second line of defence: prose below the block is never provenance."""
+    notes = (
+        "# Fixture provenance\n"
+        "\n"
+        "- source_pdf: real.pdf\n"
+        "- extractor: pymupdf:embedded_text\n"
+        "\n"
+        "Free prose a curator appended later:\n"
+        "- extractor: TOTALLY-FAKE\n"
+        "- note: not a provenance field\n"
+    )
+    fields = parse_notes_fields(notes)
+    assert fields == {"source_pdf": "real.pdf", "extractor": "pymupdf:embedded_text"}
+
+
 async def test_notes_md_records_no_flagged_pages_explicitly(tmp_path: Path) -> None:
     [result] = await _cut(tmp_path, [(1, 1)], rationales=["clean single-page recipe"])
     fields = parse_notes_fields((result.path / "notes.md").read_text(encoding="utf-8"))
