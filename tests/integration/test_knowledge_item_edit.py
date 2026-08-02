@@ -530,10 +530,15 @@ async def test_a_non_pending_item_is_404_review_not_pending(
     assert body["details"] == {"item_id": item.id, "status": status.value}
 
 
-async def test_a_patch_losing_to_a_decide_gets_review_not_pending(
+async def test_an_edit_after_a_decide_gets_review_not_pending(
     client: httpx.AsyncClient, db_session: AsyncSession, fake_arq_redis: Any
 ) -> None:
-    """Edit and decide race on the same guarded UPDATE: exactly one winner."""
+    """A decided item can no longer be edited, and the edit writes nothing.
+
+    Sequential by construction — the genuinely concurrent case (two connections
+    contending on the guarded UPDATE) needs committed rows and lives in
+    ``test_knowledge_item_edit_race.py``.
+    """
     from rag_recipes.api.dependencies import get_arq_redis
 
     doc = await _seed_document(db_session)
@@ -565,6 +570,46 @@ async def test_a_patch_losing_to_a_decide_gets_review_not_pending(
 # --------------------------------------------------------------------------- #
 
 
+async def test_the_scalar_metadata_fields_round_trip_through_the_alias(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """``yield`` is a Python keyword, so the field is only reachable by alias."""
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}",
+            json={
+                "yield": "Serves 6",
+                "prep_time": "15 min",
+                "cook_time": "1 hr",
+                "total_time": None,
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    structured = (await _reload(db_session, item.id)).structured_data
+    assert structured["yield"] == "Serves 6"
+    assert structured["prep_time"] == "15 min"
+    assert structured["cook_time"] == "1 hr"
+    assert structured["total_time"] is None
+    # A scalar-only edit touches no lines, so the body is left alone.
+    assert (await _reload(db_session, item.id)).body_text == _BODY_TEXT
+
+
+async def test_an_unknown_id_reports_as_unknown_whatever_the_body_says(
+    client: httpx.AsyncClient,
+) -> None:
+    """The empty-body 400 must not mask the 404 (guard-order regression)."""
+    async with client:
+        resp = await client.patch("/api/v1/knowledge-items/item_nope", json={})
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "knowledge_item_not_found"
+
+
 async def test_an_empty_patch_is_rejected(
     client: httpx.AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -586,6 +631,9 @@ async def test_an_empty_patch_is_rejected(
         pytest.param({"title": "   "}, id="blank-title"),
         pytest.param({"ingredients": ["1 cup beans", "  "]}, id="blank-ingredient"),
         pytest.param({"steps": [""]}, id="blank-step"),
+        pytest.param({"ingredients": None}, id="null-ingredients"),
+        pytest.param({"steps": None}, id="null-steps"),
+        pytest.param({"yield_": "Serves 6"}, id="yield-by-field-name-not-alias"),
         pytest.param({"confidence": {"overall": 1.0}}, id="machine-owned-field"),
         pytest.param({"warnings": []}, id="warnings-not-writable"),
         pytest.param({"source_span_ids": ["span_1"]}, id="provenance-not-writable"),

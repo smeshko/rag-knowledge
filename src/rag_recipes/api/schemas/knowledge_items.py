@@ -89,14 +89,23 @@ class KnowledgeItemUpdateRequest(BaseModel):
     steps: list[str] | None = None
 
     @model_validator(mode="after")
-    def _title_must_be_a_real_title(self) -> KnowledgeItemUpdateRequest:
-        """``title`` is NOT NULL on the row and hard-validated non-empty at ingest.
+    def _non_nullable_fields_are_not_nulled(self) -> KnowledgeItemUpdateRequest:
+        """Reject an explicit null on the fields that have no "cleared" meaning.
 
-        Absent is fine (leave it alone); explicit null and whitespace-only are
-        not — either would persist a title no ingested item could have carried.
+        ``title`` is NOT NULL on the row and hard-validated non-empty at ingest,
+        so neither an explicit null nor whitespace-only can be honoured. The two
+        lists are whole-array replacement: an empty section is ``[]``, and a
+        client that serialises it as ``null`` instead is making a mistake worth
+        hearing about rather than a 500 three layers down.
+
+        Absent is always fine — it means "leave this alone".
         """
-        if "title" in self.model_fields_set and not (self.title or "").strip():
+        supplied = self.model_fields_set
+        if "title" in supplied and not (self.title or "").strip():
             raise ValueError("title must be a non-empty string")
+        for name in ("ingredients", "steps"):
+            if name in supplied and getattr(self, name) is None:
+                raise ValueError(f"{name} must be a list, not null (send [] to empty it)")
         return self
 
     @field_validator("ingredients", "steps")

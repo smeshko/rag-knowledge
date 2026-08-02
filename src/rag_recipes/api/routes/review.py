@@ -47,7 +47,13 @@ from rag_recipes.api.schemas.review import (
     ReviewResponse,
 )
 from rag_recipes.api.search_projection import top_ingredients
-from rag_recipes.ingestion.editing import UNSET, RecipeEdit, apply_edit, warnings_for_item
+from rag_recipes.ingestion.editing import (
+    UNSET,
+    RecipeEdit,
+    Unset,
+    apply_edit,
+    warnings_for_item,
+)
 from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
 from rag_recipes.ingestion.queue import enqueue_job
 from rag_recipes.ingestion.status import TERMINAL_STATUSES
@@ -71,8 +77,8 @@ def _source_pages(
     """Min/max page bounds over the item's resolved span locators.
 
     Keys are read with ``.get`` and skipped when absent (the
-    ``_pdf_page_label`` precedent) — a degraded locator must never 500 the
-    whole listing. Both bounds are ``None`` when nothing resolves.
+    ``knowledge_item_view.pdf_page_label`` precedent) — a degraded locator must
+    never 500 the whole listing. Both bounds are ``None`` when nothing resolves.
     """
     starts: list[int] = []
     ends: list[int] = []
@@ -190,21 +196,35 @@ def _recipe_edit_from(body: KnowledgeItemUpdateRequest) -> RecipeEdit:
     ``model_fields_set`` is the ``exclude_unset`` semantics the contract needs:
     a field the client never mentioned stays ``UNSET`` and is left alone, while
     one sent as ``null`` is a real instruction to clear it.
+
+    Written out field by field rather than through a ``getattr`` helper so the
+    types survive: a helper returning ``Any`` would let a ``None`` reach a field
+    the domain object types as non-optional without mypy noticing.
     """
     supplied = body.model_fields_set
 
-    def picked(name: str) -> Any:
-        return getattr(body, name) if name in supplied else UNSET
+    def clearable(name: str, value: str | None) -> str | None | Unset:
+        return value if name in supplied else UNSET
+
+    # The schema rejects an explicit null on these three, so "supplied" implies
+    # a real value.
+    title: str | Unset = body.title if "title" in supplied and body.title else UNSET
+    ingredients: list[str] | Unset = (
+        body.ingredients if "ingredients" in supplied and body.ingredients is not None else UNSET
+    )
+    steps: list[str] | Unset = (
+        body.steps if "steps" in supplied and body.steps is not None else UNSET
+    )
 
     return RecipeEdit(
-        title=picked("title"),
-        summary=picked("summary"),
-        yield_=picked("yield_"),
-        prep_time=picked("prep_time"),
-        cook_time=picked("cook_time"),
-        total_time=picked("total_time"),
-        ingredients=picked("ingredients"),
-        steps=picked("steps"),
+        title=title,
+        summary=clearable("summary", body.summary),
+        yield_=clearable("yield_", body.yield_),
+        prep_time=clearable("prep_time", body.prep_time),
+        cook_time=clearable("cook_time", body.cook_time),
+        total_time=clearable("total_time", body.total_time),
+        ingredients=ingredients,
+        steps=steps,
     )
 
 
@@ -230,23 +250,31 @@ async def update_knowledge_item(
 
     Guards run in the same order as ``POST …/review`` so each stays reachable
     rather than masked: 404 unknown id → 409 mid-reprocess document → 409 stale
-    generation → guarded UPDATE → 404 not awaiting review.
-    """
-    edit = _recipe_edit_from(body)
-    if edit.is_empty():
-        raise ApiError(
-            status_code=400,
-            code=ErrorCode.INVALID_REQUEST,
-            message="Request body names no editable field.",
-            details={"item_id": item_id},
-        )
+    generation → guarded UPDATE → 404 not awaiting review. The empty-body 400
+    sits *after* the 404 so an unknown id reports as unknown whatever the body
+    says.
 
+    Not closed here (and not asked for by the epic): two concurrent PATCHes are
+    last-write-wins on content. The guarded UPDATE closes the edit-vs-decide
+    race, and the COALESCE keeps the snapshot at the original extraction, but
+    neither is a content-level precondition — two reviewers editing the same
+    item in two tabs would see the second edit replace the first wholesale.
+    """
     item = await session.get(KnowledgeItem, item_id)
     if item is None:
         raise ApiError(
             status_code=404,
             code=ErrorCode.KNOWLEDGE_ITEM_NOT_FOUND,
             message=f"Knowledge item {item_id!r} not found.",
+            details={"item_id": item_id},
+        )
+
+    edit = _recipe_edit_from(body)
+    if edit.is_empty():
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message="Request body names no editable field.",
             details={"item_id": item_id},
         )
 
