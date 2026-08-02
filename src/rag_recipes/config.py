@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     anthropic_batch_max_submit_attempts: int = Field(default=2, ge=1)
 
     llm_model: str = "gpt-4.1"
+    # Retarget the OpenAI SDK at any OpenAI-*compatible* endpoint (Epic 23.4).
+    # None keeps the SDK's own default (api.openai.com). This is transport only:
+    # the identity label a provider records is set alongside it by the provider
+    # registry, because that label is written to every ExtractionRun row and is
+    # part of the extraction cache key — pointing the client elsewhere without
+    # changing the label would file another vendor's runs under "openai" and let
+    # the two satisfy each other's cache lookups.
+    llm_base_url: str | None = None
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request
     # timeout. retries=0 disables retries (raise on the first 429); the timeout
     # is a float so it feeds chat.completions.create(timeout=…) without a cast.

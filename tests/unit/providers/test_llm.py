@@ -672,6 +672,126 @@ async def test_disabled_observability_never_touches_client() -> None:
     assert fake.observations == []
 
 
+# --- provider identity + base_url (Epic 23.4 TASK-001) ----------------------
+#
+# ``provider`` is no longer a class constant: one OpenAI-compatible transport can
+# serve several vendors, and the label it reports is written to every
+# ``ExtractionRun`` audit row AND is part of the extraction cache key
+# ``(input_hash, provider, model, ...)``. A wrong label therefore both corrupts
+# provenance and lets one vendor's cached run satisfy another's lookup.
+
+
+async def test_provider_identity_defaults_to_openai() -> None:
+    provider = _provider_with(_completion(content='{"ok": true}'))
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert provider.provider == "openai"
+    assert response.provider == "openai"
+
+
+async def test_provider_identity_is_per_instance() -> None:
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="deepseek-v4-pro",
+        provider="deepseek",
+        client=_client(response=_completion(content='{"ok": true}')),
+    )
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # The instance's configured identity wins over the caller-supplied
+    # request.provider ("openai" on _OPENAI_REQUEST) — the audit row and cache
+    # key must reflect the endpoint actually called, not a stale caller label.
+    assert response.provider == "deepseek"
+
+
+async def test_two_identities_on_one_transport_do_not_share_a_label() -> None:
+    openai_provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="shared-model",
+        client=_client(response=_completion(content='{"ok": true}')),
+    )
+    deepseek_provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="shared-model",
+        provider="deepseek",
+        client=_client(response=_completion(content='{"ok": true}')),
+    )
+    first = await openai_provider.generate_structured_output(_OPENAI_REQUEST)
+    second = await deepseek_provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # Same transport class, same model name — only the identity separates them.
+    # This pair is exactly the cache-key collision Epic 23.4 exists to prevent.
+    assert (first.provider, first.model) != (second.provider, second.model) or (
+        first.provider != second.provider
+    )
+    assert first.provider == "openai"
+    assert second.provider == "deepseek"
+
+
+async def test_observability_metadata_carries_instance_identity() -> None:
+    fake = _FakeLangfuse()
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="deepseek-v4-pro",
+        provider="deepseek",
+        client=_client(response=_completion(content='{"ok": true}')),
+        observability=ProviderObservability(fake, enabled=True),
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert fake.start_calls[0]["metadata"]["provider"] == "deepseek"
+
+
+def test_base_url_forwarded_to_sdk_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _capture)
+    OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com/v1",
+    )
+
+    assert captured["base_url"] == "https://api.deepseek.com/v1"
+    # The provider owns retry/backoff; the SDK must stay pinned at 0 even when
+    # pointed at a third-party endpoint.
+    assert captured["max_retries"] == 0
+
+
+def test_base_url_unset_leaves_sdk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _capture)
+    OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1")
+
+    assert captured["base_url"] is None
+    assert captured["max_retries"] == 0
+
+
+def test_injected_client_bypasses_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _explode(**_kwargs: Any) -> Any:  # pragma: no cover - must never run
+        raise AssertionError("AsyncOpenAI must not be constructed when a client is injected")
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _explode)
+    injected = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        base_url="https://api.deepseek.com/v1",
+        client=injected,
+    )
+
+    assert provider._client is injected
+
+
 # === AnthropicLLMProvider ===================================================
 
 

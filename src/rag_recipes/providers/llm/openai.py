@@ -95,10 +95,15 @@ class OpenAILLMProvider(LLMProvider):
     explicit Epic-9 concern and a post-generation timeout can't trigger duplicate
     billable generations the audit record never sees (DECISIONS § 4).
 
-    The response provenance ``provider`` is the provider's own identity
-    (``provider``), not the caller-supplied ``request.provider``: this class can
-    only ever produce OpenAI generations, so the audit/cache label must reflect
-    that regardless of a stale or mistaken caller label.
+    ``base_url`` retargets the SDK client at any OpenAI-**compatible** endpoint,
+    and ``provider`` is the identity label that endpoint's generations are
+    recorded under (Epic 23.4). The two travel together: the response provenance
+    is always this instance's ``provider``, never the caller-supplied
+    ``request.provider``, because the label is what the ``ExtractionRun`` audit
+    row and the extraction cache key are keyed on — so it must describe the
+    endpoint actually called, not a stale or mistaken caller label. Setting
+    ``base_url`` without setting ``provider`` would file another vendor's runs
+    under ``openai`` and let them satisfy each other's cache lookups.
     """
 
     provider = "openai"
@@ -108,12 +113,17 @@ class OpenAILLMProvider(LLMProvider):
         api_key: str,
         *,
         default_model: str,
+        provider: str = "openai",
+        base_url: str | None = None,
         client: AsyncOpenAI | None = None,
         observability: ProviderObservability | None = None,
         max_rate_limit_retries: int = 5,
         request_timeout: float = 60.0,
     ) -> None:
-        self._client = client or AsyncOpenAI(api_key=api_key, max_retries=0)
+        self._client = client or AsyncOpenAI(
+            api_key=api_key, base_url=base_url, max_retries=0
+        )
+        self.provider = provider
         self.default_model = default_model
         self._obs = observability or ProviderObservability(None, enabled=False)
         # Phase 9.5: explicit retry/timeout, kept separate from the SDK (pinned at
