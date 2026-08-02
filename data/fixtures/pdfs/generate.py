@@ -4,9 +4,12 @@ Run with ``uv run python data/fixtures/pdfs/generate.py``. The output is
 byte-stable: PDF metadata dates are pinned and the document ``/ID`` is fixed, so
 re-running produces an identical file (the determinism acceptance criterion).
 
-The fixture has three pages of recipe-like text plus one deliberately empty page
-(page 3) that falls below ``PDF_MIN_TEXT_CHARS_FOR_PAGE`` so the extractor's
-sparse-page flagging is exercised.
+The fixture has two pages of recipe-like text plus two deliberately sparse pages
+that fall below ``PDF_MIN_TEXT_CHARS_FOR_PAGE`` so the extractor's sparse-page
+flagging is exercised: page 3 is empty, and page 4 carries a short image-plate
+caption. The two differ on purpose — an implementation that flagged sparse pages
+but *blanked their text* would be indistinguishable from a correct one if every
+sparse page were empty, and real cookbooks' image plates carry short captions.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ _PAGES: list[str] = [
     "Instructions\nMix the dry ingredients.\nWhisk in the eggs and milk.\n"
     "Cook on a hot griddle until golden.",
     "",  # intentionally empty -> sub-threshold page
+    "Plate 4",  # short caption -> sub-threshold page that still carries text
 ]
 
 

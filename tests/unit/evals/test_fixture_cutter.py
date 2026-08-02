@@ -1,9 +1,11 @@
 """Tests for ``evals.fixture_cutter`` (Epic 23 Phase 23.1).
 
 Hermetic by construction: every test cuts from the *generated*
-``data/fixtures/pdfs/sample_recipe.pdf`` (3 pages, page 3 deliberately empty so
-the sub-threshold flagging path is exercised) into ``tmp_path``. No test opens a
-real cookbook under ``~/Downloads/books``.
+``data/fixtures/pdfs/sample_recipe.pdf`` (4 pages: 1-2 dense recipe text, 3
+deliberately empty, 4 a short ``Plate 4`` caption — both sub-threshold, so the
+flagging path is exercised *and* text preservation on a flagged page is
+provable) into ``tmp_path``. No test opens a real cookbook under
+``~/Downloads/books``.
 """
 
 from __future__ import annotations
@@ -188,6 +190,34 @@ async def test_sub_threshold_pages_are_kept_and_flagged(tmp_path: Path) -> None:
     assert result.flagged_pages == (3,)
     # Preserved, never dropped — production persists these pages too.
     assert result.source_md == pages[1].text + PAGE_SEPARATOR + pages[2].text
+
+
+async def test_sub_threshold_page_keeps_its_text_verbatim(tmp_path: Path) -> None:
+    """AC3, sharpened: a flagged page's *text* survives, not just its slot.
+
+    The empty page 3 cannot prove this — ``page2 + "\\n\\n" + ""`` is what an
+    implementation that blanked flagged pages would also produce. Page 4 is a
+    short, non-empty image-plate caption, exactly the case production keeps
+    (RESEARCH.md records real 35-char plate pages in the corpus).
+    """
+    pages = await _pages()
+    caption = pages[3].text
+    assert pages[3].confidence == 0.0
+    assert caption.strip() == "Plate 4"
+    assert len(caption) < DEFAULT_MIN_TEXT_CHARS  # genuinely sub-threshold
+
+    [result] = await _cut(tmp_path, [(2, 4)])
+    assert result.flagged_pages == (3, 4)
+    assert result.source_md.endswith(caption)
+    assert "Plate 4" in (result.path / "source.md").read_text(encoding="utf-8")
+    assert result.source_md == PAGE_SEPARATOR.join([pages[1].text, "", caption])
+
+
+async def test_a_lone_flagged_page_is_cut_with_its_caption(tmp_path: Path) -> None:
+    pages = await _pages()
+    [result] = await _cut(tmp_path, [(4, 4)])
+    assert result.flagged_pages == (4,)
+    assert (result.path / "source.md").read_text(encoding="utf-8") == pages[3].text
 
 
 async def test_pages_above_threshold_are_not_flagged(tmp_path: Path) -> None:
