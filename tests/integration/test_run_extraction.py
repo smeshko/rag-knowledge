@@ -358,3 +358,86 @@ async def test_differing_model_is_a_cache_miss(db_session: AsyncSession) -> None
     assert len(other_provider.calls) == 1
     assert run.status == ExtractionRunStatus.SUCCESS
     assert run.model == "model-b"
+
+
+@pytest.mark.asyncio
+async def test_differing_provider_identity_is_a_cache_miss(db_session: AsyncSession) -> None:
+    """Two vendors on the same model name must never share a cached run.
+
+    This is the criterion protecting Phase 23.5's whole comparison. Since Epic
+    23.4 one OpenAI-compatible transport can serve several vendors, so the only
+    thing separating a DeepSeek run from an OpenAI run at the same model name is
+    the identity label — and that label is a cache-key component. If it leaked,
+    a "DeepSeek" eval could silently be served OpenAI's cached output and the
+    migrate/don't-migrate decision would rest on the incumbent's own numbers.
+
+    `provider` is an instance attribute since TASK-001, so relabelling a Fake is
+    legal and mypy-clean; `FakeLLMProvider` takes no `provider` kwarg because it
+    echoes `request.provider` at response time, which is a separate concern.
+    """
+    document_id, window = await _make_document_and_window(db_session)
+    payload = _canned_success_payload()
+
+    incumbent = FakeLLMProvider(default_output=payload, default_model="shared-model")
+    incumbent.provider = "openai"
+    first = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=incumbent,
+    )
+    assert first.provider == "openai"
+
+    # Same window, same model, same prompt/schema version — ONLY the identity
+    # differs. The cache lookup filters on provider, so this must miss.
+    candidate = FakeLLMProvider(default_output=payload, default_model="shared-model")
+    candidate.provider = "deepseek"
+    second = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=candidate,
+    )
+
+    assert len(candidate.calls) == 1, "cross-vendor cache hit: the candidate was never called"
+    assert second.status == ExtractionRunStatus.SUCCESS
+    assert second.provider == "deepseek"
+    assert second.model == first.model
+    assert second.input_hash == first.input_hash
+    assert second.id != first.id
+
+
+@pytest.mark.asyncio
+async def test_same_provider_identity_still_hits_the_cache(db_session: AsyncSession) -> None:
+    """The negative control for the test above.
+
+    Without this, a cache that never hit at all would satisfy the isolation
+    assertion while quietly re-paying for every window.
+    """
+    document_id, window = await _make_document_and_window(db_session)
+    payload = _canned_success_payload()
+
+    first_provider = FakeLLMProvider(default_output=payload, default_model="shared-model")
+    first_provider.provider = "deepseek"
+    await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=first_provider,
+    )
+
+    second_provider = FakeLLMProvider(default_output=payload, default_model="shared-model")
+    second_provider.provider = "deepseek"
+    run = await run_extraction(
+        db_session,
+        window,
+        source_version=SOURCE_VERSION,
+        document_id=document_id,
+        provider=second_provider,
+    )
+
+    assert len(second_provider.calls) == 0, "identical key should have been served from cache"
+    assert run.status == ExtractionRunStatus.SUCCESS

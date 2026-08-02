@@ -19,9 +19,11 @@ from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.embeddings.openai import OpenAIEmbeddingProvider
 from rag_recipes.providers.file_storage.base import FileStorageProvider
 from rag_recipes.providers.file_storage.local import LocalFileStorage
-from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
 from rag_recipes.providers.llm.base import LLMProvider
-from rag_recipes.providers.llm.openai import OpenAILLMProvider
+from rag_recipes.providers.llm.registry import (
+    build_llm_provider,
+    resolve_extraction_model,
+)
 from rag_recipes.providers.reranker.base import RerankerProvider
 from rag_recipes.providers.reranker.openai import OpenAIRerankerProvider
 
@@ -76,42 +78,40 @@ def get_llm_provider(
 ) -> LLMProvider:
     """Build the production LLM provider for the query-time answer endpoint.
 
-    Tests override this with a ``FakeLLMProvider``. Dispatches on
-    ``settings.llm_provider`` (Epic 19.1): ``"anthropic"`` builds Claude on the
-    Anthropic settings, anything else stays OpenAI (the default). On OpenAI the
-    model resolves to ``answer_llm_model`` when set, else ``llm_model`` (a
-    class-level default can't reference a sibling field, so the fallback lives
-    here). On Anthropic the answer model is ``anthropic_llm_model`` — the
-    OpenAI-shaped ``answer_llm_model`` override is **deliberately ignored** so a
-    deployment that set ``ANSWER_LLM_MODEL=gpt-4.1-mini`` can't route a GPT id to
-    Claude (DECISIONS #5).
+    Tests override this with a ``FakeLLMProvider``. Construction goes through the
+    provider registry (Epic 23.4); the one thing this site owns is *which model*
+    the answer layer gets — see ``resolve_answer_model``.
 
     Like ``get_embedding_provider``, no ``ProviderObservability`` is injected —
     request-time providers are deliberately untraced (answers are synchronous,
     not a traced ingestion job), so the answer layer inherits the provider's
-    retry + parse-error handling but not Langfuse tracing (deferred). The config
-    validator guarantees ``anthropic_api_key`` when Anthropic is selected; the
-    ``None`` narrow is defense-in-depth and satisfies mypy.
+    retry + parse-error handling but not Langfuse tracing (deferred).
     """
-    if settings.llm_provider == "anthropic":
-        api_key = settings.anthropic_api_key
-        if api_key is None:
-            raise ValueError(
-                "anthropic_api_key is required when llm_provider == 'anthropic'"
-            )
-        return AnthropicLLMProvider(
-            api_key,
-            default_model=settings.anthropic_llm_model,
-            max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-            request_timeout=settings.llm_request_timeout_seconds,
-            max_tokens=settings.anthropic_max_tokens,
-        )
-    return OpenAILLMProvider(
-        settings.openai_api_key,
-        default_model=settings.answer_llm_model or settings.llm_model,
-        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-        request_timeout=settings.llm_request_timeout_seconds,
-    )
+    return build_llm_provider(settings, model=resolve_answer_model(settings))
+
+
+def resolve_answer_model(settings: Settings) -> str:
+    """The model the answer layer should use for the configured provider.
+
+    On OpenAI this is ``answer_llm_model`` when set, else ``llm_model`` — a
+    class-level default can't reference a sibling field, so the fallback lives
+    here. On **every other** provider the OpenAI-shaped ``answer_llm_model``
+    override is deliberately ignored, so a deployment that set
+    ``ANSWER_LLM_MODEL=gpt-4.1-mini`` can't route a GPT id to Claude or to
+    DeepSeek (Epic 19.1 DECISIONS #5, generalised in 23.4).
+
+    This lives at the call site rather than in the registry on purpose: it is a
+    concern of the answer route, not of provider construction, and keeping it here
+    is what lets the registry stay free of per-caller model policy.
+
+    The ``llm_provider == "openai"`` test below is deliberately *not* a dispatch
+    table — it is the policy statement "an OpenAI-shaped model override applies
+    only to OpenAI". Registering a fourth provider needs no edit here: it falls to
+    the ``else`` and gets its own extraction model, which is the safe default.
+    """
+    if settings.llm_provider == "openai" and settings.answer_llm_model:
+        return settings.answer_llm_model
+    return resolve_extraction_model(settings)
 
 
 def get_reranker_provider(

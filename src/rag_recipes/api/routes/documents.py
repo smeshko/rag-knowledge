@@ -366,6 +366,11 @@ async def _create_document_from_upload(
 
 
 def _anthropic_batch_enabled(settings: Settings) -> bool:
+    # Deliberately NOT routed through the provider registry (Epic 23.4). The batch
+    # path is Anthropic-specific by construction — AnthropicBatchProvider sits
+    # outside the LLMProvider ABC and ingestion/batch.py no-ops for anything else —
+    # so a provider-agnostic lookup here would advertise a capability no other
+    # registered provider has. This is the one surviving llm_provider comparison.
     return settings.llm_provider == "anthropic" and bool(settings.anthropic_api_key)
 
 

@@ -206,6 +206,55 @@ class TestOpenAILLM(LLMContract):
         )
 
 
+_DEEPSEEK_REQUEST = StructuredOutputRequest(
+    provider="deepseek",
+    model="deepseek-v4-pro",
+    prompt_version="recipe-v1",
+    schema_version="recipe.v1",
+    input="Return ok=true",
+    json_schema=_STRICT_SCHEMA,
+)
+
+
+class TestDeepSeekLLM(LLMContract):
+    """The DeepSeek configuration must satisfy the same interface guarantees.
+
+    Same transport class as OpenAI, different endpoint, different identity, and
+    a forced tool call instead of response_format — so it is a genuinely
+    different code path through the provider, not a relabelled duplicate.
+
+    Note `LLMContract.test_reports_provider_and_model` asserts
+    `response.provider == sample_request.provider`, while the provider returns
+    `self.provider`. Both must therefore say "deepseek"; a mismatch here is the
+    contract checking label agreement, not the transport being broken.
+    """
+
+    @pytest.fixture
+    def provider(self) -> OpenAILLMProvider:
+        return OpenAILLMProvider(
+            api_key="sk-ds-test",
+            default_model="deepseek-v4-pro",
+            provider="deepseek",
+            base_url="https://api.deepseek.com/v1",
+            structured_output_mode="strict_tool",
+            client=_client(response=_tool_completion(arguments='{"ok": true}')),
+        )
+
+    @pytest.fixture
+    def sample_request(self) -> StructuredOutputRequest:
+        return _DEEPSEEK_REQUEST
+
+    @pytest.fixture
+    def failure_provider(self) -> OpenAILLMProvider:
+        return OpenAILLMProvider(
+            api_key="sk-ds-test",
+            default_model="deepseek-v4-pro",
+            provider="deepseek",
+            structured_output_mode="strict_tool",
+            client=_client(error=APITimeoutError(request=_REQUEST_OBJ)),
+        )
+
+
 # --- bespoke OpenAILLMProvider tests ----------------------------------------
 
 
@@ -670,6 +719,313 @@ async def test_disabled_observability_never_touches_client() -> None:
 
     assert fake.start_calls == []
     assert fake.observations == []
+
+
+# --- provider identity + base_url (Epic 23.4 TASK-001) ----------------------
+#
+# ``provider`` is no longer a class constant: one OpenAI-compatible transport can
+# serve several vendors, and the label it reports is written to every
+# ``ExtractionRun`` audit row AND is part of the extraction cache key
+# ``(input_hash, provider, model, ...)``. A wrong label therefore both corrupts
+# provenance and lets one vendor's cached run satisfy another's lookup.
+
+
+async def test_provider_identity_defaults_to_openai() -> None:
+    provider = _provider_with(_completion(content='{"ok": true}'))
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert provider.provider == "openai"
+    assert response.provider == "openai"
+
+
+async def test_provider_identity_is_per_instance() -> None:
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="deepseek-v4-pro",
+        provider="deepseek",
+        client=_client(response=_completion(content='{"ok": true}')),
+    )
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # The instance's configured identity wins over the caller-supplied
+    # request.provider ("openai" on _OPENAI_REQUEST) — the audit row and cache
+    # key must reflect the endpoint actually called, not a stale caller label.
+    assert response.provider == "deepseek"
+
+
+async def test_two_identities_on_one_transport_do_not_share_a_label() -> None:
+    openai_provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="shared-model",
+        client=_client(response=_completion(content='{"ok": true}')),
+    )
+    deepseek_provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="shared-model",
+        provider="deepseek",
+        client=_client(response=_completion(content='{"ok": true}')),
+    )
+    first = await openai_provider.generate_structured_output(_OPENAI_REQUEST)
+    second = await deepseek_provider.generate_structured_output(_OPENAI_REQUEST)
+
+    # Same transport class, same model name — only the identity separates them.
+    # This pair is exactly the cache-key collision Epic 23.4 exists to prevent.
+    assert (first.provider, first.model) != (second.provider, second.model) or (
+        first.provider != second.provider
+    )
+    assert first.provider == "openai"
+    assert second.provider == "deepseek"
+
+
+async def test_observability_metadata_carries_instance_identity() -> None:
+    fake = _FakeLangfuse()
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="deepseek-v4-pro",
+        provider="deepseek",
+        client=_client(response=_completion(content='{"ok": true}')),
+        observability=ProviderObservability(fake, enabled=True),
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert fake.start_calls[0]["metadata"]["provider"] == "deepseek"
+
+
+def test_base_url_forwarded_to_sdk_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _capture)
+    OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com/v1",
+    )
+
+    assert captured["base_url"] == "https://api.deepseek.com/v1"
+    # The provider owns retry/backoff; the SDK must stay pinned at 0 even when
+    # pointed at a third-party endpoint.
+    assert captured["max_retries"] == 0
+
+
+def test_base_url_unset_leaves_sdk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _capture)
+    OpenAILLMProvider(api_key="sk-test", default_model="gpt-4.1")
+
+    assert captured["base_url"] is None
+    assert captured["max_retries"] == 0
+
+
+def test_injected_client_bypasses_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _explode(**_kwargs: Any) -> Any:  # pragma: no cover - must never run
+        raise AssertionError("AsyncOpenAI must not be constructed when a client is injected")
+
+    monkeypatch.setattr("rag_recipes.providers.llm.openai.AsyncOpenAI", _explode)
+    injected = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="gpt-4.1",
+        base_url="https://api.deepseek.com/v1",
+        client=injected,
+    )
+
+    assert provider._client is injected
+
+
+# --- structured-output modes (Epic 23.4 TASK-002) ---------------------------
+#
+# DeepSeek's response_format accepts only "text" and "json_object" — there is no
+# json_schema variant — so schema-constrained output on OpenAI-compatible vendors
+# has to go through a forced tool call. The three modes MUST agree on parse
+# semantics: a cross-provider eval that scores the same model output differently
+# depending on how it was requested is not a comparison at all.
+
+
+@dataclass
+class _FakeFunction:
+    arguments: str | None
+    name: str = "recipe_v1"
+
+
+@dataclass
+class _FakeToolCall:
+    function: _FakeFunction
+    id: str = "call_1"
+    type: str = "function"
+
+
+@dataclass
+class _FakeToolMessage:
+    """A completion message carrying a forced tool call rather than content."""
+
+    tool_calls: list[_FakeToolCall] | None = None
+    content: str | None = None
+    refusal: str | None = None
+
+
+def _tool_completion(
+    *,
+    arguments: str | None = None,
+    refusal: str | None = None,
+    finish_reason: str = "stop",
+    omit_tool_call: bool = False,
+) -> _FakeCompletion:
+    tool_calls = (
+        None
+        if omit_tool_call or arguments is None
+        else [_FakeToolCall(function=_FakeFunction(arguments=arguments))]
+    )
+    return _FakeCompletion(
+        choices=[
+            _FakeChoice(
+                message=_FakeToolMessage(tool_calls=tool_calls, refusal=refusal),  # type: ignore[arg-type]
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=_DEFAULT_USAGE,
+    )
+
+
+_TOOL_MODES = ["strict_tool", "tool"]
+_ALL_MODES = ["json_schema", *_TOOL_MODES]
+
+# (case id, payload, refusal, finish_reason) → the parse verdict must not depend
+# on the mode. Payload is what the vendor returned, however it was carried.
+_PARSE_CASES = [
+    ("clean_object", '{"ok": true}', None, "stop", {"ok": True}, None),
+    (
+        "not_json",
+        "sorry, no",
+        None,
+        "stop",
+        None,
+        "model output is not valid JSON",
+    ),
+    ("json_non_object", "[1, 2]", None, "stop", None, "model output is not a JSON object"),
+    (
+        "refusal",
+        None,
+        "cannot comply",
+        "stop",
+        None,
+        "model refused to generate output: cannot comply",
+    ),
+    (
+        "truncated",
+        '{"ok"',
+        None,
+        "length",
+        None,
+        "output truncated by provider (finish_reason=length)",
+    ),
+]
+
+
+def _completion_for(
+    mode: str,
+    payload: str | None,
+    refusal: str | None,
+    finish_reason: str,
+) -> _FakeCompletion:
+    if mode == "json_schema":
+        return _completion(content=payload, refusal=refusal, finish_reason=finish_reason)
+    return _tool_completion(
+        arguments=payload, refusal=refusal, finish_reason=finish_reason
+    )
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES)
+@pytest.mark.parametrize(
+    ("case_id", "payload", "refusal", "finish_reason", "expected_json", "expected_error"),
+    _PARSE_CASES,
+    ids=[case[0] for case in _PARSE_CASES],
+)
+async def test_parse_semantics_are_identical_across_modes(
+    mode: str,
+    case_id: str,
+    payload: str | None,
+    refusal: str | None,
+    finish_reason: str,
+    expected_json: dict[str, Any] | None,
+    expected_error: str | None,
+) -> None:
+    client = _client(response=_completion_for(mode, payload, refusal, finish_reason))
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="m",
+        structured_output_mode=mode,  # type: ignore[arg-type]
+        client=client,
+    )
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json == expected_json
+    assert response.parse_error == expected_error
+    assert response.raw_text == (payload if payload is not None else (refusal or ""))
+    assert response.usage.input_tokens == _DEFAULT_USAGE.prompt_tokens
+    assert response.usage.output_tokens == _DEFAULT_USAGE.completion_tokens
+
+
+@pytest.mark.parametrize("mode", _TOOL_MODES)
+async def test_tool_mode_without_a_tool_call_is_a_rejection_not_a_crash(mode: str) -> None:
+    client = _client(response=_tool_completion(omit_tool_call=True))
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="m",
+        structured_output_mode=mode,  # type: ignore[arg-type]
+        client=client,
+    )
+    response = await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    assert response.output_json is None
+    assert response.parse_error == "model did not return structured output (no tool_call block)"
+
+
+async def test_json_schema_mode_request_is_unchanged() -> None:
+    client = _client(response=_completion(content='{"ok": true}'))
+    provider = OpenAILLMProvider(api_key="sk-test", default_model="m", client=client)
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    kwargs = client.completions.calls[0]
+    assert kwargs["response_format"]["json_schema"]["strict"] is True
+    assert kwargs["response_format"]["json_schema"]["schema"] == _OPENAI_REQUEST.json_schema
+    # The default path must send no tool fields at all — a vendor that supports
+    # one mechanism generally rejects a request carrying both.
+    assert "tools" not in kwargs
+    assert "tool_choice" not in kwargs
+
+
+@pytest.mark.parametrize(("mode", "expect_strict"), [("strict_tool", True), ("tool", False)])
+async def test_tool_mode_request_shape(mode: str, expect_strict: bool) -> None:
+    client = _client(response=_tool_completion(arguments='{"ok": true}'))
+    provider = OpenAILLMProvider(
+        api_key="sk-test",
+        default_model="m",
+        structured_output_mode=mode,  # type: ignore[arg-type]
+        client=client,
+    )
+    await provider.generate_structured_output(_OPENAI_REQUEST)
+
+    kwargs = client.completions.calls[0]
+    assert "response_format" not in kwargs
+    function = kwargs["tools"][0]["function"]
+    assert function["parameters"] == _OPENAI_REQUEST.json_schema
+    assert function.get("strict", False) is expect_strict
+    assert kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": function["name"]},
+    }
+    # Reuses _schema_name rather than a second sanitiser, so the tool name is
+    # subject to OpenAI's ^[a-zA-Z0-9_-]{1,64}$ constraint like the schema name.
+    assert _NAME_RE.match(function["name"])
 
 
 # === AnthropicLLMProvider ===================================================

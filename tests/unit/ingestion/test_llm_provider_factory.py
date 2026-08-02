@@ -29,6 +29,12 @@ def _settings(
         llm_model = "gpt-4.1"
         llm_max_rate_limit_retries = 5
         llm_request_timeout_seconds = 60.0
+        # Epic 23.4: the registry's openai factory reads these. Extending a
+        # duck-typed stub with fields production now reads is a fixture change,
+        # not a behaviour change — every assertion below is unchanged.
+        llm_base_url = None
+        llm_provider_label = None
+        llm_structured_output_mode = None
 
     s = _S()
     s.llm_provider = llm_provider

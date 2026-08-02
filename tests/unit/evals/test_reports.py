@@ -31,6 +31,8 @@ from evals.reports import (
 )
 from pydantic import BaseModel
 
+from rag_recipes.providers.llm.registry import get_spec, supported_providers
+
 RUN_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-")
 
 
@@ -208,6 +210,39 @@ def test_provider_resolution_anthropic_branch() -> None:
     metadata = build_metadata("run", settings=_SettingsStandIn(llm_provider="anthropic"))
     assert metadata.llm_provider == "anthropic"
     assert metadata.llm_model == "claude-sonnet-4-6"
+
+
+@pytest.mark.parametrize("provider_name", sorted(supported_providers()))
+def test_run_metadata_reads_each_registered_provider_s_own_model_field(
+    provider_name: str,
+) -> None:
+    """Every registered provider must be stamped with *its* model, not ``llm_model``.
+
+    This metadata is committed inside every baseline and read by ``rag-evals
+    diff``, so a provider that falls through to ``llm_model`` labels a DeepSeek
+    run as ``gpt-4.1`` — misattributing the artifact a migration decision rests
+    on. ``build_metadata``'s own docstring already warns about exactly this for
+    Anthropic; parametrising over the registry means a newly registered provider
+    is covered the moment it is added, rather than when someone remembers.
+
+    The stand-in carries *only* the field its provider's spec names, so a
+    hardcoded ``settings.llm_model`` raises rather than silently returning the
+    wrong string.
+    """
+    spec = get_spec(provider_name)
+
+    class _S:
+        embedding_provider = "openai"
+        embedding_model = "text-embedding-3-small"
+        llm_provider = provider_name
+
+    stand_in = _S()
+    setattr(stand_in, spec.model_field, f"model-for-{provider_name}")
+
+    metadata = build_metadata("run", settings=stand_in)  # type: ignore[arg-type]
+
+    assert metadata.llm_provider == provider_name
+    assert metadata.llm_model == f"model-for-{provider_name}"
 
 
 def test_results_json_contains_no_secret_field_names(tmp_path: Path) -> None:

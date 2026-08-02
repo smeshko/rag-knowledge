@@ -61,7 +61,14 @@ BASELINES_ROOT = Path(__file__).resolve().parents[1] / "evals" / "baselines"
 
 
 class SettingsLike(Protocol):
-    """The five settings attributes the report metadata reads (and nothing more)."""
+    """The settings attributes the report metadata reads (and nothing more).
+
+    ``llm_model`` and ``anthropic_llm_model`` are declared because they are this
+    repo's two extraction-model fields today; the actual field read is chosen by
+    the provider registry from the selected provider's spec, so a third provider
+    contributes its own field without an edit here. A stub passed in a test must
+    therefore carry whichever model field its ``llm_provider`` names.
+    """
 
     @property
     def embedding_provider(self) -> str: ...
@@ -155,7 +162,11 @@ def build_metadata(label: str, *, settings: SettingsLike | None = None) -> RunMe
     ``settings`` is injectable so tests stay hermetic; ``None`` falls back to the
     real ``get_settings()``. Reading ``settings.llm_model`` unconditionally would
     stamp ``gpt-4.1`` on an Anthropic run, so the model is resolved through
-    ``llm_provider`` (DECISIONS #4). Only the five named fields are read.
+    ``llm_provider`` (DECISIONS #4) — since Epic 23.4 via the provider registry,
+    so a newly registered provider cannot be silently mislabelled here. That
+    matters more than it looks: this metadata is committed inside every baseline
+    and read by ``rag-evals diff``, so a wrong ``llm_model`` misattributes the
+    artifact a provider-migration decision rests on. Only named fields are read.
     """
     if settings is None:
         from rag_recipes.config import get_settings
@@ -164,12 +175,9 @@ def build_metadata(label: str, *, settings: SettingsLike | None = None) -> RunMe
     # Lazy import: keeps `import evals.reports` (and the rag-evals CLI) from
     # pulling in the whole extraction pipeline at startup.
     from rag_recipes.ingestion.pipeline.extraction import PROMPT_VERSION, SCHEMA_VERSION
+    from rag_recipes.providers.llm.registry import resolve_extraction_model
 
-    llm_model = (
-        settings.anthropic_llm_model
-        if settings.llm_provider == "anthropic"
-        else settings.llm_model
-    )
+    llm_model = resolve_extraction_model(settings)
     return RunMetadata(
         timestamp=datetime.now(UTC).isoformat(timespec="seconds"),
         git_commit=_git_commit(),

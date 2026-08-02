@@ -44,32 +44,17 @@ _CUT_MIN_TEXT_CHARS = 20
 def _build_llm_provider(settings: Settings) -> LLMProvider:
     """Construct the live extraction LLM provider from settings.
 
-    Mirrors ``rag_recipes.ingestion.jobs._build_llm_provider`` (module-private,
-    so not imported): dispatch on ``settings.llm_provider`` — ``"anthropic"``
-    builds Claude on the Anthropic settings, anything else stays OpenAI. Not
-    ``api.dependencies.get_llm_provider``, which resolves the *answer* model.
-    Never exercised by tests (they monkeypatch this seam).
-    """
-    from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
-    from rag_recipes.providers.llm.openai import OpenAILLMProvider
+    Delegates to the provider registry (Epic 23.4), which resolves the
+    *extraction* model — not ``api.dependencies.get_llm_provider``, which resolves
+    the *answer* model. This wrapper survives as the monkeypatch seam the tests
+    replace with a ``FakeLLMProvider``; it is never itself exercised by a test.
 
-    if settings.llm_provider == "anthropic":
-        api_key = settings.anthropic_api_key
-        if api_key is None:
-            raise ValueError("anthropic_api_key is required when llm_provider == 'anthropic'")
-        return AnthropicLLMProvider(
-            api_key,
-            default_model=settings.anthropic_llm_model,
-            max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-            request_timeout=settings.llm_request_timeout_seconds,
-            max_tokens=settings.anthropic_max_tokens,
-        )
-    return OpenAILLMProvider(
-        settings.openai_api_key,
-        default_model=settings.llm_model,
-        max_rate_limit_retries=settings.llm_max_rate_limit_retries,
-        request_timeout=settings.llm_request_timeout_seconds,
-    )
+    The import stays inside the body so importing this module — and rendering
+    ``--help`` — cannot reach a provider, per the module docstring.
+    """
+    from rag_recipes.providers.llm.registry import build_llm_provider
+
+    return build_llm_provider(settings)
 
 
 @app.command("extraction")

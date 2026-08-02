@@ -59,7 +59,37 @@ class Settings(BaseSettings):
     anthropic_batch_poll_interval_minutes: int = Field(default=5, ge=1)
     anthropic_batch_max_submit_attempts: int = Field(default=2, ge=1)
 
+    # DeepSeek (Epic 23.4) — OpenAI-compatible transport on its own endpoint, so
+    # it reuses OpenAILLMProvider rather than adding a client. deepseek_api_key is
+    # only required when selected (the registry-driven cross-field validator
+    # enforces that). The model id and base URL are settings, not constants,
+    # because both were established from a dated docs check rather than from a
+    # live call — Phase 23.5 may need to retarget without a code change.
+    deepseek_api_key: str | None = None
+    deepseek_llm_model: str = "deepseek-v4-pro"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+
     llm_model: str = "gpt-4.1"
+    # Retarget the OpenAI SDK at any OpenAI-*compatible* endpoint (Epic 23.4).
+    # None keeps the SDK's own default (api.openai.com). This is transport only:
+    # the identity label a provider records is set alongside it by the provider
+    # registry, because that label is written to every ExtractionRun row and is
+    # part of the extraction cache key — pointing the client elsewhere without
+    # changing the label would file another vendor's runs under "openai" and let
+    # the two satisfy each other's cache lookups.
+    llm_base_url: str | None = None
+    # How schema-constrained output is requested (Epic 23.4). None means "let the
+    # selected provider's registry entry choose" — a non-None default could not
+    # express that, and would let llm_provider=deepseek + json_schema (a guaranteed
+    # 400, since DeepSeek's response_format accepts only text/json_object) load
+    # clean and fail at the first request. See providers.llm.openai for the values.
+    llm_structured_output_mode: str | None = None
+    # The identity label runs against llm_base_url are recorded under. Required
+    # whenever llm_base_url is set (enforced below): the label is written to every
+    # ExtractionRun row and is part of the extraction cache key, so retargeting the
+    # URL while leaving the label at "openai" would file another vendor's runs as
+    # OpenAI's and let the two satisfy each other's cache lookups.
+    llm_provider_label: str | None = None
     # Phase 9.5: bound the provider's rate-limit retry loop and per-request
     # timeout. retries=0 disables retries (raise on the first 429); the timeout
     # is a float so it feeds chat.completions.create(timeout=…) without a cast.
@@ -210,24 +240,83 @@ class Settings(BaseSettings):
     @classmethod
     def _llm_provider_supported(cls, value: str) -> str:
         # Reject an unsupported provider at load so a typo (e.g. "gemini") fails
-        # fast rather than falling through to the OpenAI branch at runtime.
-        supported = {"openai", "anthropic"}
+        # fast rather than falling through to the OpenAI branch at runtime. The
+        # allow-list is the provider registry itself (Epic 23.4), so registering a
+        # provider does not also require editing a literal set here.
+        from rag_recipes.providers.llm.registry import supported_providers
+
+        supported = supported_providers()
         if value not in supported:
             raise ValueError(
                 f"llm_provider must be one of {sorted(supported)}; got {value!r}"
             )
         return value
 
-    @model_validator(mode="after")
-    def _anthropic_api_key_required_when_selected(self) -> Settings:
-        # A class default can't reference a sibling field, so the cross-field rule
-        # (key required when Anthropic is selected) lives here. Fails at Settings
-        # load with a message naming the missing field rather than at the first
-        # call. Note this does NOT narrow anthropic_api_key to str for mypy, so
-        # the factories (TASK-003) still narrow str | None → str before use.
-        if self.llm_provider == "anthropic" and not self.anthropic_api_key:
+    @field_validator("llm_structured_output_mode")
+    @classmethod
+    def _structured_output_mode_supported(cls, value: str | None) -> str | None:
+        # None is the "defer to the registry entry" sentinel and is always valid.
+        # A typo'd mode must fail at load: an unknown value would otherwise reach
+        # the provider and produce a request shape the vendor rejects mid-run.
+        from rag_recipes.providers.llm.openai import STRUCTURED_OUTPUT_MODES
+
+        if value is not None and value not in STRUCTURED_OUTPUT_MODES:
             raise ValueError(
-                "anthropic_api_key is required when llm_provider == 'anthropic'"
+                "llm_structured_output_mode must be one of "
+                f"{sorted(STRUCTURED_OUTPUT_MODES)}; got {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _provider_api_key_required_when_selected(self) -> Settings:
+        # A class default can't reference a sibling field, so the cross-field rule
+        # (key required when the provider needing it is selected) lives here. Fails
+        # at Settings load with a message naming the missing field rather than at
+        # the first call. Generic over the registry since Epic 23.4, but the message
+        # is byte-identical to the pre-registry Anthropic-specific one — it is
+        # user-facing config feedback, and that refactor changed no behaviour.
+        # api_key_field is None for providers whose key is already unconditionally
+        # required (openai), so this never fires on an empty-string openai_api_key.
+        # Note this does NOT narrow the key to str for mypy; the registry factories
+        # still narrow str | None → str before use.
+        from rag_recipes.providers.llm.registry import get_spec
+
+        field = get_spec(self.llm_provider).api_key_field
+        if field is not None and not getattr(self, field):
+            raise ValueError(
+                f"{field} is required when llm_provider == {self.llm_provider!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _structured_output_mode_serveable_by_provider(self) -> Settings:
+        # A mode the selected vendor's API does not offer is a guaranteed 400 on
+        # the first request. Rejecting it at load matters because that first
+        # request may be a paid eval run mid-flight (Phase 23.5), where the
+        # cheapest possible failure is one that happens before any spend.
+        from rag_recipes.providers.llm.registry import unsupported_structured_output_modes
+
+        mode = self.llm_structured_output_mode
+        unsupported = unsupported_structured_output_modes(self.llm_provider)
+        if mode is not None and mode in unsupported:
+            raise ValueError(
+                f"llm_structured_output_mode={mode!r} is not supported by "
+                f"llm_provider={self.llm_provider!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _base_url_requires_a_provider_label(self) -> Settings:
+        # The identity label a built-in registry entry uses is a constant. Setting
+        # llm_base_url alone would therefore file another vendor's generations under
+        # "openai" — and since the label is part of the extraction cache key, let the
+        # two vendors serve each other cached runs. That is the single hazard Epic
+        # 23.4 exists to prevent, so it must not be reachable with one env var.
+        if self.llm_base_url and not self.llm_provider_label:
+            raise ValueError(
+                "llm_provider_label is required when llm_base_url is set; the label "
+                "is recorded on every ExtractionRun and is part of the extraction "
+                "cache key, so a retargeted endpoint must carry its own identity"
             )
         return self
 
