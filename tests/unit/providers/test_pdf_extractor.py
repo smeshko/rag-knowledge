@@ -44,6 +44,14 @@ _FIXTURE_PAGES = [
         extraction_method="embedded_text",
         confidence=0.0,
     ),
+    # Sub-threshold but *not* empty: an image plate with a caption. Pins that
+    # flagging never blanks a page's text.
+    PdfPageText(
+        page_number=4,
+        text="Plate 4\n",
+        extraction_method="embedded_text",
+        confidence=0.0,
+    ),
 ]
 
 
@@ -121,15 +129,22 @@ async def test_extract_pages_is_deterministic() -> None:
 async def test_pages_are_one_indexed_in_document_order() -> None:
     extractor = PyMuPdfExtractor(min_text_chars=20)
     pages = await extractor.extract_pages(_FIXTURE.read_bytes())
-    assert [page.page_number for page in pages] == [1, 2, 3]
+    assert [page.page_number for page in pages] == [1, 2, 3, 4]
 
 
 async def test_sparse_page_flagged_and_method_constant() -> None:
     extractor = PyMuPdfExtractor(min_text_chars=20)
     pages = await extractor.extract_pages(_FIXTURE.read_bytes())
     assert all(page.extraction_method == "embedded_text" for page in pages)
-    assert pages[-1].confidence == 0.0
-    assert all(page.confidence is None for page in pages[:-1])
+    assert [page.confidence for page in pages] == [None, None, 0.0, 0.0]
+
+
+async def test_flagged_page_keeps_its_text() -> None:
+    """Sub-threshold pages are flagged, never blanked or dropped."""
+    extractor = PyMuPdfExtractor(min_text_chars=20)
+    pages = await extractor.extract_pages(_FIXTURE.read_bytes())
+    assert pages[3].confidence == 0.0
+    assert pages[3].text == "Plate 4\n"
 
 
 async def test_non_pdf_bytes_raise_pdf_extraction_error() -> None:

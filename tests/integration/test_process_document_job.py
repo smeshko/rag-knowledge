@@ -209,11 +209,13 @@ async def test_process_document_writes_three_spans_and_transitions(
                 )
             ).scalars().all()
             spans = sorted(spans, key=lambda s: s.locator["page_start"])
-            assert [s.locator["page_start"] for s in spans] == [1, 2, 3]
-            assert [s.locator["page_end"] for s in spans] == [1, 2, 3]
+            assert [s.locator["page_start"] for s in spans] == [1, 2, 3, 4]
+            assert [s.locator["page_end"] for s in spans] == [1, 2, 3, 4]
+            # Pages 3 (empty) and 4 (short plate caption) are both sub-threshold.
             assert [s.locator["meta"]["suspicious"] for s in spans] == [
                 False,
                 False,
+                True,
                 True,
             ]
 

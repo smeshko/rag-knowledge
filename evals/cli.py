@@ -2,9 +2,11 @@
 
 All subcommands are real: ``extraction``/``judge-alignment``/``confidence-review``
 run the extraction eval suite (Epic 15) and ``retrieval`` the retrieval eval
-(Epic 16); ``diff``/``save-baseline`` cover both report types. Provider/
-``Settings`` imports stay lazy inside the command bodies, so importing this
-module (and rendering ``--help``) can never issue a live call.
+(Epic 16); ``diff``/``save-baseline`` cover both report types; the ``fixtures``
+sub-app cuts real cookbook page ranges into fixture candidates (Epic 23.1).
+Provider/``Settings`` imports stay lazy inside the command bodies, so importing
+this module (and rendering ``--help``) can never issue a live call — that
+includes ``evals.fixture_cutter``, which pulls in the PyMuPDF provider.
 ``_build_llm_provider`` below is the **only** live-provider construction site
 in the extraction harness — the driver takes the provider injected, and tests
 monkeypatch this seam with ``FakeLLMProvider``. **Running** ``retrieval``
@@ -28,6 +30,15 @@ if TYPE_CHECKING:
     from rag_recipes.providers.llm.base import LLMProvider
 
 app = typer.Typer(help="rag-recipes evaluation harness")
+
+fixtures_app = typer.Typer(help="Author and maintain evaluation fixtures.")
+app.add_typer(fixtures_app, name="fixtures")
+
+#: Duplicated from ``evals.fixture_cutter.DEFAULT_MIN_TEXT_CHARS`` (itself
+#: mirroring ``Settings.pdf_min_text_chars_for_page``) because a Typer default is
+#: evaluated at *decoration* time — importing the cutter to read it would drag
+#: the PyMuPDF provider into ``--help``. A unit test pins the two together.
+_CUT_MIN_TEXT_CHARS = 20
 
 
 def _build_llm_provider(settings: Settings) -> LLMProvider:
@@ -305,6 +316,132 @@ def save_baseline(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
     typer.echo(str(path))
+
+
+def _parse_page_range(spec: str) -> tuple[int, int]:
+    """Parse ``"42-43"`` (or a bare ``"42"``) into an inclusive 1-based range.
+
+    Raises ``ValueError`` with the offending spec named; the caller turns that
+    into exit 2. Bounds themselves (inversion, out-of-document) are the cutter's
+    job — this only rejects what is not a page range at all.
+    """
+    text = spec.strip()
+    first_text, sep, last_text = text.partition("-")
+    if not sep:
+        first_text = last_text = text
+    try:
+        first_page = int(first_text)
+        last_page = int(last_text)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --pages {spec!r}: expected N-M (inclusive, 1-based) or a single page N"
+        ) from exc
+    return first_page, last_page
+
+
+@fixtures_app.command("cut")
+def fixtures_cut(
+    pdf: Annotated[
+        Path,
+        typer.Option(help="Source cookbook PDF to cut from."),
+    ],
+    fixture_set: Annotated[
+        str,
+        typer.Option("--set", help="Fixture set under data/fixtures/synthetic_recipes/."),
+    ],
+    pages: Annotated[
+        list[str],
+        typer.Option(
+            "--pages",
+            help=(
+                "Inclusive 1-based page range 'N-M' (or a single page 'N'). "
+                "Repeat for a batch; the book is extracted once for the whole batch."
+            ),
+        ),
+    ],
+    rationale: Annotated[
+        list[str],
+        typer.Option(
+            "--rationale",
+            help=(
+                "Why this window was chosen, recorded in notes.md. Repeat once per "
+                "--pages. Rationales are paired with ranges positionally — the Nth "
+                "--rationale goes with the Nth --pages, regardless of where they sit "
+                "on the command line — so always interleave them strictly: "
+                "--pages A --rationale a --pages B --rationale b. Only the counts "
+                "are checked, so a mispaired batch is accepted silently."
+            ),
+        ),
+    ],
+    min_text_chars: Annotated[
+        int,
+        typer.Option(help="Sparse-page threshold; matches PDF_MIN_TEXT_CHARS_FOR_PAGE."),
+    ] = _CUT_MIN_TEXT_CHARS,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Replace an existing fixture of the same derived name."),
+    ] = False,
+    invalidate_goldens: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Also allow overwriting a fixture that carries expected.json. "
+                "The golden then describes text that no longer exists — re-author it."
+            )
+        ),
+    ] = False,
+) -> None:
+    """Cut real cookbook PDF page ranges into fixture candidates (Epic 23.1).
+
+    Fixture names are derived (``<book-stem>-p<first>-<last>``), never supplied:
+    the name becomes the span id Phase 23.2's goldens cite. The set this writes
+    carries **no** ``expected.json`` — goldens are 23.2, so
+    ``rag-evals extraction`` cannot score it yet.
+
+    Every caller error exits 2 with the problem named: an unparseable, inverted
+    or out-of-document ``--pages``, a missing ``--pdf``, a ``--rationale`` count
+    that does not match ``--pages``, an unsafe ``--set``, or a collision without
+    ``--overwrite``.
+    """
+    import asyncio
+
+    from evals.fixture_cutter import FixtureCutterError, cut_fixtures
+
+    try:
+        ranges = [_parse_page_range(spec) for spec in pages]
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    try:
+        results = asyncio.run(
+            cut_fixtures(
+                pdf,
+                fixture_set=fixture_set,
+                ranges=ranges,
+                rationales=rationale,
+                min_text_chars=min_text_chars,
+                overwrite=overwrite,
+                invalidate_goldens=invalidate_goldens,
+            )
+        )
+    except FixtureCutterError as exc:
+        # Every documented caller error is one of the cutter's named types
+        # (all ValueError subclasses); a bare ValueError/FileNotFoundError
+        # reaching here would be a bug in the cutter's error contract.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    for result in results:
+        typer.echo(f"{result.name}\t{result.path}")
+        if result.flagged_pages:
+            flagged = ", ".join(str(page) for page in result.flagged_pages)
+            typer.echo(
+                f"warning: {result.name}: page(s) {flagged} are below "
+                f"{min_text_chars} characters (likely image plates) — "
+                f"check the cut before authoring a golden",
+                err=True,
+            )
 
 
 if __name__ == "__main__":
