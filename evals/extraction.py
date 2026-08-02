@@ -386,6 +386,11 @@ class _JudgeSection:
         return {
             "name": self._judge.name,
             "version": self._judge.version,
+            # Provider as well as model: a committed baseline is read months
+            # later by someone deciding whether to trust the number, and once
+            # two providers can serve the same model name the model alone does
+            # not say who graded it (Epic 23.3).
+            "provider": self._judge.provider,
             "model": self._judge.model,
             "per_fixture": self.per_fixture,
             "pass_rate": self.pass_rate,
@@ -509,6 +514,7 @@ async def run_extraction_eval(
     *,
     llm_provider: LLMProvider,
     judge: str | None = None,
+    judge_provider: LLMProvider | None = None,
     reports_root: Path | None = None,
     fixtures_root: Path | None = None,
     thresholds: SoftValidationThresholds | None = None,
@@ -520,8 +526,13 @@ async def run_extraction_eval(
 
     ``llm_provider`` is required and injected — this function never builds a
     provider and never reads an API key. ``judge`` names a committed judge
-    prompt to run per fixture (the same injected provider serves both
-    extraction and judge calls). ``fixtures_root``/``reports_root``/
+    prompt to run per fixture. ``judge_provider`` lets the judge run on a
+    *different* provider than the model under test (Epic 23.3); ``None`` — the
+    default — reuses ``llm_provider`` itself, the same object rather than an
+    equivalent one, so the unset path is byte-identical to pre-23.3 behaviour.
+    Setting it is what makes a cross-provider comparison meaningful: with one
+    provider serving both roles, every candidate grades itself.
+    ``fixtures_root``/``reports_root``/
     ``thresholds``/``settings``/``baseline_path``/``judge_cache_root`` default
     to the repo layout and real ``Settings`` but are injectable so tests stay
     hermetic. When a baseline exists the Epic-14 ``diff_against_baseline`` is
@@ -531,7 +542,7 @@ async def run_extraction_eval(
     judge_section: _JudgeSection | None = None
     if judge is not None:
         judge_section = _JudgeSection(
-            load_judge(judge, llm_provider, root=fixtures_root),
+            load_judge(judge, judge_provider or llm_provider, root=fixtures_root),
             JudgeCache(root=judge_cache_root),
             fixture_set,
         )

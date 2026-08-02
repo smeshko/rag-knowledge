@@ -6,6 +6,46 @@ Offline evaluation harness for retrieval and extraction quality.
 
 Background reading: [`docs/architecture/12-evaluation-and-testing.md`](../docs/architecture/12-evaluation-and-testing.md) (§ 5 judge alignment, § 6 confidence calibration, § 9 regression testing, § 10 report shapes) and [`docs/architecture/13-implementation-decisions.md`](../docs/architecture/13-implementation-decisions.md) (topics 10–12: report/baseline storage, retrieval metrics, LLM-judge fixtures).
 
+## Judging with a different provider than the model under test
+
+By default the eval harness builds **one** LLM provider and uses it for both
+extraction and judging. That is fine for a single-provider run and wrong for a
+comparison: with one provider in both roles, every candidate grades itself, and
+a "provider A scores higher than provider B" result says as much about the
+judges as about the models.
+
+Set the judge separately for any cross-provider run:
+
+```bash
+# Extract with DeepSeek, judge with Claude.
+LLM_PROVIDER=deepseek JUDGE_LLM_PROVIDER=anthropic rag-evals extraction \
+    --fixtures cookbooks --label deepseek-judged-by-claude --judge summary_quality
+```
+
+Rules worth knowing:
+
+- **Unset means "same provider as extraction"** — today's behaviour, unchanged.
+- **Hold the judge fixed across a comparison.** Running candidate A judged by A
+  and candidate B judged by B is the original confound with extra steps. Both
+  baselines in a comparison must record the same judge provider.
+- `JUDGE_LLM_MODEL` alone (provider unset) judges with a different model on the
+  same vendor. Setting only `JUDGE_LLM_PROVIDER` picks that provider's own
+  model — never `LLM_MODEL`, which would send one vendor's model id to another.
+- A judge provider needs its own API key, checked at `Settings` load rather than
+  at the first judge call — which happens after extraction has already run.
+- The run's `results.json` records `judge.provider` alongside `judge.model`, so a
+  committed baseline states who graded it.
+
+### This change invalidated the existing judge cache
+
+The judge-rating cache key now includes the judge's provider. Without it, two
+providers serving the same model name would share cached ratings — the exact
+cross-vendor contamination the split exists to remove. The cache path is a hash
+over the key, so **every previously cached rating is orphaned** and the first run
+after this change re-issues every judge call. That is expected, not a bug. The
+orphaned files are harmless and are left in place.
+
+
 ## Running the harness
 
 The CLI is installed as the `rag-evals` console script (`uv sync` links it):

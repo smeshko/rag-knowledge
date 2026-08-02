@@ -115,6 +115,7 @@ def extraction(
                 label,
                 llm_provider=_build_llm_provider(settings),
                 judge=judge,
+                judge_provider=_build_judge_provider(settings),
             )
         )
     except ValueError as exc:  # empty/unknown fixture set — a caller error
@@ -227,11 +228,13 @@ def judge_alignment(
 
         from rag_recipes.config import get_settings
 
+        settings = get_settings()
         result = asyncio.run(
             run_judge_alignment(
                 judge,
                 fixtures,
-                llm_provider=_build_llm_provider(get_settings()),
+                llm_provider=_build_llm_provider(settings),
+                judge_provider=_build_judge_provider(settings),
                 report_path=run_dir,
             )
         )
