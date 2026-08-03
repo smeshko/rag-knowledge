@@ -27,6 +27,9 @@ venv/
 data/storage/
 !data/storage/.gitkeep
 data/fixtures/private/
+# Real-cookbook excerpts (Epic 23.1): generated locally by `rag-evals fixtures
+# cut` from copyrighted PDFs. Never committed — this repository is public.
+data/fixtures/synthetic_recipes/cookbooks/
 
 # Eval reports (baselines stay committed)
 evals/reports/*
