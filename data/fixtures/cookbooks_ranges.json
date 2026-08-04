@@ -1,0 +1,311 @@
+{
+  "set": "cookbooks",
+  "books": {
+    "bakingwithlesssugar": [
+      {
+        "pages": [
+          34,
+          36
+        ],
+        "name": "bakingwithlesssugar-p34-36"
+      },
+      {
+        "pages": [
+          44,
+          46
+        ],
+        "name": "bakingwithlesssugar-p44-46"
+      },
+      {
+        "pages": [
+          97,
+          97
+        ],
+        "name": "bakingwithlesssugar-p97-97"
+      },
+      {
+        "pages": [
+          105,
+          105
+        ],
+        "name": "bakingwithlesssugar-p105-105"
+      },
+      {
+        "pages": [
+          113,
+          113
+        ],
+        "name": "bakingwithlesssugar-p113-113"
+      },
+      {
+        "pages": [
+          140,
+          141
+        ],
+        "name": "bakingwithlesssugar-p140-141"
+      },
+      {
+        "pages": [
+          174,
+          176
+        ],
+        "name": "bakingwithlesssugar-p174-176"
+      }
+    ],
+    "bonebrothmiracle": [
+      {
+        "pages": [
+          98,
+          98
+        ],
+        "name": "bonebrothmiracle-p98-98"
+      },
+      {
+        "pages": [
+          100,
+          100
+        ],
+        "name": "bonebrothmiracle-p100-100"
+      },
+      {
+        "pages": [
+          101,
+          101
+        ],
+        "name": "bonebrothmiracle-p101-101"
+      },
+      {
+        "pages": [
+          110,
+          110
+        ],
+        "name": "bonebrothmiracle-p110-110"
+      },
+      {
+        "pages": [
+          122,
+          122
+        ],
+        "name": "bonebrothmiracle-p122-122"
+      },
+      {
+        "pages": [
+          134,
+          134
+        ],
+        "name": "bonebrothmiracle-p134-134"
+      },
+      {
+        "pages": [
+          143,
+          143
+        ],
+        "name": "bonebrothmiracle-p143-143"
+      }
+    ],
+    "eatdrinkpaleocookbook": [
+      {
+        "pages": [
+          34,
+          34
+        ],
+        "name": "eatdrinkpaleocookbook-p34-34"
+      },
+      {
+        "pages": [
+          40,
+          40
+        ],
+        "name": "eatdrinkpaleocookbook-p40-40"
+      },
+      {
+        "pages": [
+          42,
+          43
+        ],
+        "name": "eatdrinkpaleocookbook-p42-43"
+      },
+      {
+        "pages": [
+          80,
+          80
+        ],
+        "name": "eatdrinkpaleocookbook-p80-80"
+      },
+      {
+        "pages": [
+          103,
+          103
+        ],
+        "name": "eatdrinkpaleocookbook-p103-103"
+      },
+      {
+        "pages": [
+          148,
+          148
+        ],
+        "name": "eatdrinkpaleocookbook-p148-148"
+      },
+      {
+        "pages": [
+          174,
+          174
+        ],
+        "name": "eatdrinkpaleocookbook-p174-174"
+      }
+    ],
+    "edwardiancooking": [
+      {
+        "pages": [
+          15,
+          16
+        ],
+        "name": "edwardiancooking-p15-16"
+      },
+      {
+        "pages": [
+          37,
+          38
+        ],
+        "name": "edwardiancooking-p37-38"
+      },
+      {
+        "pages": [
+          63,
+          64
+        ],
+        "name": "edwardiancooking-p63-64"
+      },
+      {
+        "pages": [
+          91,
+          92
+        ],
+        "name": "edwardiancooking-p91-92"
+      },
+      {
+        "pages": [
+          111,
+          112
+        ],
+        "name": "edwardiancooking-p111-112"
+      },
+      {
+        "pages": [
+          133,
+          134
+        ],
+        "name": "edwardiancooking-p133-134"
+      },
+      {
+        "pages": [
+          155,
+          156
+        ],
+        "name": "edwardiancooking-p155-156"
+      }
+    ],
+    "onepantorulethemall": [
+      {
+        "pages": [
+          47,
+          48
+        ],
+        "name": "onepantorulethemall-p47-48"
+      },
+      {
+        "pages": [
+          61,
+          62
+        ],
+        "name": "onepantorulethemall-p61-62"
+      },
+      {
+        "pages": [
+          108,
+          108
+        ],
+        "name": "onepantorulethemall-p108-108"
+      },
+      {
+        "pages": [
+          136,
+          137
+        ],
+        "name": "onepantorulethemall-p136-137"
+      },
+      {
+        "pages": [
+          166,
+          166
+        ],
+        "name": "onepantorulethemall-p166-166"
+      },
+      {
+        "pages": [
+          196,
+          196
+        ],
+        "name": "onepantorulethemall-p196-196"
+      },
+      {
+        "pages": [
+          223,
+          224
+        ],
+        "name": "onepantorulethemall-p223-224"
+      }
+    ],
+    "wastefreekitchenhandbook": [
+      {
+        "pages": [
+          122,
+          123
+        ],
+        "name": "wastefreekitchenhandbook-p122-123"
+      },
+      {
+        "pages": [
+          126,
+          126
+        ],
+        "name": "wastefreekitchenhandbook-p126-126"
+      },
+      {
+        "pages": [
+          129,
+          129
+        ],
+        "name": "wastefreekitchenhandbook-p129-129"
+      },
+      {
+        "pages": [
+          131,
+          131
+        ],
+        "name": "wastefreekitchenhandbook-p131-131"
+      },
+      {
+        "pages": [
+          133,
+          133
+        ],
+        "name": "wastefreekitchenhandbook-p133-133"
+      },
+      {
+        "pages": [
+          136,
+          136
+        ],
+        "name": "wastefreekitchenhandbook-p136-136"
+      },
+      {
+        "pages": [
+          141,
+          141
+        ],
+        "name": "wastefreekitchenhandbook-p141-141"
+      }
+    ]
+  }
+}

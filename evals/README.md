@@ -164,9 +164,9 @@ Single range:
 
 ```bash
 uv run rag-evals fixtures cut \
-  --pdf ~/Downloads/books/cidermadesimple.pdf \
+  --pdf ~/Downloads/books/edwardiancooking.pdf \
   --set cookbooks \
-  --pages 42-43 \
+  --pages 41-42 \
   --rationale "one complete recipe with headnote; ingredient table"
 ```
 
@@ -227,3 +227,40 @@ Per doc 12 § 5 / § 11 and the existing `backend/.gitignore` rules:
 | Per-run reports (`evals/reports/<run>/`) | **gitignored** (only `.gitkeep` tracked) |
 | Judge cache (`evals/reports/.judge_cache/`) | **gitignored** (covered by the reports rule) |
 | Baselines (`evals/baselines/<name>.json`) | **commit** |
+
+### The `cookbooks` set
+
+42 single-recipe windows, 7 from each of 6 real cookbooks, curated 2026-08-03
+(Epic 23.1). The extracted text is **gitignored** — see "What to commit vs
+gitignore" above — but `data/fixtures/cookbooks_ranges.json` records every book
+and page range, so the set is regenerated from the source PDFs by replaying the
+manifest through `rag-evals fixtures cut`.
+
+| Book | Fixtures | Window shape |
+|---|---|---|
+| `bakingwithlesssugar` | 7 | 1–3 pages; method spills past the ingredients page, and photo plates sit mid-recipe |
+| `bonebrothmiracle` | 7 | single page; the most regular layout of the six |
+| `eatdrinkpaleocookbook` | 7 | single page, occasionally 2; title and headnote print *after* the method |
+| `edwardiancooking` | 7 | always 2 pages: title + headnote + ingredients on one, `Steps:` on the next |
+| `onepantorulethemall` | 7 | 1–2 pages; ingredients in a sidebar, method first |
+| `wastefreekitchenhandbook` | 7 | single page, columns extracted out of order (method → ingredients → headnote → title) |
+
+A seventh book, `cidermadesimple.pdf`, was dropped: it is a narrative history of
+cider, not a recipe collection. Exactly 2 of its 178 pages carry a yield marker
+and both are prose, so it cannot contribute a single-recipe window.
+
+**Layout drives the window size, and getting it wrong is silent.** Each book
+splits a recipe differently, and a window cut on the wrong boundary still
+validates — it just holds a headless step list, a truncated method, or two
+recipes. Cutting `edwardiancooking` by single page yields fixtures with no title
+and no ingredients; cutting `wastefreekitchenhandbook` by page *pair* merges two
+recipes. Verify the layout of a book before cutting it in bulk, and read back
+every `source.md`.
+
+Deliberately included as hard cases: recipes whose columns extract out of
+reading order (`wastefreekitchenhandbook`), a recipe whose ingredient list
+cross-references two other recipes (`edwardiancooking-p133-134`, Steak and
+Kidney Pie), 3-page windows spanning a photo plate
+(`bakingwithlesssugar-p34-36`, `-p44-46`), and two non-dish recipes — a marinade
+and refrigerator pickles — kept so the corpus is not biased toward composed
+dishes.
