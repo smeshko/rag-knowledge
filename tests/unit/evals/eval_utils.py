@@ -166,6 +166,50 @@ def recipe_output(
     }
 
 
+def golden_to_recipe_output(
+    name: str, source_md: str, expected: dict[str, Any]
+) -> dict[str, Any]:
+    """The provider payload an *ideal* extractor would return for one golden.
+
+    Built from that fixture's own ``expected.json`` — the golden-replay run
+    (Epic 23.2 TASK-004) feeds these back through the real driver so the loader,
+    hard/soft validation, and every objective scorer traverse the whole set with
+    no live call. A perfect score therefore proves the golden is well formed and
+    fully reachable; it says nothing about whether the golden matches the
+    recipe — that is exactly and only the human verification pass.
+    """
+    del source_md  # part of the adapter contract (window identity), unused here
+    structured = expected["structured_data"]
+    span_id = synthetic_span_id(name)
+    ingredients = [
+        ingredient_payload(
+            position,
+            ingredient["raw_text"],
+            ingredient["quantity_value"],
+            ingredient["unit_normalized"],
+            ingredient["item_normalized"],
+            ingredient["preparation"],
+        )
+        for position, ingredient in enumerate(structured["ingredients"], start=1)
+    ]
+    steps = [
+        step_payload(number, step["text"], span_id)
+        for number, step in enumerate(structured["steps"], start=1)
+    ]
+    return recipe_output(
+        title=expected["title"],
+        span_id=span_id,
+        # Soft validation bounds recipe length; the joined method is the recipe.
+        body_text="\n".join(step["text"] for step in structured["steps"]),
+        ingredients=ingredients,
+        steps=steps,
+        yield_=structured["yield"],
+        prep_time=structured["prep_time"],
+        cook_time=structured["cook_time"],
+        total_time=structured["total_time"],
+    )
+
+
 def write_fixture(
     fixtures_root: Path, fixture_set: str, name: str, source_md: str, expected: dict[str, Any]
 ) -> None:
