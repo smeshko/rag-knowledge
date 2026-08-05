@@ -264,3 +264,101 @@ Kidney Pie), 3-page windows spanning a photo plate
 (`bakingwithlesssugar-p34-36`, `-p44-46`), and two non-dish recipes — a marinade
 and refrigerator pickles — kept so the corpus is not biased toward composed
 dishes.
+
+## Authoring a golden fixture
+
+A golden is `expected.json` next to a fixture's `source.md` — the values a
+perfect extraction would produce. `evals/golden_schema.py` enforces its shape and
+`tests/unit/evals/test_golden_conformance.py` runs those rules over every
+enrolled set, because **the scorers never raise**: each defect below produces a
+wrong number rather than an error, so a broken golden looks like a model problem.
+
+```json
+{
+  "item_type": "recipe",
+  "title": "Ginger Tea",
+  "source_span_ids": ["span_eval_ginger-tea"],
+  "structured_data": {
+    "schema": "recipe.v1",
+    "yield": "serves 2",
+    "prep_time": "5 minutes",
+    "cook_time": "10 minutes",
+    "total_time": "15 minutes",
+    "ingredients": [
+      {"raw_text": "2 tbsp honey", "quantity_value": 2.0,
+       "unit_normalized": "tablespoon", "item_normalized": "honey", "preparation": null}
+    ],
+    "steps": [{"text": "Strain into mugs and serve."}]
+  }
+}
+```
+
+The rules, and the silent failure each one prevents:
+
+| Rule | What goes wrong without it |
+|---|---|
+| Strict key sets at all four levels | `_sub_field_equal` reads sub-fields with `.get()` (`objective.py:196-201`), so an `item_normalised` typo is never compared, never reported — and the fixture scores a **perfect** ingredient F1 with that field unmeasured |
+| `source_span_ids == ["span_eval_<fixture-name>"]` | Any other value fails *hard* validation, so the fixture is never scored — it vanishes from the report instead of scoring low |
+| Every non-null time parses as a duration | An unparseable value (`"overnight"`) is dropped from the field's mean (`extraction.py:485-489`), which **raises** the average over the fixtures that remain |
+| Every ingredient has a non-empty `raw_text` or `item_normalized` | `_ingredient_keys_match` cannot align the line, so it drops out of precision and recall rather than counting as a miss (`objective.py:212-227`) |
+| `quantity_value` is a number or `null`, never a string | `"2"` never equals `2.0` |
+
+**Write `null`, never a guess.** Every scored value may be null — a recipe that
+states no cook time should say so. An invented value scores a real extraction
+*wrong*; an honest null tells the scorer "not measured here". This is the one
+place where being vague is more accurate than being specific.
+
+**`source_span_ids_f1` is degenerate on this harness.** `_build_synthetic_window`
+collapses a whole `source.md` into one span stamped `page_start: 1`, while
+production emits one page-labelled block per span. There is only ever one id to
+cite, so the metric can only be 1.0 or 0.0. Do not read a perfect span F1 in a
+baseline as evidence of good provenance behaviour.
+
+### Verification status
+
+Each fixture's `notes.md` carries a line the gate parses:
+
+```
+- Verification: draft — drafted by claude-opus-5 from source.md, 2026-08-05
+- Verification: verified — Ivo, 2026-08-05, corrected the yield
+```
+
+`draft` and `verified` are the only accepted values. An absent or unrecognised
+value is a **failure, never a default** — a missing-status default would make a
+forgotten fixture look finished, which is the whole reason the field exists.
+Free text after the keyword is ignored, so annotate freely.
+
+Status lives in `notes.md` rather than `expected.json` deliberately:
+`RecipeFixture.content_hash()` hashes `source_md` + `expected` only
+(`evals/models.py:50`), so flipping `draft` → `verified` cannot invalidate a
+judge cache or an alignment record. The same field inside `expected.json` would
+re-cost every judge call on every status flip.
+
+**Only a human flips a status to `verified`.** A drafted golden checked by the
+same agent that drafted it is the model-grading-itself confound in a different
+costume — the identical problem Phase 23.3 removed from the judge path.
+
+### Drafting bias, and how the `cookbooks` set limits it
+
+A golden drafted by an LLM encodes *that model's* conventions — how it splits a
+compound ingredient line, whether it writes "serves 4" or "4 servings", where it
+breaks a step. Phase 23.5 then scores providers partly against those
+conventions. Two mitigations are in place, and neither is a substitute for the
+human pass:
+
+- **Parsed, not drafted, where the book allows it.** `bonebrothmiracle` and
+  `edwardiancooking` print explicit `Ingredients:` / `Method:` / `Steps:`
+  markers, so those goldens are lifted by a deterministic parser with no model
+  judgement in the loop. The remaining books have no such structure.
+- **Provenance is per fixture.** Each `notes.md` records whether its golden was
+  parsed or drafted, and by what — so "is this golden biased?" has an answer.
+
+### Running the gate
+
+```bash
+uv run pytest tests/unit/evals/test_golden_conformance.py -q
+```
+
+`cookbooks` is gitignored, so CI skips it with an explicit reason and the gate
+enforces it only where the set exists — your machine. Presence enforces every
+rule in full; there is no partial mode.
