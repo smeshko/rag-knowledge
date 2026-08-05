@@ -346,12 +346,24 @@ breaks a step. Phase 23.5 then scores providers partly against those
 conventions. Two mitigations are in place, and neither is a substitute for the
 human pass:
 
-- **Parsed, not drafted, where the book allows it.** `bonebrothmiracle` and
-  `edwardiancooking` print explicit `Ingredients:` / `Method:` / `Steps:`
-  markers, so those goldens are lifted by a deterministic parser with no model
-  judgement in the loop. The remaining books have no such structure.
+- **Parsed, not drafted, where the book allows it.** 28 of the 42 `cookbooks`
+  goldens are lifted by deterministic parsers (`scripts/regen_cookbook_goldens.py`)
+  with no model judgement in the loop: `bonebrothmiracle` and `edwardiancooking`
+  via their literal `Ingredients:` / `Method:` / `Steps:` markers,
+  `bakingwithlesssugar` via its bulleted-ingredient/numbered-step structure, and
+  `onepantorulethemall` via its `INGREDIENTS:` marker plus column-measure
+  paragraph reassembly. Titles/yields for the last two are hand transcriptions
+  (recorded in the script) — every heuristic tried got them wrong. The remaining
+  14 (`eatdrinkpaleocookbook`, `wastefreekitchenhandbook`) have no structure a
+  parser can anchor on and were hand-drafted; each judgement call is recorded as
+  a `draft-flag:` line in that fixture's `notes.md`.
 - **Provenance is per fixture.** Each `notes.md` records whether its golden was
   parsed or drafted, and by what — so "is this golden biased?" has an answer.
+
+Because the goldens are gitignored with the excerpts, the 28 parsed ones are
+regenerable (`uv run python scripts/regen_cookbook_goldens.py --write`) but the
+14 hand-drafted ones exist **only in the local working copy** — back up
+`data/fixtures/synthetic_recipes/cookbooks/` accordingly.
 
 ### Running the gate
 
