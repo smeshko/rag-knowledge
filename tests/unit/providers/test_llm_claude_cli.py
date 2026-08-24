@@ -243,7 +243,10 @@ async def test_subprocess_env_strips_anthropic_credentials(
     assert env.get("PATH") == os.environ.get("PATH")
 
 
-async def test_cwd_is_fresh_empty_temp_dir_and_cleaned_up() -> None:
+async def test_cwd_is_one_stable_empty_temp_dir_across_calls() -> None:
+    # The CLI embeds cwd in its system prompt, so the cwd is part of the prompt
+    # cache key: a fresh dir per call re-created ~3.7K tokens every window
+    # (TASK-005). One per-instance dir keeps consecutive windows cache-hot.
     runner = _FakeRunner(result=_cli_result(_SUCCESS_ENVELOPE))
     provider = _provider_with(runner)
     await provider.generate_structured_output(_REQUEST)
@@ -251,17 +254,26 @@ async def test_cwd_is_fresh_empty_temp_dir_and_cleaned_up() -> None:
 
     first, second = runner.calls
     assert first.cwd_was_empty_dir
-    assert second.cwd_was_empty_dir
-    assert first.cwd != second.cwd
-    assert not Path(first.cwd).exists()
-    assert not Path(second.cwd).exists()
+    assert second.cwd == first.cwd
+    assert Path(first.cwd).is_dir()
 
 
-async def test_temp_dir_cleaned_up_on_failure() -> None:
+async def test_distinct_instances_use_distinct_cwds() -> None:
+    runner_a = _FakeRunner(result=_cli_result(_SUCCESS_ENVELOPE))
+    runner_b = _FakeRunner(result=_cli_result(_SUCCESS_ENVELOPE))
+    await _provider_with(runner_a).generate_structured_output(_REQUEST)
+    await _provider_with(runner_b).generate_structured_output(_REQUEST)
+    assert runner_a.calls[0].cwd != runner_b.calls[0].cwd
+
+
+async def test_cwd_survives_a_failed_call() -> None:
+    # The dir must outlive failures — the next window still needs the same
+    # cache-stable cwd. Cleanup happens at instance finalization, not per call.
     runner = _FakeRunner(result=CLIResult(returncode=1, stdout="", stderr="boom"))
+    provider = _provider_with(runner)
     with pytest.raises(LLMTechnicalError):
-        await _provider_with(runner).generate_structured_output(_REQUEST)
-    assert not Path(runner.calls[0].cwd).exists()
+        await provider.generate_structured_output(_REQUEST)
+    assert Path(runner.calls[0].cwd).is_dir()
 
 
 async def test_nonzero_exit_raises_with_stderr_excerpt() -> None:

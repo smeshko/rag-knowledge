@@ -16,9 +16,11 @@ Invocation hygiene (plan DECISIONS #1/#2/#4):
 - the subprocess env is the parent env **minus** ``ANTHROPIC_API_KEY`` /
   ``ANTHROPIC_AUTH_TOKEN``, so a key exported for the API provider can never
   silently switch these "free" calls to API billing;
-- cwd is a fresh empty temp dir and all tools / MCP servers / session
-  persistence are disabled, keeping the CLI context minimal and deterministic
-  (the system prompt is part of the extraction cache's effective input).
+- cwd is one empty temp dir per provider instance and all tools / MCP servers /
+  session persistence are disabled, keeping the CLI context minimal and
+  deterministic. Per-instance (not per-call) because the CLI embeds cwd in its
+  system prompt, making cwd part of the server-side prompt-cache key: a fresh
+  dir per call re-created ~3.7K tokens every window (TASK-005).
 
 There is deliberately no retry loop (DECISIONS #5): Max-quota exhaustion is an
 hours-scale wall, not a transient — it raises ``LLMTechnicalError`` and the
@@ -144,6 +146,12 @@ class ClaudeCLILLMProvider(LLMProvider):
         self._timeout_seconds = timeout_seconds
         self._runner: CLIRunner = runner if runner is not None else _run_claude_cli
         self._obs = observability or ProviderObservability(None, enabled=False)
+        # One hermetic cwd for the instance's lifetime, NOT per call: the CLI
+        # embeds cwd in its system prompt, so cwd is part of the server-side
+        # prompt-cache key — a fresh dir per call re-created ~3.7K tokens on
+        # every window (TASK-005 probe: cache_creation 3704 → 0 with a shared
+        # dir). Cleanup runs via TemporaryDirectory's own finalizer.
+        self._cwd = tempfile.TemporaryDirectory(prefix="claude-cli-")
 
     async def generate_structured_output(
         self,
@@ -197,7 +205,7 @@ class ClaudeCLILLMProvider(LLMProvider):
             return response
 
     async def _invoke(self, request: StructuredOutputRequest) -> CLIResult:
-        """Run the CLI once in a fresh empty temp-dir cwd with a scrubbed env."""
+        """Run the CLI once in the instance's hermetic cwd with a scrubbed env."""
         argv = [
             self._binary,
             "-p",
@@ -216,17 +224,16 @@ class ClaudeCLILLMProvider(LLMProvider):
             request.input,
         ]
         env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_ENV_VARS}
-        with tempfile.TemporaryDirectory(prefix="claude-cli-") as cwd:
-            try:
-                return await self._runner(argv, env=env, cwd=cwd, timeout=self._timeout_seconds)
-            except TimeoutError as exc:
-                raise LLMTechnicalError(
-                    f"claude CLI timed out after {self._timeout_seconds}s"
-                ) from exc
-            except OSError as exc:
-                raise LLMTechnicalError(
-                    f"failed to spawn claude CLI binary {self._binary!r}: {exc}"
-                ) from exc
+        try:
+            return await self._runner(
+                argv, env=env, cwd=self._cwd.name, timeout=self._timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise LLMTechnicalError(f"claude CLI timed out after {self._timeout_seconds}s") from exc
+        except OSError as exc:
+            raise LLMTechnicalError(
+                f"failed to spawn claude CLI binary {self._binary!r}: {exc}"
+            ) from exc
 
 
 def map_envelope_to_structured_output(
