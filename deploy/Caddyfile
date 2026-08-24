@@ -1,0 +1,67 @@
+# Production front for recipes.ivot.dev.
+#
+# This is the ONLY process the cloudflared tunnel talks to. It serves the
+# built frontend and path-splits /api/* to the backend, so the frontend and
+# the API share one origin — no CORS, no preflight, and the backend port
+# never appears in ~/.cloudflared/config.yml.
+#
+# Bound to 127.0.0.1 so it is unreachable from the LAN: the only way in is
+# the tunnel, and the tunnel hostname is gated by Cloudflare Access.
+{
+	# No admin API — it would otherwise listen on :2019 with no auth.
+	admin off
+	# Every site address here is plain HTTP on loopback; Cloudflare terminates
+	# TLS at the edge. Without this Caddy would try to provision a certificate.
+	auto_https off
+}
+
+# Port-only site address, so any Host matches — cloudflared forwards the
+# original `Host: recipes.ivot.dev`, which a `127.0.0.1:8090` address would
+# reject with a 400. `bind` is what restricts the listener to loopback; a
+# hostname in the site address is a request matcher, not a bind address.
+:8090 {
+	bind 127.0.0.1
+
+	log {
+		output file /Users/itsonev/Developer/logs/recipes-caddy.log
+		format console
+	}
+
+	encode zstd gzip
+
+	# Backend. `header_up` SETS the header, so a client-supplied Authorization
+	# is replaced rather than passed through — the browser never sees or
+	# supplies the token. Caddy reads it from its own environment; start it
+	# with RAG_RECIPES_TOKEN exported (see ~/Developer/start-services.sh).
+	#
+	# Only /api/* is routed here, which also means /openapi.json, /docs and
+	# /redoc stay unreachable through the tunnel — FastAPI registers those as
+	# plain Starlette routes, so the app-level require_api_token dependency
+	# does not gate them.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8004 {
+			header_up Authorization "Bearer {env.RAG_RECIPES_TOKEN}"
+			# PDF uploads and LLM answers both outlast the 30s default.
+			transport http {
+				read_timeout 300s
+				write_timeout 300s
+			}
+		}
+	}
+
+	# Frontend: the Vite production build. `try_files ... /index.html` is the
+	# SPA fallback — /library and /recipes/:id are client-side routes with no
+	# file behind them, and would 404 without it.
+	handle {
+		root * /Users/itsonev/Developer/Projects/recipes/rag-recipes-fe/dist
+
+		# Vite content-hashes everything under /assets, so it is safe to cache
+		# forever; index.html must not be, or a deploy never reaches the browser.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		header /index.html Cache-Control "no-cache"
+
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -29,9 +29,11 @@ dev:
     wait
 
 # Run the FastAPI app under uvicorn with autoreload.
-# Host port 8001 (not 8000) to avoid clashing with other local dev servers.
+# Host port 8004 (not 8000/8001) to avoid clashing with other local dev servers.
+# NOT 8001: the cloudflared tunnel maps webhook.ivot.dev to :8001 for adw, so
+# anything listening there is published to the internet without Access.
 dev-api:
-    uv run uvicorn rag_recipes.api.app:app --reload --port 8001
+    uv run uvicorn rag_recipes.api.app:app --reload --port 8004
 
 # Run the arq worker against compose Redis. Reads .env via uv run.
 # `--watch src/` autoreloads on source changes (mirrors uvicorn --reload).

@@ -8,11 +8,13 @@ name: rag-recipes
 services:
   postgres:
     image: pgvector/pgvector:pg17
-    # Host port 5433 (not 5432) to avoid clashing with other local Postgres
-    # instances. Container-internal port stays 5432 for in-network DSNs.
+    # Host port 5435 to avoid clashing with other local Postgres instances:
+    # 5432 is ai-news-aggregator-db and 5433 is life-organizer-db, both of
+    # which are started by ~/Developer/start-services.sh before this stack.
+    # Container-internal port stays 5432 for in-network DSNs.
     # Loopback-only — dev credentials are committed (matches Phase 1.5 posture).
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:5435:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

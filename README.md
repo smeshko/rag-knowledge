@@ -23,7 +23,7 @@ just setup
 
 The dev compose stack publishes every service on `127.0.0.1` only — the committed dev credentials (`postgres:postgres`, `redis:redis`, `dev@rag-recipes.local`) are deliberately weak and loopback binding is what keeps them safe.
 
-- `postgres` on `127.0.0.1:5433` (user `postgres`, password `postgres`).
+- `postgres` on `127.0.0.1:5435` (user `postgres`, password `postgres`).
 - `redis` on `127.0.0.1:6379` with `requirepass`; the password is `REDIS_PASSWORD` (default `redis`) — it must also be present in the `REDIS_URL` DSN (Settings rejects a credential-less DSN).
 - Langfuse UI on `127.0.0.1:3002`; MinIO API / console on `127.0.0.1:9090` / `127.0.0.1:9091`.
 
@@ -48,9 +48,9 @@ just dev
 The API is gated by a personal bearer token and **fails closed**: when `PERSONAL_API_TOKEN` is empty, every request — including `/api/v1/health` — returns `401 unauthorized`. Set the variable in `.env` and send it as a header to use the API locally:
 
 ```sh
-curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8001/api/v1/health
+curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8004/api/v1/health
 # {"status":"ok"}
-curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8001/api/v1/documents
+curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8004/api/v1/documents
 ```
 
 ## Test
