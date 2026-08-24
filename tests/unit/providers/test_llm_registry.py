@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from rag_recipes.config import Settings
 from rag_recipes.providers._observability import ProviderObservability
 from rag_recipes.providers.llm.anthropic import AnthropicLLMProvider
+from rag_recipes.providers.llm.claude_cli import ClaudeCLILLMProvider
 from rag_recipes.providers.llm.openai import OpenAILLMProvider
 from rag_recipes.providers.llm.registry import (
     build_llm_provider,
@@ -79,9 +80,7 @@ def test_importing_config_does_not_cycle() -> None:
     outright, so pin it.
     """
     for module in ("rag_recipes.config", "rag_recipes.api.dependencies"):
-        subprocess.run(
-            [sys.executable, "-c", f"import {module}"], capture_output=True, check=True
-        )
+        subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, check=True)
 
 
 # --- identity and base_url --------------------------------------------------
@@ -214,9 +213,7 @@ def test_anthropic_key_message_is_byte_identical_to_the_pre_registry_one(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
-    assert "anthropic_api_key is required when llm_provider == 'anthropic'" in str(
-        excinfo.value
-    )
+    assert "anthropic_api_key is required when llm_provider == 'anthropic'" in str(excinfo.value)
 
 
 def test_openai_spec_has_no_conditional_key_field(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,9 +237,7 @@ def test_get_spec_names_the_supported_set() -> None:
 
 
 def _deepseek_settings(monkeypatch: pytest.MonkeyPatch, **env: str) -> Settings:
-    return _settings(
-        monkeypatch, LLM_PROVIDER="deepseek", DEEPSEEK_API_KEY="sk-ds-test", **env
-    )
+    return _settings(monkeypatch, LLM_PROVIDER="deepseek", DEEPSEEK_API_KEY="sk-ds-test", **env)
 
 
 def test_deepseek_builds_an_openai_transport_with_its_own_identity(
@@ -303,9 +298,7 @@ def test_deepseek_key_is_required_when_selected(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None)
-    assert "deepseek_api_key is required when llm_provider == 'deepseek'" in str(
-        excinfo.value
-    )
+    assert "deepseek_api_key is required when llm_provider == 'deepseek'" in str(excinfo.value)
 
 
 def test_deepseek_answer_model_ignores_the_openai_shaped_override(
@@ -326,3 +319,70 @@ def test_deepseek_answer_model_ignores_the_openai_shaped_override(
 def test_deepseek_is_in_the_allow_list() -> None:
     assert "deepseek" in supported_providers()
     assert get_spec("deepseek").api_key_field == "deepseek_api_key"
+
+
+# --- claude_cli: subscription-quota provider, no API key ---------------------
+
+
+def _claude_cli_settings(monkeypatch: pytest.MonkeyPatch, **env: str) -> Settings:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "claude_cli")
+    # No vendor key beyond the unconditionally-required openai_api_key: the CLI
+    # authenticates via the local `claude` login, not an env credential.
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return Settings(_env_file=None)
+
+
+def test_claude_cli_builds_with_no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _claude_cli_settings(monkeypatch)
+    provider = build_llm_provider(settings)
+
+    assert isinstance(provider, ClaudeCLILLMProvider)
+    assert provider.provider == "claude_cli"
+    assert provider.default_model == settings.claude_cli_model
+
+
+def test_claude_cli_threads_binary_and_timeout_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _claude_cli_settings(
+        monkeypatch,
+        CLAUDE_CLI_BINARY="/opt/homebrew/bin/claude",
+        CLAUDE_CLI_TIMEOUT_SECONDS="120",
+    )
+    provider = build_llm_provider(settings)
+
+    assert isinstance(provider, ClaudeCLILLMProvider)
+    assert provider._binary == "/opt/homebrew/bin/claude"
+    assert provider._timeout_seconds == 120.0
+
+
+def test_resolve_extraction_model_claude_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This resolution is what eval RunMetadata.llm_model stamps; the pinned full
+    # model name (never the `opus` alias) keeps the extraction cache key honest.
+    settings = _claude_cli_settings(monkeypatch)
+    assert resolve_extraction_model(settings, "claude_cli") == "claude-opus-5"
+
+    overridden = _claude_cli_settings(monkeypatch, CLAUDE_CLI_MODEL="claude-sonnet-5")
+    assert resolve_extraction_model(overridden) == "claude-sonnet-5"
+
+
+def test_claude_cli_is_in_the_allow_list() -> None:
+    assert "claude_cli" in supported_providers()
+    assert get_spec("claude_cli").api_key_field is None
+
+
+def test_importing_the_registry_does_not_import_the_claude_cli_module() -> None:
+    """The lazy-import invariant extends to in-repo provider modules too."""
+    code = (
+        "import sys; "
+        "import rag_recipes.providers.llm.registry; "
+        "print(int('rag_recipes.providers.llm.claude_cli' in sys.modules))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "0", result.stdout
