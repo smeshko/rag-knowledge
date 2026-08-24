@@ -69,6 +69,18 @@ class Settings(BaseSettings):
     deepseek_llm_model: str = "deepseek-v4-pro"
     deepseek_base_url: str = "https://api.deepseek.com/v1"
 
+    # claude_cli — the local `claude` binary in -p mode, drawing claude.ai
+    # subscription quota instead of API billing. No key field: auth is the CLI's
+    # own login (a missing login fails loudly at the first call). The model is
+    # the pinned full name, never the `opus` alias — it is part of the extraction
+    # cache key and every ExtractionRun row, and an alias would let a CLI update
+    # change model vintage under a stable key. The timeout kills the subprocess
+    # and raises LLMTechnicalError (Opus windows can be slow, hence 300s); the
+    # binary path is overridable for non-PATH installs.
+    claude_cli_model: str = "claude-opus-5"
+    claude_cli_timeout_seconds: float = Field(default=300.0, ge=1)
+    claude_cli_binary: str = "claude"
+
     # Judge provider/model for the eval harness (Epic 23.3). Both None by default,
     # meaning "the judge runs on the same provider as the model under test" — i.e.
     # today's behaviour. Setting them is what makes a cross-provider comparison
@@ -256,9 +268,7 @@ class Settings(BaseSettings):
 
         supported = supported_providers()
         if value not in supported:
-            raise ValueError(
-                f"llm_provider must be one of {sorted(supported)}; got {value!r}"
-            )
+            raise ValueError(f"llm_provider must be one of {sorted(supported)}; got {value!r}")
         return value
 
     @field_validator("judge_llm_provider")
@@ -308,9 +318,7 @@ class Settings(BaseSettings):
 
         field = get_spec(self.llm_provider).api_key_field
         if field is not None and not getattr(self, field):
-            raise ValueError(
-                f"{field} is required when llm_provider == {self.llm_provider!r}"
-            )
+            raise ValueError(f"{field} is required when llm_provider == {self.llm_provider!r}")
         # Epic 23.3: the judge may run on a different provider, which needs its own
         # key. Checked here rather than at the first judge call because that call
         # happens *after* extraction has already spent money on the run.
@@ -346,8 +354,7 @@ class Settings(BaseSettings):
                 continue
             if mode in unsupported_structured_output_modes(provider):
                 raise ValueError(
-                    f"llm_structured_output_mode={mode!r} is not supported by "
-                    f"{field}={provider!r}"
+                    f"llm_structured_output_mode={mode!r} is not supported by {field}={provider!r}"
                 )
         return self
 

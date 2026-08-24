@@ -182,9 +182,7 @@ def test_worker_settings_have_expected_defaults(monkeypatch: pytest.MonkeyPatch)
         "WORKER_HEALTH_CHECK_INTERVAL_SECONDS",
     ],
 )
-def test_worker_positive_int_fields_reject_zero(
-    monkeypatch: pytest.MonkeyPatch, var: str
-) -> None:
+def test_worker_positive_int_fields_reject_zero(monkeypatch: pytest.MonkeyPatch, var: str) -> None:
     _required_env(monkeypatch)
     monkeypatch.setenv(var, "0")
     with pytest.raises(ValidationError) as excinfo:
@@ -402,9 +400,7 @@ def test_reranker_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "201"])
-def test_rerank_top_n_out_of_bounds_rejected(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
+def test_rerank_top_n_out_of_bounds_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     # rerank_top_n is Field(ge=1, le=200): ≤0 would silently disable reranking and a
     # huge value would feed an LLM reranker a costly fan-out (Epic 18.1).
     _required_env(monkeypatch)
@@ -511,6 +507,31 @@ def test_llm_provider_invalid_value_rejected(monkeypatch: pytest.MonkeyPatch) ->
     _required_env(monkeypatch)
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     with pytest.raises(ValidationError, match="llm_provider"):
+        Settings(_env_file=None)
+
+
+def test_llm_provider_claude_cli_needs_no_provider_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The CLI provider authenticates via the local `claude` login; selecting it
+    # must not demand any vendor key beyond the base-required openai_api_key.
+    _required_env(monkeypatch)
+    monkeypatch.setenv("LLM_PROVIDER", "claude_cli")
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.llm_provider == "claude_cli"
+    assert settings.claude_cli_model == "claude-opus-5"
+    assert settings.claude_cli_timeout_seconds == 300.0
+    assert settings.claude_cli_binary == "claude"
+
+
+def test_claude_cli_timeout_must_be_at_least_one_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _required_env(monkeypatch)
+    monkeypatch.setenv("CLAUDE_CLI_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValidationError, match="claude_cli_timeout_seconds"):
         Settings(_env_file=None)
 
 

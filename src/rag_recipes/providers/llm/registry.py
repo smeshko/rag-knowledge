@@ -184,6 +184,7 @@ _ANTHROPIC = ProviderSpec(
     default_structured_output_mode="tool",
 )
 
+
 def _build_deepseek(
     settings: Settings,
     *,
@@ -218,6 +219,36 @@ _DEEPSEEK = ProviderSpec(
     default_structured_output_mode="strict_tool",
 )
 
+
+def _build_claude_cli(
+    settings: Settings,
+    *,
+    model: str,
+    observability: ProviderObservability | None,
+) -> LLMProvider:
+    from rag_recipes.providers.llm.claude_cli import ClaudeCLILLMProvider
+
+    return ClaudeCLILLMProvider(
+        model,
+        binary=settings.claude_cli_binary,
+        timeout_seconds=settings.claude_cli_timeout_seconds,
+        observability=observability,
+    )
+
+
+_CLAUDE_CLI = ProviderSpec(
+    name="claude_cli",
+    factory=_build_claude_cli,
+    model_field="claude_cli_model",
+    # No key: auth is the local `claude` binary's own claude.ai login. A missing
+    # login surfaces as a clear first-call LLMTechnicalError, not a config error.
+    api_key_field=None,
+    # Recorded for completeness like the Anthropic entry — the CLI enforces the
+    # schema itself via --json-schema; the provider does not consume a mode.
+    default_structured_output_mode="json_schema",
+)
+
+
 #: Modes a provider's transport cannot serve, rejected at Settings load rather
 #: than at the first (possibly paid) request.
 _UNSUPPORTED_MODES: dict[str, frozenset[str]] = {
@@ -234,6 +265,7 @@ _REGISTRY: dict[str, ProviderSpec] = {
     _OPENAI.name: _OPENAI,
     _ANTHROPIC.name: _ANTHROPIC,
     _DEEPSEEK.name: _DEEPSEEK,
+    _CLAUDE_CLI.name: _CLAUDE_CLI,
 }
 
 
@@ -247,9 +279,7 @@ def get_spec(name: str) -> ProviderSpec:
     try:
         return _REGISTRY[name]
     except KeyError:
-        raise ValueError(
-            f"llm_provider must be one of {sorted(_REGISTRY)}; got {name!r}"
-        ) from None
+        raise ValueError(f"llm_provider must be one of {sorted(_REGISTRY)}; got {name!r}") from None
 
 
 def resolve_extraction_model(
