@@ -26,6 +26,7 @@ from rag_recipes.api.routes import (
     documents,
     health,
     knowledge_items,
+    menus,
     review,
     search,
 )
@@ -109,6 +110,7 @@ app.include_router(health.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(search.router, prefix="/api/v1")
 app.include_router(answers.router, prefix="/api/v1")
+app.include_router(menus.router, prefix="/api/v1")
 app.include_router(knowledge_items.router, prefix="/api/v1")
 app.include_router(review.router, prefix="/api/v1")
 # Dev-only debug endpoints: hidden from the production OpenAPI; the router's
