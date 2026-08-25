@@ -34,7 +34,12 @@ _STRUCTURED: dict[str, Any] = {
     "ingredients": [
         {"raw_text": "1 cup maple syrup", "item_normalized": "maple syrup"},
         {"raw_text": "2 cups flour", "item_normalized": "flour"},
-        {"raw_text": "1 stick butter", "item_normalized": "butter"},
+        {
+            "position": 3,
+            "raw_text": "1 stick butter",
+            "item_normalized": "butter",
+            "confidence": {"normalization": 0.3},
+        },
     ],
     "warnings": ["low_normalization_confidence"],
 }
@@ -205,11 +210,15 @@ async def test_listing_returns_contract_shape(
         "top_ingredients": ["maple syrup", "flour", "butter"],
         "confidence_overall": 0.62,
     }
-    # flags carry the exact 21.1 canonical copy — verbatim SOFT_WARNING_MESSAGES.
+    # flags carry the exact 21.1 canonical copy — verbatim SOFT_WARNING_MESSAGES —
+    # plus the reviewer aids: the lowest score, the current bound, the rows below it.
     assert entry["flags"] == [
         {
             "code": "low_normalization_confidence",
             "message": SOFT_WARNING_MESSAGES["low_normalization_confidence"],
+            "value": 0.3,
+            "threshold": 0.5,
+            "ingredient_positions": [3],
         }
     ]
 
