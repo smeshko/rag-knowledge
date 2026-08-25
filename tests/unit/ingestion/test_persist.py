@@ -58,10 +58,26 @@ def test_normalize_title_strips_edges() -> None:
     assert normalize_title("   hello   ") == "hello"
 
 
-def test_normalize_title_nfc_normalizes_unicode() -> None:
-    # Decomposed "e" + combining acute → precomposed "é", then lowered.
-    assert normalize_title("Café") == "café"
-    assert normalize_title("Café") == normalize_title("café")
+def test_normalize_title_strips_diacritics() -> None:
+    # Precomposed and decomposed forms both collapse to the bare ASCII letter,
+    # so a re-extraction that drops the accent still dedups against the original.
+    assert normalize_title("Caf\u00e9") == "cafe"
+    assert normalize_title("Cafe\u0301") == normalize_title("caf\u00e9")
+    assert normalize_title("White Bean Pur\u00e9e") == normalize_title("White Bean Puree")
+    assert normalize_title("Chocolate Pots Cr\u00e8me") == "chocolate pots creme"
+
+
+def test_normalize_title_folds_typographic_quotes_and_dashes() -> None:
+    assert normalize_title("Dill Oil Jicama \u201cFries\u201d") == normalize_title(
+        'Dill Oil Jicama "Fries"'
+    )
+    assert normalize_title("Sweet\u2019n Sour") == "sweet'n sour"
+    assert normalize_title("Slow\u2014Cooked Beans") == normalize_title("Slow-Cooked Beans")
+    assert normalize_title("Slow\u2013Cooked Beans") == "slow-cooked beans"
+
+
+def test_normalize_title_folds_nbsp_to_space() -> None:
+    assert normalize_title("Bean\u00a0Soup") == "bean soup"
 
 
 def test_normalize_title_is_idempotent() -> None:

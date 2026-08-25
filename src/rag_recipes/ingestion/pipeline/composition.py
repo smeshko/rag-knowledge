@@ -32,18 +32,43 @@ __all__ = [
 ]
 
 
+_TYPOGRAPHIC_FOLDS = str.maketrans(
+    {
+        "\u2018": "'",  # ‘
+        "\u2019": "'",  # ’
+        "\u201a": "'",
+        "\u201c": '"',  # “
+        "\u201d": '"',  # ”
+        "\u201e": '"',
+        "\u2013": "-",  # –
+        "\u2014": "-",  # —
+        "\u2212": "-",  # minus sign
+        "\u00a0": " ",  # nbsp
+    }
+)
+
+
 def normalize_title(title: str) -> str:
     """Deterministically normalize a title for dedup/lookup (doc 2 § 4).
 
-    Unicode-NFC → lowercase → collapse internal whitespace runs to a single
-    space → strip. Pure, locale-independent, and idempotent
+    Unicode-NFKD → drop combining marks (``purée`` → ``puree``) → fold typographic
+    quotes/dashes to their ASCII forms (``“fries”`` → ``"fries"``) → lowercase →
+    collapse internal whitespace runs to a single space → strip. Pure,
+    locale-independent, and idempotent
     (``"Tomato and White Bean Soup"`` → ``"tomato and white bean soup"``).
+
+    The diacritic and quote folding exists because overlapping extraction
+    windows re-extract the same page and the model does not spell the title
+    byte-identically each time (``Crème``/``Creme``, ``“Fries”``/``"Fries"``);
+    dedup groups on this value, so those variants must collapse to one key.
 
     Lives here rather than in ``pipeline/persist`` (which re-exports it for its
     existing callers) so the pure edit layer can reach it without importing a
     module that pulls in a session and ``Settings``.
     """
-    folded = unicodedata.normalize("NFC", title).lower()
+    decomposed = unicodedata.normalize("NFKD", title)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    folded = stripped.translate(_TYPOGRAPHIC_FOLDS).lower()
     return " ".join(folded.split())
 
 

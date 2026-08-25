@@ -5,6 +5,11 @@ drops the LLM's self-reported warnings and the threshold-bearing messages), so
 the API maps each code to a stable human label at projection time. Pure module:
 no session, no settings — trivially unit-testable.
 
+Reviewer aids are layered on top when the caller passes the item's persisted
+``confidence`` and the current ``thresholds``: the observed score behind a
+confidence reason, the bound it is measured against, and — for the ingredient
+normalization rule — which rows are below it, so the UI can point at them.
+
 Consumed by ``GET /knowledge-items/{id}`` (the review surface: search cannot
 return ``needs_review`` items — they are never chunked, and retrieval floors at
 ``ready``).
@@ -14,7 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from rag_recipes.api.schemas.knowledge_items import ReviewReason
+from rag_recipes.api.schemas.knowledge_items import ReviewReason, ReviewThresholds
+from rag_recipes.ingestion.validation import SoftValidationThresholds
 
 # Human labels for the canonical `validate_soft` warning codes. The original
 # threshold-bearing messages are not persisted (thresholds may have changed
@@ -33,8 +39,76 @@ SOFT_WARNING_MESSAGES: dict[str, str] = {
 }
 
 
+def _score(container: Any, key: str) -> float | None:
+    """A finite number under ``key`` of a mapping, else ``None`` (JSONB is opaque)."""
+    if not isinstance(container, dict):
+        return None
+    value = container.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _ingredient_normalizations(structured_data: dict[str, Any]) -> list[tuple[int, float]]:
+    """``(position, normalization)`` per ingredient that carries a numeric score.
+
+    ``position`` falls back to the row's index when absent, which is also what
+    the FE's row order resolves to for an unpositioned list.
+    """
+    ingredients = structured_data.get("ingredients")
+    if not isinstance(ingredients, list):
+        return []
+    scored: list[tuple[int, float]] = []
+    for index, ing in enumerate(ingredients):
+        if not isinstance(ing, dict):
+            continue
+        normalization = _score(ing.get("confidence"), "normalization")
+        if normalization is None:
+            continue
+        position = ing.get("position")
+        if isinstance(position, bool) or not isinstance(position, int):
+            position = index
+        scored.append((position, normalization))
+    return scored
+
+
+def _normalization_detail(
+    structured_data: dict[str, Any], threshold: float | None
+) -> tuple[float | None, list[int] | None]:
+    """Lowest normalization score and the positions at/below the bound.
+
+    The rule fired on the minimum, so the minimum row is always named even when
+    the threshold has since moved above it (or is unknown): a reason that
+    points at nothing is what this exists to fix.
+    """
+    scored = _ingredient_normalizations(structured_data)
+    if not scored:
+        return None, None
+    lowest = min(score for _, score in scored)
+    below = [pos for pos, score in scored if score < threshold] if threshold is not None else []
+    if not below:
+        below = [pos for pos, score in scored if score == lowest]
+    return lowest, below
+
+
+def build_review_thresholds(
+    status: str, thresholds: SoftValidationThresholds | None
+) -> ReviewThresholds | None:
+    """The bounds a reviewer is judging against; only for ``needs_review``."""
+    if status != "needs_review" or thresholds is None:
+        return None
+    return ReviewThresholds(
+        overall=thresholds.min_overall_confidence,
+        boundary=thresholds.min_boundary_confidence,
+        normalization=thresholds.min_normalization_confidence,
+    )
+
+
 def build_review_reasons(
-    status: str, structured_data: dict[str, Any]
+    status: str,
+    structured_data: dict[str, Any],
+    confidence: dict[str, Any] | None = None,
+    thresholds: SoftValidationThresholds | None = None,
 ) -> list[ReviewReason]:
     """Project persisted warning codes into ``{code, message}`` reasons (D3).
 
@@ -49,6 +123,14 @@ def build_review_reasons(
     (a 500 on the item's own detail/audit endpoint) and a bare string or mapping
     would iterate per character / per key into nonsense reasons. Anything that is
     not a list yields ``[]`` — no reasons rather than invented ones.
+
+    ``confidence`` (the item's persisted top-level scores) and ``thresholds``
+    (the current bounds) are optional: without them the reasons carry only
+    ``code``/``message``. With them, the three confidence codes also carry the
+    observed ``value`` and ``threshold``, and ``low_normalization_confidence``
+    names the ``ingredient_positions`` to look at. Every lookup tolerates a
+    malformed payload — a missing or non-numeric score just leaves the aid
+    ``None``.
     """
     if status != "needs_review":
         return []
@@ -57,10 +139,20 @@ def build_review_reasons(
         return []
     reasons: list[ReviewReason] = []
     for warning in warnings:
-        if isinstance(warning, str) and warning in SOFT_WARNING_MESSAGES:
-            reasons.append(
-                ReviewReason(code=warning, message=SOFT_WARNING_MESSAGES[warning])
-            )
-        else:
+        if not (isinstance(warning, str) and warning in SOFT_WARNING_MESSAGES):
             reasons.append(ReviewReason(code="llm_warning", message=str(warning)))
+            continue
+        reason = ReviewReason(code=warning, message=SOFT_WARNING_MESSAGES[warning])
+        if warning == "low_overall_confidence":
+            reason.value = _score(confidence, "overall")
+            reason.threshold = thresholds.min_overall_confidence if thresholds else None
+        elif warning == "low_boundary_confidence":
+            reason.value = _score(confidence, "boundary")
+            reason.threshold = thresholds.min_boundary_confidence if thresholds else None
+        elif warning == "low_normalization_confidence":
+            reason.threshold = thresholds.min_normalization_confidence if thresholds else None
+            reason.value, reason.ingredient_positions = _normalization_detail(
+                structured_data, reason.threshold
+            )
+        reasons.append(reason)
     return reasons

@@ -259,6 +259,21 @@ class Settings(BaseSettings):
     answer_context_item_limit: int = Field(default=6, ge=1)
     answer_matched_chunks_per_item: int = Field(default=3, ge=1)
 
+    # Menu composition (POST /api/v1/menus). A menu request names several dishes at
+    # once, which one embedding cannot serve; the layer plans one retrieval query per
+    # course, retrieves each independently, then selects a coherent combination.
+    # menu_max_courses bounds the planner's fan-out — every course costs one search
+    # (an embedding round-trip plus two SQL legs), so this is the layer's cost knob.
+    # All three caps are Field(ge=1) so a <=0 env value is rejected at Settings load
+    # rather than silently producing an empty plan or an empty context.
+    menu_plan_prompt_version: str = "menu-plan-v1"
+    menu_plan_schema_version: str = "menu_plan.v1"
+    menu_selection_prompt_version: str = "menu-selection-v1"
+    menu_selection_schema_version: str = "menu_selection.v1"
+    menu_max_courses: int = Field(default=6, ge=1, le=12)
+    menu_candidates_per_course: int = Field(default=5, ge=1)
+    menu_matched_chunks_per_item: int = Field(default=2, ge=1)
+
     # Reranking (Epic 18). Off by default; the rerank step is wired into search() in
     # Phase 18.2. rerank_top_n is bounded (ge=1, le=200) so a ≤0 value can't silently
     # disable reranking and a huge value can't feed an LLM reranker a costly fan-out.

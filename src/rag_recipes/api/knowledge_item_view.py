@@ -17,13 +17,17 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.api.review_reasons import build_review_reasons
+from rag_recipes.api.review_reasons import (
+    build_review_reasons,
+    build_review_thresholds,
+)
 from rag_recipes.api.schemas.knowledge_items import (
     KnowledgeItemDetail,
     KnowledgeItemDisplay,
     KnowledgeItemResponse,
     KnowledgeItemSourceCitation,
 )
+from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_span import SourceSpan
@@ -82,6 +86,9 @@ async def build_knowledge_item_response(
     doc_title = document.title if document is not None else ""
     subtitle = f"{doc_title} · {primary_label}" if primary_label else (doc_title or None)
 
+    # Current bounds, not the ones ingest used (those are not persisted) — the
+    # reasons say so on the wire via `threshold`.
+    thresholds = thresholds_from_settings()
     return KnowledgeItemResponse(
         knowledge_item=KnowledgeItemDetail(
             id=item.id,
@@ -93,7 +100,13 @@ async def build_knowledge_item_response(
             source_span_ids=span_ids,
             confidence=item.confidence,
             structured_data=item.structured_data or {},
-            review_reasons=build_review_reasons(item.status.value, item.structured_data or {}),
+            review_reasons=build_review_reasons(
+                item.status.value,
+                item.structured_data or {},
+                confidence=item.confidence,
+                thresholds=thresholds,
+            ),
+            review_thresholds=build_review_thresholds(item.status.value, thresholds),
             edited_at=item.edited_at,
         ),
         display=KnowledgeItemDisplay(title=item.title, subtitle=subtitle),

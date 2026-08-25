@@ -18,6 +18,25 @@ class ReviewReason(BaseModel):
 
     code: str
     message: str
+    # Reviewer aids (additive, all optional). ``value`` is the observed score the
+    # rule fired on (overall / boundary / lowest ingredient normalization);
+    # ``threshold`` is the CURRENT configured bound it is compared against —
+    # thresholds are not persisted, so this may differ from the one ingest used.
+    # ``ingredient_positions`` names the ingredient rows (their ``position``)
+    # that sit below the normalization threshold, so the UI can mark them.
+    value: float | None = None
+    threshold: float | None = None
+    ingredient_positions: list[int] | None = None
+
+
+class ReviewThresholds(BaseModel):
+    """The current soft-validation bounds, so the UI can mark per-line scores
+    (steps, fields) the item-level reasons do not individually name. Shipped
+    only on ``needs_review`` items."""
+
+    overall: float
+    boundary: float
+    normalization: float
 
 
 class KnowledgeItemDetail(BaseModel):
@@ -36,6 +55,8 @@ class KnowledgeItemDetail(BaseModel):
     # Mapped from structured_data["warnings"] for needs_review items; [] otherwise
     # (Epic 21.1, D3).
     review_reasons: list[ReviewReason] = []
+    # Current thresholds for needs_review items; null otherwise.
+    review_thresholds: ReviewThresholds | None = None
     # When a reviewer last corrected this item in place; null means never edited
     # (Epic 22.2). Lets the queue mark an item as already corrected.
     edited_at: datetime | None = None

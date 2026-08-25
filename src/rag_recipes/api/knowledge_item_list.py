@@ -28,6 +28,7 @@ from rag_recipes.api.schemas.review import (
     ReviewItemSourcePages,
 )
 from rag_recipes.api.search_projection import top_ingredients
+from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -69,6 +70,10 @@ async def build_summaries(
     One batched span fetch for the whole page, never one per item — the N+1 the
     21.3 listing was written to avoid.
     """
+    # Resolved once per page, not per row: the bounds are settings-derived and
+    # identical for every item, and `build_review_reasons` needs them to attach
+    # the observed value/threshold aids to the three confidence codes.
+    thresholds = thresholds_from_settings()
     page_span_ids = {
         span_id for item, _, _ in rows for span_id in (item.source_span_ids or [])
     }
@@ -107,7 +112,12 @@ async def build_summaries(
                         "confidence_overall": (item.confidence or {}).get("overall"),
                     }
                 ),
-                flags=build_review_reasons(item.status.value, structured),
+                flags=build_review_reasons(
+                    item.status.value,
+                    structured,
+                    confidence=item.confidence,
+                    thresholds=thresholds,
+                ),
                 edited_at=item.edited_at,
             )
         )
