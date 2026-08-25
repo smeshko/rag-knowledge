@@ -15,6 +15,7 @@ per-book listing gets page provenance for ``ready`` rows for free.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -30,6 +31,7 @@ from rag_recipes.api.schemas.review import (
 from rag_recipes.api.search_projection import top_ingredients
 from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
+from rag_recipes.storage.models.knowledge_item_favourite import KnowledgeItemFavourite
 from rag_recipes.storage.models.source_span import SourceSpan
 
 __all__ = ["build_summaries", "source_pages"]
@@ -88,6 +90,24 @@ async def build_summaries(
         ).all()
         locators_by_id = {row.id: row.locator for row in span_rows}
 
+    # One batched read for the whole page, the span fetch's rule: a per-row
+    # lookup here would reintroduce the N+1 this function exists to avoid.
+    # `GET /favourites` joins the table itself, so for that caller this is a
+    # second read of rows it already has — cheap (a PK-keyed IN over one page)
+    # and worth it to keep every listing on the same projection.
+    favourited_at_by_id: dict[str, datetime] = {}
+    page_item_ids = [item.id for item, _, _ in rows]
+    if page_item_ids:
+        favourite_rows = (
+            await session.execute(
+                select(
+                    KnowledgeItemFavourite.knowledge_item_id,
+                    KnowledgeItemFavourite.created_at,
+                ).where(KnowledgeItemFavourite.knowledge_item_id.in_(page_item_ids))
+            )
+        ).all()
+        favourited_at_by_id = {row[0]: row[1] for row in favourite_rows}
+
     summaries: list[KnowledgeItemSummary] = []
     for item, doc_id, doc_title in rows:
         structured = item.structured_data or {}
@@ -119,6 +139,7 @@ async def build_summaries(
                     thresholds=thresholds,
                 ),
                 edited_at=item.edited_at,
+                favourited_at=favourited_at_by_id.get(item.id),
             )
         )
     return summaries

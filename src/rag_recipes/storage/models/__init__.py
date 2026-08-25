@@ -10,6 +10,9 @@ from rag_recipes.storage.models.extraction_batch_item import ExtractionBatchItem
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.ingestion_failure import IngestionFailure
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
+from rag_recipes.storage.models.knowledge_item_favourite import (
+    KnowledgeItemFavourite,
+)
 from rag_recipes.storage.models.source_asset import SourceAsset
 from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -22,6 +25,7 @@ __all__ = [
     "ExtractionRun",
     "IngestionFailure",
     "KnowledgeItem",
+    "KnowledgeItemFavourite",
     "SourceAsset",
     "SourceSpan",
 ]

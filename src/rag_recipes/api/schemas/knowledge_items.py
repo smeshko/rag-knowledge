@@ -60,6 +60,10 @@ class KnowledgeItemDetail(BaseModel):
     # When a reviewer last corrected this item in place; null means never edited
     # (Epic 22.2). Lets the queue mark an item as already corrected.
     edited_at: datetime | None = None
+    # When the reader starred this recipe; null means it is not a favourite.
+    # Read from the separate favourites table, so it moves only when the star
+    # does — nothing in the extraction row changes.
+    favourited_at: datetime | None = None
 
 
 class KnowledgeItemDisplay(BaseModel):

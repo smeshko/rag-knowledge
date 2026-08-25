@@ -64,6 +64,10 @@ class ReviewItem(BaseModel):
     # Null until a reviewer corrects the item in place (Epic 22.2), so the queue
     # can mark a row as already corrected.
     edited_at: datetime | None = None
+    # Null unless the reader starred this recipe. Carried on every listing row,
+    # not just the favourites one, so a shelf or queue card can render its own
+    # star without a second request.
+    favourited_at: datetime | None = None
 
 
 class ReviewItemListResponse(BaseModel):

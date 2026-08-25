@@ -30,6 +30,7 @@ from rag_recipes.api.schemas.knowledge_items import (
 from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
+from rag_recipes.storage.models.knowledge_item_favourite import KnowledgeItemFavourite
 from rag_recipes.storage.models.source_span import SourceSpan
 
 __all__ = ["build_knowledge_item_response", "pdf_page_label"]
@@ -62,6 +63,17 @@ async def build_knowledge_item_response(
     gets the recomputed flag set for free.
     """
     document = await session.get(Document, item.document_id)
+    # A scalar read rather than a relationship: the star lives in its own table
+    # (see the model docstring) and the PATCH path calls this builder inside a
+    # transaction that has just rewritten the item, so a lazy load here would be
+    # an async lazy load on a dirty session.
+    favourited_at = (
+        await session.execute(
+            select(KnowledgeItemFavourite.created_at).where(
+                KnowledgeItemFavourite.knowledge_item_id == item.id
+            )
+        )
+    ).scalar_one_or_none()
     span_ids: list[str] = list(item.source_span_ids or [])
     spans_by_id: dict[str, SourceSpan] = {}
     if span_ids:
@@ -108,6 +120,7 @@ async def build_knowledge_item_response(
             ),
             review_thresholds=build_review_thresholds(item.status.value, thresholds),
             edited_at=item.edited_at,
+            favourited_at=favourited_at,
         ),
         display=KnowledgeItemDisplay(title=item.title, subtitle=subtitle),
         source_citations=citations,
