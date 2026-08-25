@@ -50,6 +50,9 @@ _THRESHOLDS = SoftValidationThresholds(
     min_normalization_confidence=0.5,
     min_recipe_chars=200,
     max_recipe_chars=20000,
+    assembly_min_ingredients=3,
+    assembly_max_ingredients=12,
+    assembly_max_chars=400,
 )
 
 

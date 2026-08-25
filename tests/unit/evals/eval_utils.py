@@ -32,6 +32,9 @@ THRESHOLDS = SoftValidationThresholds(
     min_normalization_confidence=0.5,
     min_recipe_chars=50,
     max_recipe_chars=20_000,
+    assembly_min_ingredients=3,
+    assembly_max_ingredients=12,
+    assembly_max_chars=400,
 )
 
 JUDGE_PROMPT = (
@@ -112,7 +115,6 @@ def step_payload(step_number: int, text: str, span_id: str) -> dict[str, Any]:
         "step_number": step_number,
         "text": text,
         "source_span_ids": [span_id],
-        "confidence": {"overall": 0.9, "ordering": 0.9},
     }
 
 
@@ -166,9 +168,7 @@ def recipe_output(
     }
 
 
-def golden_to_recipe_output(
-    name: str, source_md: str, expected: dict[str, Any]
-) -> dict[str, Any]:
+def golden_to_recipe_output(name: str, source_md: str, expected: dict[str, Any]) -> dict[str, Any]:
     """The provider payload an *ideal* extractor would return for one golden.
 
     Built from that fixture's own ``expected.json`` — the golden-replay run

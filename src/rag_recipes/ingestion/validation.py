@@ -87,18 +87,16 @@ def _confidence_pairs(extracted: ExtractedRecipe) -> Iterator[tuple[str, float]]
     yield "item.fields.ingredients", fields.ingredients
     yield "item.fields.steps", fields.steps
     for ingredient in extracted.structured_data.ingredients:
-        conf = ingredient.confidence
-        position = ingredient.position
-        yield f"ingredient[{position}].overall", conf.overall
-        yield f"ingredient[{position}].quantity", conf.quantity
-        yield f"ingredient[{position}].unit", conf.unit
-        yield f"ingredient[{position}].item", conf.item
-        yield f"ingredient[{position}].normalization", conf.normalization
-    for step in extracted.structured_data.steps:
-        step_conf = step.confidence
-        number = step.step_number
-        yield f"step[{number}].overall", step_conf.overall
-        yield f"step[{number}].ordering", step_conf.ordering
+        # ``normalization`` only: it is the one per-row confidence with a reader
+        # (``validate_soft``'s low_normalization_confidence warning). The four
+        # sibling ingredient axes and both step axes were range-checked here and
+        # nowhere else, so they were dropped from the schema — see
+        # ``IngredientConfidence`` / ``ExtractedStep``. Steps now contribute no
+        # pairs at all.
+        yield (
+            f"ingredient[{ingredient.position}].normalization",
+            ingredient.confidence.normalization,
+        )
 
 
 def validate_hard(extracted: ExtractedRecipe, window: Window) -> list[HardValidationFailure]:
@@ -197,6 +195,66 @@ class SoftValidationThresholds:
     min_normalization_confidence: float
     min_recipe_chars: int
     max_recipe_chars: int
+    #: Bounds on what still counts as an *assembly* recipe — see
+    #: ``_is_assembly_recipe``. A step-less candidate inside all three is judged
+    #: method-free by design rather than truncated or unstructured.
+    assembly_min_ingredients: int
+    assembly_max_ingredients: int
+    assembly_max_chars: int
+
+
+def _is_assembly_recipe(
+    extracted: ExtractedRecipe,
+    body_len: int,
+    thresholds: SoftValidationThresholds,
+) -> bool:
+    """True when a method-free candidate is an *assembly* recipe, not a truncated one.
+
+    Some cookbooks — the bowl / "build your own" genre especially — print recipes
+    that are a title plus a list of already-documented components and nothing
+    else::
+
+        THANKSGIVING IN A BOWL
+        Mashed Potatoes (page 46), shredded leftover roasted turkey, roasted
+        Brussels sprouts (page 43), ..., cranberry sauce
+
+    That is the whole recipe as printed. ``no_steps`` and ``recipe_too_short``
+    were written for books where a missing method means the extraction failed, so
+    against this genre they fire on correct output: ingesting one such title sent
+    31 of 167 items to ``needs_review``, where nothing is chunked and the
+    retrieval floor hides them entirely.
+
+    The discriminator is size, not the absence of steps. A *truncated* recipe —
+    the head half of one that spilled across a window boundary, keeping its
+    ingredient block and losing its method — carries the full component list of a
+    real dish: 17 to 32 rows over a long body. An assembly recipe names a handful
+    of finished components in a line or two. Measured over both books ingested so
+    far, every method-free candidate with ingredients sat at 3-10 rows and
+    96-260 characters, and no truncated head came close; the defaults leave the
+    gap between the two populations wide.
+
+    The *lower* bound is what keeps this from swallowing the failure it most
+    resembles. A recipe whose method the model wrote into ``body_text`` as prose
+    but never broke into ``steps`` is also short and step-less — the extraction
+    eval's tomato-soup fixture is exactly that, one ingredient and "Chop the
+    tomatoes, then simmer and blend" as its whole body — and exempting it would
+    promote genuinely unstructured output into search. An assembly recipe is a
+    *composition*: it names several finished components. Below three there is no
+    composition to speak of, only a recipe missing its method, so the floor sits
+    at the smallest real component list observed.
+
+    Requiring ingredients at all is deliberate for the same reason: a candidate
+    with neither ingredients nor steps is not an assembly recipe, it is empty,
+    and ``no_ingredients`` should still speak for it.
+    """
+    ingredients = extracted.structured_data.ingredients
+    return (
+        not extracted.structured_data.steps
+        and thresholds.assembly_min_ingredients
+        <= len(ingredients)
+        <= thresholds.assembly_max_ingredients
+        and body_len <= thresholds.assembly_max_chars
+    )
 
 
 def validate_soft(
@@ -212,6 +270,12 @@ def validate_soft(
     """
     warnings: list[SoftValidationWarning] = []
     structured = extracted.structured_data
+    body_len = len(extracted.body_text)
+    # Both of this candidate's size-shaped rules are waived together or not at
+    # all: an assembly recipe is short *because* it has no method, so clearing
+    # ``no_steps`` while leaving ``recipe_too_short`` behind would still park it
+    # in review for the same underlying fact.
+    assembly = _is_assembly_recipe(extracted, body_len, thresholds)
 
     if not structured.ingredients:
         warnings.append(
@@ -220,7 +284,7 @@ def validate_soft(
             )
         )
 
-    if not structured.steps:
+    if not structured.steps and not assembly:
         warnings.append(
             SoftValidationWarning(code="no_steps", message="structured_data has no steps")
         )
@@ -243,8 +307,7 @@ def validate_soft(
             )
         )
 
-    body_len = len(extracted.body_text)
-    if body_len < thresholds.min_recipe_chars:
+    if body_len < thresholds.min_recipe_chars and not assembly:
         warnings.append(
             SoftValidationWarning(
                 code="recipe_too_short",

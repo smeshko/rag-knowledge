@@ -231,6 +231,22 @@ class Settings(BaseSettings):
     extraction_min_normalization_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     extraction_min_recipe_chars: int = Field(default=200, ge=0)
     extraction_max_recipe_chars: int = Field(default=20000, ge=1)
+    # Bounds on the *assembly* recipe exemption (see
+    # ``validation._is_assembly_recipe``): a candidate with no steps, at most
+    # this many ingredients and a body no longer than this is judged method-free
+    # by design — the bowl-cookbook genre prints such recipes as a title plus a
+    # list of components documented elsewhere — and is spared ``no_steps`` /
+    # ``recipe_too_short``. Sized from the two ingested books: every real
+    # assembly recipe held 3-10 ingredients in 96-260 characters, while the
+    # failure mode these rules exist to catch (a recipe truncated at a window
+    # boundary, keeping its ingredients and losing its method) held 17-32.
+    # The gap is wide; these sit inside it. The floor exists to exclude the
+    # other short step-less shape — a recipe whose method was written as prose
+    # into body_text and never structured; that is a real defect and must keep
+    # flagging.
+    extraction_assembly_min_ingredients: int = Field(default=3, ge=1)
+    extraction_assembly_max_ingredients: int = Field(default=12, ge=1)
+    extraction_assembly_max_chars: int = Field(default=400, ge=1)
 
     # Query-time answer layer (Epic 17, doc 8 § 3). answer_llm_model is left None
     # and resolved to llm_model at the dependency boundary (a class default can't

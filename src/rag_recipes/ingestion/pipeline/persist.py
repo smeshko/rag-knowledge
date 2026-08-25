@@ -63,6 +63,9 @@ def thresholds_from_settings() -> SoftValidationThresholds:
         min_normalization_confidence=settings.extraction_min_normalization_confidence,
         min_recipe_chars=settings.extraction_min_recipe_chars,
         max_recipe_chars=settings.extraction_max_recipe_chars,
+        assembly_min_ingredients=settings.extraction_assembly_min_ingredients,
+        assembly_max_ingredients=settings.extraction_assembly_max_ingredients,
+        assembly_max_chars=settings.extraction_assembly_max_chars,
     )
 
 

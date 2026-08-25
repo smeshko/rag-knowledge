@@ -32,7 +32,6 @@ from rag_recipes.ingestion.pipeline.extraction import (
     RecipeConfidence,
     RecipeFieldConfidence,
     RecipeV1StructuredData,
-    StepConfidence,
 )
 from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
 
@@ -42,6 +41,9 @@ THRESHOLDS = SoftValidationThresholds(
     min_normalization_confidence=0.5,
     min_recipe_chars=80,
     max_recipe_chars=600,
+    assembly_min_ingredients=3,
+    assembly_max_ingredients=12,
+    assembly_max_chars=400,
 )
 
 LONG_BODY = "Tomato Soup\n\n" + ("a rich, slow-simmered tomato soup for a cold evening. " * 3)
@@ -79,7 +81,6 @@ def _step(step_number: int = 1, text: str = "Heat the oil in a large pot.") -> E
         step_number=step_number,
         text=text,
         source_span_ids=[f"span_{step_number:03d}"],
-        confidence=StepConfidence(overall=0.9, ordering=0.9),
     )
 
 
@@ -447,7 +448,7 @@ def test_the_result_shares_no_mutable_state_with_the_input() -> None:
 
     out["ingredients"][0]["confidence"]["overall"] = 0.0
     out["steps"][0]["source_span_ids"].append("span_999")
-    assert structured_in["ingredients"][0]["confidence"]["overall"] == 0.9
+    assert structured_in["ingredients"][0]["confidence"]["normalization"] == 0.9
     assert structured_in["steps"][0]["source_span_ids"] == ["span_001"]
 
 

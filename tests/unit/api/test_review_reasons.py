@@ -28,7 +28,6 @@ from rag_recipes.ingestion.pipeline.extraction import (
     RecipeConfidence,
     RecipeFieldConfidence,
     RecipeV1StructuredData,
-    StepConfidence,
 )
 from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
 
@@ -45,9 +44,7 @@ def test_needs_review_known_codes_project_code_and_message() -> None:
 
 
 def test_unknown_string_projects_as_llm_warning_envelope() -> None:
-    reasons = build_review_reasons(
-        "needs_review", {"warnings": ["model said something odd"]}
-    )
+    reasons = build_review_reasons("needs_review", {"warnings": ["model said something odd"]})
     assert len(reasons) == 1
     assert reasons[0].code == "llm_warning"
     assert reasons[0].message == "model said something odd"
@@ -56,9 +53,7 @@ def test_unknown_string_projects_as_llm_warning_envelope() -> None:
 def test_non_string_element_projects_as_llm_warning_and_never_raises() -> None:
     # structured_data is opaque JSONB: a dict element must not 500 the search
     # endpoint via `unhashable type` (D3 isinstance guard).
-    reasons = build_review_reasons(
-        "needs_review", {"warnings": [{"code": "weird"}, 42]}
-    )
+    reasons = build_review_reasons("needs_review", {"warnings": [{"code": "weird"}, 42]})
     assert [r.code for r in reasons] == ["llm_warning", "llm_warning"]
     assert reasons[0].message == str({"code": "weird"})
     assert reasons[1].message == "42"
@@ -129,12 +124,16 @@ def test_soft_warning_messages_covers_every_declared_code() -> None:
     assert declared, "AST scan found no SoftValidationWarning codes — guard is vacuous"
     assert declared == set(SOFT_WARNING_MESSAGES)
 
+
 _THRESHOLDS = SoftValidationThresholds(
     min_overall_confidence=0.5,
     min_boundary_confidence=0.5,
     min_normalization_confidence=0.5,
     min_recipe_chars=10,
     max_recipe_chars=50,
+    assembly_min_ingredients=3,
+    assembly_max_ingredients=12,
+    assembly_max_chars=400,
 )
 
 
@@ -207,15 +206,12 @@ def test_soft_warning_messages_covers_every_validate_soft_code() -> None:
         item_normalized="beans",
         preparation=None,
         notes=None,
-        confidence=IngredientConfidence(
-            overall=1.0, quantity=1.0, unit=1.0, item=1.0, normalization=0.0
-        ),
+        confidence=IngredientConfidence(normalization=0.0),
     )
     step = ExtractedStep(
         step_number=1,
         text="cook",
         source_span_ids=["span_1"],
-        confidence=StepConfidence(overall=1.0, ordering=1.0),
     )
     candidate_b = _recipe(
         body_text="x" * 100,

@@ -121,6 +121,7 @@ from rag_recipes.ingestion.pipeline.extraction import (
     RecipeExtractionOutput,
     run_extraction,
 )
+from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
 from rag_recipes.ingestion.pipeline.windows import Window
 from rag_recipes.ingestion.validation import (
     SoftValidationThresholds,
@@ -558,15 +559,11 @@ async def run_extraction_eval(
         if settings is None:
             settings = real_settings
         if thresholds is None:
-            thresholds = SoftValidationThresholds(
-                min_overall_confidence=real_settings.extraction_min_overall_confidence,
-                min_boundary_confidence=real_settings.extraction_min_boundary_confidence,
-                min_normalization_confidence=(
-                    real_settings.extraction_min_normalization_confidence
-                ),
-                min_recipe_chars=real_settings.extraction_min_recipe_chars,
-                max_recipe_chars=real_settings.extraction_max_recipe_chars,
-            )
+            # Delegate rather than re-list the fields: this block drifted out of
+            # sync the moment ingest grew a threshold (the assembly-recipe
+            # bounds), and an eval scoring against different thresholds than
+            # ingest uses is measuring the wrong pipeline.
+            thresholds = thresholds_from_settings()
 
     fixtures = load_recipe_fixtures(fixture_set, root=fixtures_root)
     if not fixtures:
