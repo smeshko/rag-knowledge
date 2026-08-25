@@ -2,6 +2,13 @@
 
 ``schema`` / ``yield`` are reserved words JSON-side, carried by ``schema_`` /
 ``yield_`` with aliases — the idiom from ``api/schemas/search.py``.
+
+``ReviewItem`` outgrew the review queue: the per-book listing
+(``GET /documents/{id}/knowledge-items``) needs exactly the same row, so it is
+re-exported here as ``KnowledgeItemSummary`` and wrapped by
+``KnowledgeItemListResponse``. Both stay in *this* module rather than moving to
+``schemas/knowledge_items.py`` because this module already imports
+``ReviewReason`` from there — the reverse import would be a cycle.
 """
 
 from __future__ import annotations
@@ -45,6 +52,10 @@ class ReviewItem(BaseModel):
     title: str
     summary: str | None
     item_type: str
+    # Always ``needs_review`` on /review-items; the per-book listing is what
+    # makes this field carry information (additive, so the queue's contract is
+    # unchanged).
+    status: str
     document: ReviewItemDocument
     source_pages: ReviewItemSourcePages
     extraction: ReviewItemExtraction
@@ -57,6 +68,21 @@ class ReviewItem(BaseModel):
 
 class ReviewItemListResponse(BaseModel):
     review_items: list[ReviewItem]
+
+
+#: The same row, named for the surface that is not a review queue. One model,
+#: so a card rendered from either listing cannot drift.
+KnowledgeItemSummary = ReviewItem
+
+
+class KnowledgeItemListResponse(BaseModel):
+    """``GET /documents/{document_id}/knowledge-items``.
+
+    No total and no cursor, matching ``ReviewItemListResponse`` — clients walk
+    ``limit``/``offset`` until a page comes back short.
+    """
+
+    knowledge_items: list[KnowledgeItemSummary]
 
 
 class ReviewDecision(StrEnum):

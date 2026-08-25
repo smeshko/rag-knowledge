@@ -1,7 +1,8 @@
 """Session-scoped Postgres fixtures for integration tests.
 
 Probes the dev compose Postgres at TEST_DATABASE_URL (default:
-postgresql+asyncpg://postgres:postgres@localhost:5433/rag_recipes_test).
+postgresql+asyncpg://postgres:postgres@localhost:5435/rag_recipes_test — the
+port docker-compose publishes, and the one .env.example ships).
 Skips the entire integration test session with a clear remediation message
 when compose Postgres is unreachable.
 """
@@ -30,7 +31,14 @@ from sqlalchemy.pool import NullPool
 from rag_recipes.config import get_settings
 from rag_recipes.ingestion.queue import _build_redis_settings
 
-DEFAULT_TEST_DSN = "postgresql+asyncpg://postgres:postgres@localhost:5433/rag_recipes_test"
+# 5435 is the port docker-compose publishes (5432/5433 are other projects'
+# databases on this machine — see docker-compose.yml). This default has to
+# match it: TEST_DATABASE_URL lives in .env, which pydantic-settings loads for
+# Settings but never exports into os.environ, so an unexported shell running
+# `just test-integration` lands here — and a wrong default skips the ENTIRE
+# integration suite with a "start compose" message on a checkout where compose
+# is already running.
+DEFAULT_TEST_DSN = "postgresql+asyncpg://postgres:postgres@localhost:5435/rag_recipes_test"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}

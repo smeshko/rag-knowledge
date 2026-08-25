@@ -340,6 +340,168 @@ async def test_approved_item_is_indexed_handed_off_and_searchable(
         await _cleanup(test_engine, document_id, asset_id)
 
 
+async def test_editing_a_ready_item_re_embeds_it_from_the_saved_text(
+    test_engine: AsyncEngine,
+    redis_arq_settings: RedisSettings,
+    arq_queue_cleanup: str,
+) -> None:
+    """End-to-end: PATCH a shelved recipe → queued job → burst worker → findable
+    by the words it now contains, and no longer by the ones it lost.
+
+    The approve path above proves an item reaches search. This proves it can be
+    *corrected* there — the thing that was impossible while a ``ready`` item's
+    only edit path was a 404. The searchability assertions are the whole point:
+    a row rewrite alone would leave the chunks describing the old text and the
+    request would still answer 200.
+    """
+    session_factory = build_session_factory(test_engine)
+    async with session_factory() as session:
+        document_id, asset_id = await _seed_document(session)
+        run = await _seed_run(session, document_id=document_id)
+        item = await _seed_item(session, run=run, status=KnowledgeItemStatus.INDEXING)
+        item_id = item.id
+        await session.commit()
+
+    settings = get_settings().model_copy(
+        update={
+            "personal_api_token": TEST_API_TOKEN,
+            "embedding_provider": _FAKE_PROVIDER,
+            "embedding_model": _FAKE_MODEL,
+        }
+    )
+    fake = FakeEmbeddingProvider(provider=_FAKE_PROVIDER, model=_FAKE_MODEL)
+
+    async def _override_session() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as session:
+            yield session
+
+    async def _startup(ctx: dict[str, Any]) -> None:
+        ctx["settings"] = settings
+        ctx["session_factory"] = session_factory
+        ctx["embedding_provider"] = fake
+
+    async def _drain() -> None:
+        worker = Worker(
+            functions=[
+                func(index_knowledge_item, name="index_knowledge_item", max_tries=1)
+            ],
+            redis_settings=redis_arq_settings,
+            burst=True,
+            max_jobs=1,
+            queue_name=arq_queue_cleanup,
+            on_startup=_startup,
+            poll_delay=0.1,
+        )
+        try:
+            await asyncio.wait_for(worker.async_run(), timeout=30)
+        finally:
+            await worker.close()
+
+    pool = await create_pool(redis_arq_settings, default_queue_name=arq_queue_cleanup)
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[get_arq_redis] = lambda: pool
+    app.dependency_overrides[get_settings_dep] = lambda: settings
+    app.dependency_overrides[get_embedding_provider] = lambda: fake
+    app.dependency_overrides[get_reranker_provider] = lambda: None
+
+    try:
+        # Put the item on the shelf the ordinary way, so the "before" state is
+        # a genuinely indexed row rather than hand-written chunks.
+        assert await index_knowledge_item(_job_ctx(test_engine, fake), item_id) >= 1
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver", headers=AUTH_HEADERS
+        ) as client:
+            before = await client.post(
+                "/api/v1/search",
+                json={"query": "maple cutout cookies", "mode": "keyword"},
+            )
+            assert item_id in [r["item"]["id"] for r in before.json()["results"]]
+
+            # A whole-recipe correction, and it has to be: "cutout" sits in
+            # the title, the summary AND the seeded body_text, and `apply_edit`
+            # rebuilds body_text only when the ingredient or step lines change
+            # (its documented rule — prose that lives only there survives an
+            # edit that does not invalidate it). Patching all three is what
+            # makes the disappearance assertion below mean something.
+            resp = await client.patch(
+                f"/api/v1/knowledge-items/{item_id}",
+                json={
+                    "title": "Sourdough Pretzel Knots",
+                    "summary": "Chewy salted knots with a sourdough tang.",
+                    "steps": [
+                        "Shape the dough into knots and rest them briefly.",
+                        "Boil in soda water, then bake until deeply browned.",
+                    ],
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["knowledge_item"]["status"] == "indexing"
+
+            # Mid-flight the recipe is genuinely absent from search — chunks
+            # gone, nothing to match. Asserted rather than glossed over,
+            # because it is the cost the UI has to warn about.
+            async with session_factory() as session:
+                assert (
+                    await session.execute(
+                        select(Chunk.id).where(Chunk.parent_id == item_id)
+                    )
+                ).all() == []
+
+            await _drain()
+
+            async with session_factory() as session:
+                reloaded = await session.get(KnowledgeItem, item_id)
+                assert reloaded is not None
+                assert reloaded.status is KnowledgeItemStatus.READY
+                assert reloaded.title == "Sourdough Pretzel Knots"
+                chunk_ids = (
+                    (
+                        await session.execute(
+                            select(Chunk.id).where(Chunk.parent_id == item_id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert len(chunk_ids) >= 1
+                embeddings = (
+                    await session.execute(
+                        select(ChunkEmbedding.id).where(
+                            ChunkEmbedding.chunk_id.in_(chunk_ids)
+                        )
+                    )
+                ).all()
+                assert len(embeddings) == len(chunk_ids)
+
+            # The claim that matters: the index describes the SAVED text.
+            after_new = await client.post(
+                "/api/v1/search",
+                json={"query": "sourdough pretzel knots", "mode": "keyword"},
+            )
+            assert item_id in [r["item"]["id"] for r in after_new.json()["results"]]
+
+            # The other half of the claim: the OLD text is really gone, not
+            # merely outranked by the new.
+            after_old = await client.post(
+                "/api/v1/search",
+                json={"query": "cutout", "mode": "keyword"},
+            )
+            assert item_id not in [r["item"]["id"] for r in after_old.json()["results"]]
+    finally:
+        for dep in (
+            get_session,
+            get_arq_redis,
+            get_settings_dep,
+            get_embedding_provider,
+            get_reranker_provider,
+        ):
+            app.dependency_overrides.pop(dep, None)
+        await pool.aclose()
+        await _cleanup(test_engine, document_id, asset_id)
+
+
 async def test_redelivery_noops_without_duplicate_rows(
     test_engine: AsyncEngine,
 ) -> None:

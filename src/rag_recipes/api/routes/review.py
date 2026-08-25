@@ -22,14 +22,14 @@ from typing import Any
 
 from arq.connections import ArqRedis
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select, type_coerce, update
+from sqlalchemy import case, func, literal, select, type_coerce, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.dependencies import get_arq_redis, get_session
 from rag_recipes.api.errors import ApiError, ErrorCode
+from rag_recipes.api.knowledge_item_list import build_summaries
 from rag_recipes.api.knowledge_item_view import build_knowledge_item_response
-from rag_recipes.api.review_reasons import build_review_reasons
 from rag_recipes.api.routes._params import parse_int
 from rag_recipes.api.schemas.knowledge_items import (
     KnowledgeItemResponse,
@@ -38,15 +38,10 @@ from rag_recipes.api.schemas.knowledge_items import (
 from rag_recipes.api.schemas.review import (
     ReviewDecision,
     ReviewedKnowledgeItem,
-    ReviewItem,
-    ReviewItemDocument,
-    ReviewItemExtraction,
     ReviewItemListResponse,
-    ReviewItemSourcePages,
     ReviewRequest,
     ReviewResponse,
 )
-from rag_recipes.api.search_projection import top_ingredients
 from rag_recipes.ingestion.editing import (
     UNSET,
     RecipeEdit,
@@ -60,7 +55,7 @@ from rag_recipes.ingestion.status import TERMINAL_STATUSES
 from rag_recipes.storage.enums import KnowledgeItemStatus
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
-from rag_recipes.storage.models.source_span import SourceSpan
+from rag_recipes.storage.repositories.documents import DocumentRepository
 
 router = APIRouter(tags=["review"])
 
@@ -70,32 +65,14 @@ _LIST_LIMIT_DEFAULT = 50
 _LIST_LIMIT_MAX = 200
 _LIST_OFFSET_DEFAULT = 0
 
-
-def _source_pages(
-    span_ids: list[str], locators_by_id: dict[str, dict[str, Any]]
-) -> ReviewItemSourcePages:
-    """Min/max page bounds over the item's resolved span locators.
-
-    Keys are read with ``.get`` and skipped when absent (the
-    ``knowledge_item_view.pdf_page_label`` precedent) — a degraded locator must
-    never 500 the whole listing. Both bounds are ``None`` when nothing resolves.
-    """
-    starts: list[int] = []
-    ends: list[int] = []
-    for span_id in span_ids:
-        locator = locators_by_id.get(span_id)
-        if not isinstance(locator, dict):
-            continue
-        start = locator.get("page_start")
-        end = locator.get("page_end")
-        if isinstance(start, int):
-            starts.append(start)
-        if isinstance(end, int):
-            ends.append(end)
-    return ReviewItemSourcePages(
-        page_start=min(starts) if starts else None,
-        page_end=max(ends) if ends else None,
-    )
+#: The two statuses ``PATCH /knowledge-items/{id}`` accepts. ``needs_review``
+#: is a pure row rewrite; ``ready`` additionally drops the item's index rows and
+#: re-indexes it. Everything else — ``indexing``, ``extracting``,
+#: ``superseded``, ``rejected`` — is either mid-flight or dead.
+_EDITABLE_STATUSES = (
+    KnowledgeItemStatus.NEEDS_REVIEW,
+    KnowledgeItemStatus.READY,
+)
 
 
 @router.get("/review-items", response_model=ReviewItemListResponse)
@@ -141,53 +118,12 @@ async def list_review_items(
         .limit(limit_int)
         .offset(offset_int)
     )
-    rows = (await session.execute(stmt)).all()
+    rows = [tuple(row) for row in (await session.execute(stmt)).all()]
 
-    # Chunk-free source_pages path (D4): needs_review items have no chunks, so
-    # spans are resolved off KnowledgeItem.source_span_ids itself — one batched
+    # Chunk-free source_pages path (D4), now shared with the per-book listing:
+    # spans are resolved off KnowledgeItem.source_span_ids itself, one batched
     # fetch for the whole page.
-    page_span_ids = {
-        span_id for item, _, _ in rows for span_id in (item.source_span_ids or [])
-    }
-    locators_by_id: dict[str, dict[str, Any]] = {}
-    if page_span_ids:
-        span_rows = (
-            await session.execute(
-                select(SourceSpan.id, SourceSpan.locator).where(
-                    SourceSpan.id.in_(page_span_ids)
-                )
-            )
-        ).all()
-        locators_by_id = {row.id: row.locator for row in span_rows}
-
-    review_items: list[ReviewItem] = []
-    for item, doc_id, doc_title in rows:
-        structured = item.structured_data or {}
-        review_items.append(
-            ReviewItem(
-                id=item.id,
-                title=item.title,
-                summary=item.summary,
-                item_type=item.item_type,
-                document=ReviewItemDocument(id=doc_id, title=doc_title),
-                source_pages=_source_pages(
-                    list(item.source_span_ids or []), locators_by_id
-                ),
-                # model_validate (alias-keyed): `schema`/`yield` cannot be
-                # passed by keyword (`yield` is a Python keyword).
-                extraction=ReviewItemExtraction.model_validate(
-                    {
-                        "schema": structured.get("schema", "recipe.v1"),
-                        "yield": structured.get("yield"),
-                        "top_ingredients": top_ingredients(structured),
-                        "confidence_overall": (item.confidence or {}).get("overall"),
-                    }
-                ),
-                flags=build_review_reasons(item.status.value, structured),
-                edited_at=item.edited_at,
-            )
-        )
-    return ReviewItemListResponse(review_items=review_items)
+    return ReviewItemListResponse(review_items=await build_summaries(session, rows))
 
 
 def _recipe_edit_from(body: KnowledgeItemUpdateRequest) -> RecipeEdit:
@@ -233,26 +169,44 @@ async def update_knowledge_item(
     item_id: str,
     body: KnowledgeItemUpdateRequest,
     session: AsyncSession = Depends(get_session),  # noqa: B008
+    arq_redis: ArqRedis = Depends(get_arq_redis),  # noqa: B008
 ) -> Any:
-    """Correct a pending-review item in place (Epic 22.2).
+    """Correct a knowledge item in place (Epic 22.2; ``ready`` items since).
 
-    The third review verb. Editing never decides: the item is still
-    ``needs_review`` afterwards, with its content warnings re-derived from the
-    corrected text — so a reviewer who fixes "no ingredients" stops seeing the
-    flag that said so, while ``low_overall_confidence`` /
-    ``low_boundary_confidence`` survive, because retyping a line does not attest
-    that the recipe was cut out of the page correctly.
+    Content warnings are re-derived from the corrected text either way — so a
+    reviewer who fixes "no ingredients" stops seeing the flag that said so,
+    while ``low_overall_confidence`` / ``low_boundary_confidence`` survive,
+    because retyping a line does not attest that the recipe was cut out of the
+    page correctly.
 
-    Restricted to ``needs_review`` by the guarded UPDATE. Those items have no
-    chunks and no embeddings, so an edit is a pure row rewrite and the *edited*
-    text is what gets chunked when the reviewer then approves; editing an
-    indexed item would need a delete-and-re-embed path that does not exist.
+    Two statuses, two very different transactions:
+
+    - ``needs_review`` — the original path, and still a pure row rewrite.
+      Editing never decides: the item is *still* ``needs_review`` afterwards,
+      and the edited text is what gets chunked when the reviewer approves.
+      These items have no chunks and no embeddings, so there is nothing else to
+      keep in step.
+    - ``ready`` — the item is indexed, so a row rewrite alone would leave
+      ``chunks`` and ``chunk_embeddings`` describing the *old* text and the
+      recipe findable by words it no longer contains. The handler therefore
+      drops its index rows in the same transaction, flips it to ``indexing``,
+      and enqueues ``index_knowledge_item`` to rebuild and re-embed from the
+      saved text — the delete-and-re-embed path this docstring used to say did
+      not exist.
+
+    Two consequences of the ``ready`` path, both deliberate. The recipe is
+    **absent from search until the worker finishes** (search requires chunks),
+    which is the price of not blocking the request on an embedding round-trip.
+    And if the job exhausts its retries, the item-level pass in
+    ``sweep_stuck_jobs`` returns the row to ``needs_review`` — an edit can
+    therefore demote a shelved recipe into the review queue. That is honest
+    rather than lossy: the row genuinely has no chunks at that point, which is
+    exactly what ``needs_review`` means.
 
     Guards run in the same order as ``POST …/review`` so each stays reachable
     rather than masked: 404 unknown id → 409 mid-reprocess document → 409 stale
-    generation → guarded UPDATE → 404 not awaiting review. The empty-body 400
-    sits *after* the 404 so an unknown id reports as unknown whatever the body
-    says.
+    generation → guarded UPDATE → 404 not editable. The empty-body 400 sits
+    *after* the 404 so an unknown id reports as unknown whatever the body says.
 
     Not closed here (and not asked for by the epic): two concurrent PATCHes are
     last-write-wins on content. The guarded UPDATE closes the edit-vs-decide
@@ -353,12 +307,20 @@ async def update_knowledge_item(
     # pattern): a PATCH racing a decide has exactly one winner, and an in-place
     # mutation of the loaded row's `structured_data` — which is NOT dirty-tracked
     # and would vanish at commit — is structurally impossible here.
+    #
+    # The status is decided IN the same statement rather than read first and
+    # written second: a CASE over the OLD value (standard SQL — the SET
+    # expression sees the pre-UPDATE row) sends a `ready` item to `indexing`
+    # and leaves a `needs_review` one alone, and RETURNING the new value is how
+    # the handler learns which of the two branches actually won. Reading the
+    # status before the UPDATE and branching in Python would reopen exactly the
+    # race the guarded UPDATE exists to close.
     updated = (
         await session.execute(
             update(KnowledgeItem)
             .where(
                 KnowledgeItem.id == item_id,
-                KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+                KnowledgeItem.status.in_(_EDITABLE_STATUSES),
             )
             .values(
                 title=edited.title,
@@ -370,11 +332,21 @@ async def update_knowledge_item(
                     KnowledgeItem.pre_edit_snapshot, type_coerce(snapshot, JSONB)
                 ),
                 edited_at=func.now(),
+                status=case(
+                    (
+                        KnowledgeItem.status == KnowledgeItemStatus.READY,
+                        literal(
+                            KnowledgeItemStatus.INDEXING,
+                            type_=KnowledgeItem.status.type,
+                        ),
+                    ),
+                    else_=KnowledgeItem.status,
+                ),
             )
             .execution_options(synchronize_session=False)
-            .returning(KnowledgeItem.id)
+            .returning(KnowledgeItem.id, KnowledgeItem.status)
         )
-    ).scalar_one_or_none()
+    ).one_or_none()
     if updated is None:
         # Explicit re-select, not the identity-mapped object: the UPDATE ran with
         # synchronize_session=False, so `item.status` could still report
@@ -389,17 +361,82 @@ async def update_knowledge_item(
                 message=f"Knowledge item {item_id!r} not found.",
                 details={"item_id": item_id},
             )
+        # Same code, wider meaning since the ready path landed: the FE keys its
+        # REFUSED_COPY table on the code, so the code is load-bearing and the
+        # message is what widens.
         raise ApiError(
             status_code=404,
             code=ErrorCode.REVIEW_NOT_PENDING,
-            message=f"Knowledge item {item_id!r} is not awaiting review.",
+            message=(
+                f"Knowledge item {item_id!r} is not editable "
+                f"(status {current_status.value!r})."
+            ),
             details={"item_id": item_id, "status": current_status.value},
+        )
+
+    _, new_status = updated
+    reindexing = new_status is KnowledgeItemStatus.INDEXING
+    if reindexing:
+        # Same transaction as the content write: the edited row and the absence
+        # of its stale index rows commit together or not at all.
+        #
+        # Not optional. `index_knowledge_item` skips `build_chunks` entirely
+        # when the item already has chunks (its defensive-idempotency guard),
+        # so an edit that left them in place would re-embed the OLD text and
+        # report success — the worst available failure mode.
+        chunk_counts = await DocumentRepository(session).delete_knowledge_item_chunks(
+            item_id
+        )
+        logger.info(
+            "Edit of ready item %s dropped its index rows for re-embedding: %s",
+            item_id,
+            chunk_counts,
         )
 
     await session.commit()
 
+    if reindexing:
+        try:
+            await enqueue_job(
+                arq_redis, "index_knowledge_item", item_id, session_id=item.document_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to enqueue index_knowledge_item after editing %s; "
+                "reverting to needs_review",
+                item_id,
+            )
+            # The approve path's compensation, verbatim, and for the same
+            # reasons (D1) — including the revert target. `needs_review` rather
+            # than back to `ready`: the chunks are already gone, so a row
+            # labelled ready would claim to be on the shelf while being
+            # unfindable. Chunk-free IS what needs_review means.
+            try:
+                await session.execute(
+                    update(KnowledgeItem)
+                    .where(
+                        KnowledgeItem.id == item_id,
+                        KnowledgeItem.status == KnowledgeItemStatus.INDEXING,
+                    )
+                    .values(status=KnowledgeItemStatus.NEEDS_REVIEW)
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "Compensating revert failed for %s; the stuck-indexing "
+                    "sweep will return it to needs_review",
+                    item_id,
+                )
+            raise ApiError(
+                status_code=500,
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Failed to enqueue the re-indexing job.",
+            ) from None
+
     # Re-read through the ORM so the response reflects what Postgres now holds
-    # (server-side `now()`, the COALESCEd snapshot) rather than what we sent.
+    # (server-side `now()`, the COALESCEd snapshot, the new status) rather than
+    # what we sent.
     await session.refresh(item)
     return await build_knowledge_item_response(session, item)
 

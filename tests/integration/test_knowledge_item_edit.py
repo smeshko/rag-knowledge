@@ -1,8 +1,13 @@
 """Integration tests for PATCH /api/v1/knowledge-items/{item_id} (Epic 22.2).
 
-The third review verb: correct a flagged item in place instead of waving it
-through broken or rejecting it. Editing never decides — the item is still
-``needs_review`` afterwards, with its content warnings re-derived.
+Two paths, and most of this file exercises the first:
+
+- ``needs_review`` — the original verb: correct a flagged item in place instead
+  of waving it through broken or rejecting it. Editing never decides; the item
+  is still ``needs_review`` afterwards, with its content warnings re-derived.
+- ``ready`` — a shelved recipe. The row rewrite is the same, but the item's
+  chunks and embeddings describe the old text, so the handler drops them and
+  re-indexes. See the re-indexing section near the end.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.app import app
@@ -28,6 +33,7 @@ from rag_recipes.storage.enums import (
 )
 from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.chunk import Chunk
+from rag_recipes.storage.models.chunk_embedding import ChunkEmbedding
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
@@ -507,16 +513,21 @@ async def test_stale_generation_is_409_review_item_stale(
 @pytest.mark.parametrize(
     "status",
     [
-        KnowledgeItemStatus.READY,
         KnowledgeItemStatus.REJECTED,
         KnowledgeItemStatus.INDEXING,
         KnowledgeItemStatus.SUPERSEDED,
     ],
 )
-async def test_a_non_pending_item_is_404_review_not_pending(
+async def test_a_non_editable_item_is_404_review_not_pending(
     client: httpx.AsyncClient, db_session: AsyncSession, status: KnowledgeItemStatus
 ) -> None:
-    """Editing an indexed item would need a delete-and-re-embed path (out of scope)."""
+    """Only needs_review and ready are editable; the rest are dead or mid-flight.
+
+    ``READY`` is deliberately absent from this list — it moved to the
+    re-indexing path below when the delete-and-re-embed route landed. The code
+    stays ``review_not_pending`` because the frontend keys its refusal copy on
+    it.
+    """
     doc = await _seed_document(db_session)
     run = await _seed_run(db_session, document_id=doc.id)
     item = await _seed_item(db_session, run=run, status=status)
@@ -528,6 +539,143 @@ async def test_a_non_pending_item_is_404_review_not_pending(
     body = resp.json()["error"]
     assert body["code"] == "review_not_pending"
     assert body["details"] == {"item_id": item.id, "status": status.value}
+
+
+# --------------------------------------------------------------------------- #
+# The ready path: drop the stale index, re-embed from the saved text
+# --------------------------------------------------------------------------- #
+
+
+async def _seed_indexed_item(
+    session: AsyncSession, *, run: ExtractionRun
+) -> tuple[KnowledgeItem, str]:
+    """A ``ready`` item carrying one chunk and one embedding, as indexing leaves it."""
+    item = await _seed_item(session, run=run, status=KnowledgeItemStatus.READY)
+    chunk = Chunk(
+        document_id=run.document_id,
+        parent_type="knowledge_item",
+        parent_id=item.id,
+        chunk_type="recipe_full",
+        text="the stale indexed text",
+        text_hash=hashlib.sha256(f"stale-{item.id}".encode()).hexdigest(),
+        source_span_ids=[],
+        chunk_metadata={"category": "recipes"},
+    )
+    session.add(chunk)
+    await session.flush()
+    session.add(
+        ChunkEmbedding(
+            chunk_id=chunk.id,
+            embedding_provider="fake",
+            embedding_model="fake-embedding",
+            embedding_dimensions=1536,
+            embedding_vector=[0.0] * 1536,
+        )
+    )
+    await session.flush()
+    return item, chunk.id
+
+
+async def _index_row_counts(session: AsyncSession, item_id: str) -> tuple[int, int]:
+    chunk_ids = select(Chunk.id).where(Chunk.parent_id == item_id)
+    chunks = await session.scalar(
+        select(func.count()).select_from(Chunk).where(Chunk.parent_id == item_id)
+    )
+    embeddings = await session.scalar(
+        select(func.count())
+        .select_from(ChunkEmbedding)
+        .where(ChunkEmbedding.chunk_id.in_(chunk_ids))
+    )
+    return int(chunks or 0), int(embeddings or 0)
+
+
+async def test_editing_a_ready_item_drops_its_index_and_enqueues_a_reindex(
+    client: httpx.AsyncClient, db_session: AsyncSession, fake_arq_redis: Any
+) -> None:
+    """The whole point of the ready path: the old chunks must not survive.
+
+    If they did, ``index_knowledge_item``'s defensive "already has chunks" guard
+    would skip rebuilding and re-embed the OLD text — the recipe would stay
+    findable by words it no longer contains, and the request would report
+    success.
+    """
+    doc = await _seed_document(db_session, status=DocumentStatus.READY)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item, _ = await _seed_indexed_item(db_session, run=run)
+    assert await _index_row_counts(db_session, item.id) == (1, 1)
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}",
+            json={"title": "Corrected Bean Stew", "steps": _FIXED_STEPS},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["knowledge_item"]["title"] == "Corrected Bean Stew"
+    # The response reports the transitional status, not a comforting "ready" —
+    # the recipe genuinely is not searchable until the worker finishes.
+    assert body["knowledge_item"]["status"] == "indexing"
+
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.status is KnowledgeItemStatus.INDEXING
+    assert reloaded.title == "Corrected Bean Stew"
+    assert reloaded.edited_at is not None
+    assert await _index_row_counts(db_session, item.id) == (0, 0)
+
+    assert fake_arq_redis.enqueue_job.await_count == 1
+    call = fake_arq_redis.enqueue_job.await_args
+    assert call.args == ("index_knowledge_item", item.id)
+    assert call.kwargs["_session_id"] == doc.id
+
+
+async def test_editing_a_needs_review_item_still_enqueues_nothing(
+    client: httpx.AsyncClient, db_session: AsyncSession, fake_arq_redis: Any
+) -> None:
+    """The original path is untouched: a row rewrite, still awaiting a decision."""
+    doc = await _seed_document(db_session)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item = await _seed_item(db_session, run=run)
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}", json={"title": "Corrected"}
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["knowledge_item"]["status"] == "needs_review"
+    assert (await _reload(db_session, item.id)).status is KnowledgeItemStatus.NEEDS_REVIEW
+    assert await _index_row_counts(db_session, item.id) == (0, 0)
+    assert fake_arq_redis.enqueue_job.await_count == 0
+
+
+async def test_a_failed_reindex_enqueue_reverts_the_item_to_needs_review(
+    client: httpx.AsyncClient, db_session: AsyncSession, fake_arq_redis: Any
+) -> None:
+    """Compensation lands on needs_review, not back on ready.
+
+    The chunks are already gone by then, so a row labelled ``ready`` would claim
+    to be on the shelf while being unfindable. Chunk-free IS what needs_review
+    means.
+    """
+    doc = await _seed_document(db_session, status=DocumentStatus.READY)
+    run = await _seed_run(db_session, document_id=doc.id)
+    item, _ = await _seed_indexed_item(db_session, run=run)
+    fake_arq_redis.enqueue_job.side_effect = RuntimeError("redis down")
+
+    async with client:
+        resp = await client.patch(
+            f"/api/v1/knowledge-items/{item.id}",
+            json={"title": "Corrected Bean Stew", "steps": _FIXED_STEPS},
+        )
+
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "internal_error"
+    reloaded = await _reload(db_session, item.id)
+    assert reloaded.status is KnowledgeItemStatus.NEEDS_REVIEW
+    # The edit itself committed — it is the indexing that failed.
+    assert reloaded.title == "Corrected Bean Stew"
+    assert await _index_row_counts(db_session, item.id) == (0, 0)
 
 
 async def test_an_edit_after_a_decide_gets_review_not_pending(

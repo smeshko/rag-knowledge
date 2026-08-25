@@ -427,6 +427,66 @@ class DocumentRepository:
         await self._session.flush()
         return DocumentDeletion(storage_key=storage_key, counts=counts)
 
+    async def delete_knowledge_item_chunks(self, item_id: str) -> dict[str, int]:
+        """Delete one item's derived index rows: embeddings, then chunks.
+
+        The FK-safe prefix of ``delete_document_cascade``, scoped to a single
+        parent. Deliberately shared by two callers with opposite intents — the
+        per-recipe DELETE (which then drops the item row) and the edit ``PATCH``
+        of a ``ready`` item (which leaves the row and re-indexes it). Both need
+        exactly this pair, in exactly this order.
+
+        Flush-level only; the caller owns the transaction. Returns per-table
+        deleted-row counts for the caller's audit log.
+        """
+        chunk_ids = select(Chunk.id).where(Chunk.parent_id == item_id)
+        ordered_deletes: list[tuple[str, Delete]] = [
+            (
+                "chunk_embeddings",
+                delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(chunk_ids)),
+            ),
+            ("chunks", delete(Chunk).where(Chunk.parent_id == item_id)),
+        ]
+        counts: dict[str, int] = {}
+        for table_name, stmt in ordered_deletes:
+            result = await self._session.execute(
+                stmt.execution_options(synchronize_session=False)
+            )
+            assert isinstance(result, CursorResult)
+            counts[table_name] = result.rowcount
+        await self._session.flush()
+        return counts
+
+    async def delete_knowledge_item_cascade(self, item_id: str) -> dict[str, int]:
+        """Delete one knowledge item and everything derived from *it*.
+
+        ``delete_document_cascade`` scoped to a single recipe: embeddings →
+        chunks → the item row, the order the composite FK
+        ``fk_chunks_parent_document`` dictates.
+
+        It stops there on purpose. ``extraction_runs``, ``source_spans``,
+        ``extraction_batch_items`` and the ``source_asset`` are the *book's*,
+        shared with every sibling recipe — deleting one recipe must not touch
+        them, and ``fk_knowledge_items_extraction_run_document_version`` points
+        the other way (item → run), so nothing is left dangling by leaving them.
+
+        The item's own row is removed rather than flipped to ``rejected``: this
+        is the hard delete, and recovery is reprocessing the book.
+
+        Flush-level only; the caller owns the transaction. Returns per-table
+        deleted-row counts for the caller's audit log.
+        """
+        counts = await self.delete_knowledge_item_chunks(item_id)
+        result = await self._session.execute(
+            delete(KnowledgeItem)
+            .where(KnowledgeItem.id == item_id)
+            .execution_options(synchronize_session=False)
+        )
+        assert isinstance(result, CursorResult)
+        counts["knowledge_items"] = result.rowcount
+        await self._session.flush()
+        return counts
+
     async def count_knowledge_items(self, document_id: str) -> KnowledgeItemCounts:
         # Single GROUP BY query — one round-trip for total / ready / needs_review.
         # Phase 21.3 (plan D5): REJECTED is excluded from the aggregate so

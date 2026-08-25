@@ -1,4 +1,4 @@
-"""Pure edit layer for ``needs_review`` knowledge items (Epic 22.1).
+"""Pure edit layer for knowledge items (Epic 22.1).
 
 Editing exists because approve/reject is too blunt: a recipe flagged
 ``no_ingredients`` because the model missed the ingredient block can otherwise
@@ -20,11 +20,15 @@ Two functions carry the epic:
   ``validate_soft`` rather than reimplementing the rules — there is exactly one
   definition of what "too short" means.
 
-**Editing is only meaningful before indexing.** ``needs_review`` items have no
-chunks and no embeddings (``build_chunks`` returns ``[]`` for anything that is
-not ``READY``), so an edit is a pure row rewrite and the *edited* text is what
-gets chunked when the reviewer then approves. Editing an indexed item would need
-a delete-and-re-embed path that does not exist; the caller enforces the status.
+**What an edit costs depends on the item's status, and that is the caller's
+problem, not this module's.** A ``needs_review`` item has no chunks and no
+embeddings (``build_chunks`` returns ``[]`` for anything that is not ``READY``),
+so an edit there is a pure row rewrite and the *edited* text is what gets
+chunked when the reviewer approves. Editing an indexed item additionally
+requires dropping its chunks and embeddings and re-indexing from the saved text
+— which the API layer does, in the edit transaction plus an
+``index_knowledge_item`` job. These functions are the same either way: they
+compute the new field values and nothing else.
 """
 
 from __future__ import annotations
