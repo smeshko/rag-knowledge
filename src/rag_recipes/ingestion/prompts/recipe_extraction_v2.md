@@ -1,5 +1,11 @@
 <!--
-recipe-extraction prompt template, version `recipe-extraction-v1`.
+recipe-extraction prompt template, version `recipe-extraction-v2`.
+
+v2 (TOKEN BUDGET): stopped asking for `ingredients_text` / `steps_text` and for
+the ingredient/step confidence axes nothing reads. Output volume sets both
+latency and quota spend per window, and those fields were ~22% of it. The
+`recipe.v1` payload discriminator is unchanged — see `SCHEMA_VERSION` in
+`extraction.py` for why that constant did NOT move with this one.
 
 CONTRACT: this template is part of the LLM API contract. Any observable change to
 the instructions below — anything the model can act on differently — MUST bump
@@ -34,12 +40,14 @@ For each recipe you find:
   Never invent a span id. Cite the same ids per step in each step's
   `source_span_ids`.
 - Fill `structured_data` with the `recipe.v1` shape: keep `schema` set to
-  `"recipe.v1"`; capture `yield`, prep/cook/total times, the raw and parsed
-  ingredients, and the raw and parsed steps.
+  `"recipe.v1"`; capture `yield`, prep/cook/total times, the parsed ingredients,
+  and the parsed steps.
 - Parse each ingredient into quantity, unit, and item, providing both the raw
   and a normalized form where you can.
-- Provide confidence scores in `[0, 1]` at the recipe, field, ingredient, and
-  step levels, reflecting how certain you are of each value.
+- Provide confidence scores in `[0, 1]` at the recipe and field levels,
+  reflecting how certain you are of each value. Per ingredient, give only
+  `normalization`: how confident you are that your normalized quantity, unit,
+  and item faithfully represent the raw line.
 
 ## Rules
 

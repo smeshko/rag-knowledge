@@ -47,7 +47,12 @@ from rag_recipes.providers.llm.types import (
     TokenUsage,
 )
 
-__all__ = ["CLIResult", "ClaudeCLILLMProvider", "map_envelope_to_structured_output"]
+__all__ = [
+    "CLIResult",
+    "ClaudeCLILLMProvider",
+    "extract_billing_details",
+    "map_envelope_to_structured_output",
+]
 
 # Credential vars stripped from the subprocess env (DECISIONS #2). The CLI
 # prefers ``ANTHROPIC_API_KEY`` over the claude.ai login, so leaking either var
@@ -119,6 +124,36 @@ def _excerpt(text: str) -> str:
     return text if len(text) <= _EXCERPT_CHARS else text[:_EXCERPT_CHARS] + "…"
 
 
+def _failure_summary(stdout: str) -> str:
+    """The CLI's own explanation of a failure, pulled out of its stdout envelope.
+
+    A head-truncated excerpt is nearly useless here: the envelope leads with
+    ``usage``/``session_id``/timing and puts the human-readable ``result`` near
+    the END, so the first 500 characters are exactly the part that says nothing.
+    A real failure surfaced as 500 characters of zero token counts with the
+    reason cut off.
+
+    Pulls ``result`` (and the diagnostic ``subtype``/``stop_reason``) to the
+    front, falling back to the head excerpt when stdout is not a JSON object —
+    which is itself the interesting case for a crash or a usage message.
+    """
+    try:
+        envelope = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return _excerpt(stdout)
+    if not isinstance(envelope, dict):
+        return _excerpt(stdout)
+    parts: list[str] = []
+    for key in ("subtype", "stop_reason", "api_error_status", "terminal_reason"):
+        value = envelope.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    result = envelope.get("result")
+    if isinstance(result, str) and result.strip():
+        parts.append(f"result={_excerpt(result)}")
+    return " ".join(parts) if parts else _excerpt(stdout)
+
+
 class ClaudeCLILLMProvider(LLMProvider):
     """``LLMProvider`` backed by the local ``claude`` binary in ``-p`` mode.
 
@@ -173,8 +208,14 @@ class ClaudeCLILLMProvider(LLMProvider):
         ) as observation:
             result = await self._invoke(request)
             if result.returncode != 0:
+                # Both streams, because the CLI routinely fails with an EMPTY
+                # stderr and its actual diagnosis — an error envelope, an auth or
+                # quota message — on stdout. Reporting stderr alone produced
+                # "exited with code 1: " and threw the only evidence away.
                 raise LLMTechnicalError(
-                    f"claude CLI exited with code {result.returncode}: {_excerpt(result.stderr)}"
+                    f"claude CLI exited with code {result.returncode}: "
+                    f"stderr={_excerpt(result.stderr) or '(empty)'} "
+                    f"stdout={_failure_summary(result.stdout) or '(empty)'}"
                 )
             try:
                 envelope = json.loads(result.stdout)
@@ -194,11 +235,16 @@ class ClaudeCLILLMProvider(LLMProvider):
             status = "success" if response.parse_error is None else "rejected"
             observation.update(
                 output={"parsed": response.output_json, "raw": response.raw_text},
+                # The CLI's own accounting, forwarded verbatim (see
+                # ``extract_billing_details``). ``StructuredOutputResponse`` is a
+                # cross-provider contract and must not grow CLI-specific fields,
+                # so this rides on the observation instead — which is also where
+                # it is queryable for quota tracking.
+                metadata={"status": status, **extract_billing_details(envelope)},
                 usage_details={
                     "input": response.usage.input_tokens,
                     "output": response.usage.output_tokens,
                 },
-                metadata={"status": status},
                 level="DEFAULT" if response.parse_error is None else "WARNING",
                 status_message=response.parse_error,
             )
@@ -234,6 +280,38 @@ class ClaudeCLILLMProvider(LLMProvider):
             raise LLMTechnicalError(
                 f"failed to spawn claude CLI binary {self._binary!r}: {exc}"
             ) from exc
+
+
+def extract_billing_details(envelope: dict[str, Any]) -> dict[str, Any]:
+    """The CLI's own cost/cache accounting, for quota tracking.
+
+    ``TokenUsage`` collapses the CLI's three-way input split into one honest
+    context size, which is right for the cross-provider contract but destroys
+    the only thing that makes a *cost* estimate accurate: fresh, cache-creation
+    and cache-read tokens bill at roughly 1x, 1.25x and 0.1x. Re-deriving spend
+    from the collapsed figure over-charges every cached window several-fold.
+
+    ``total_cost_usd`` is better still — Anthropic's own number for the call,
+    covering the sub-model turns (the CLI dispatches some work to Haiku) that no
+    client-side estimate from the Opus rate card can see. Missing keys are simply
+    absent from the result: this is telemetry, and it must never fail a call.
+    """
+    usage = envelope.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    details: dict[str, Any] = {}
+    cost = envelope.get("total_cost_usd")
+    if isinstance(cost, int | float):
+        details["cli_total_cost_usd"] = float(cost)
+    for source, key in (
+        ("input_tokens", "cli_input_tokens_fresh"),
+        ("cache_creation_input_tokens", "cli_cache_creation_tokens"),
+        ("cache_read_input_tokens", "cli_cache_read_tokens"),
+        ("output_tokens", "cli_output_tokens"),
+    ):
+        value = usage.get(source)
+        if isinstance(value, int):
+            details[key] = value
+    return details
 
 
 def map_envelope_to_structured_output(

@@ -22,7 +22,9 @@ from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.claude_cli import (
     ClaudeCLILLMProvider,
     CLIResult,
+    _failure_summary,
     _run_claude_cli,
+    extract_billing_details,
     map_envelope_to_structured_output,
 )
 from rag_recipes.providers.llm.types import StructuredOutputRequest
@@ -287,6 +289,24 @@ async def test_nonzero_exit_raises_with_stderr_excerpt() -> None:
     assert "Invalid API key" in message
 
 
+async def test_nonzero_exit_reports_stdout_when_stderr_is_empty() -> None:
+    # The failure mode that motivated this: a real ingest died with
+    # "exited with code 1: " — empty stderr, and the CLI's actual diagnosis
+    # sitting unreported on stdout. Both streams must reach the message.
+    runner = _FakeRunner(
+        result=CLIResult(
+            returncode=1,
+            stdout='{"is_error":true,"result":"Usage limit reached"}',
+            stderr="",
+        )
+    )
+    with pytest.raises(LLMTechnicalError) as excinfo:
+        await _provider_with(runner).generate_structured_output(_REQUEST)
+    message = str(excinfo.value)
+    assert "Usage limit reached" in message
+    assert "(empty)" in message
+
+
 async def test_non_json_stdout_raises() -> None:
     runner = _FakeRunner(result=CLIResult(returncode=0, stdout="not json at all", stderr=""))
     with pytest.raises(LLMTechnicalError) as excinfo:
@@ -494,3 +514,65 @@ class TestClaudeCLILLM(LLMContract):
         return _provider_with(
             _FakeRunner(result=CLIResult(returncode=1, stdout="", stderr="login required"))
         )
+
+
+def test_billing_details_keep_the_cli_cost_and_cache_split() -> None:
+    # TokenUsage collapses the three input classes into one number, which makes
+    # a cost estimate from it wrong by several-fold on cached windows (fresh,
+    # cache-creation and cache-read bill at ~1x / 1.25x / 0.1x). Quota tracking
+    # needs the split, and the CLI's own total_cost_usd best of all — it covers
+    # the sub-model turns no Opus-rate estimate can see.
+    details = extract_billing_details(
+        {
+            "total_cost_usd": 0.0975315,
+            "usage": {
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 9373,
+                "output_tokens": 3594,
+            },
+        }
+    )
+    assert details == {
+        "cli_total_cost_usd": 0.0975315,
+        "cli_input_tokens_fresh": 2,
+        "cli_cache_creation_tokens": 0,
+        "cli_cache_read_tokens": 9373,
+        "cli_output_tokens": 3594,
+    }
+
+
+def test_billing_details_tolerate_a_missing_or_odd_envelope() -> None:
+    # Telemetry must never fail a call: absent keys are simply absent, and a
+    # non-numeric cost is dropped rather than coerced.
+    assert extract_billing_details({}) == {}
+    assert extract_billing_details({"usage": None, "total_cost_usd": "free"}) == {}
+
+
+async def test_nonzero_exit_surfaces_the_reason_not_the_envelope_head() -> None:
+    # Regression for a real bowls.pdf failure: the head-truncated excerpt spent
+    # its whole budget on usage/session_id/timing and cut off before `result`,
+    # so the error read as 500 characters of zero token counts and no reason.
+    envelope = {
+        "is_error": True,
+        "duration_api_ms": 77418,
+        "session_id": "f54b8997",
+        "usage": {"input_tokens": 0, "output_tokens": 0} | {f"pad_{i}": 0 for i in range(60)},
+        "subtype": "error_during_execution",
+        "stop_reason": "stop_sequence",
+        "result": "API Error: Internal server error",
+    }
+    runner = _FakeRunner(
+        result=CLIResult(returncode=1, stdout=json.dumps(envelope), stderr="")
+    )
+    with pytest.raises(LLMTechnicalError) as excinfo:
+        await _provider_with(runner).generate_structured_output(_REQUEST)
+    message = str(excinfo.value)
+    assert "Internal server error" in message
+    assert "error_during_execution" in message
+
+
+def test_failure_summary_falls_back_when_stdout_is_not_json() -> None:
+    # A crash or a usage message is not an envelope; that raw text IS the signal.
+    assert "command not found" in _failure_summary("zsh: command not found: claude")
+    assert _failure_summary("[1, 2]") == "[1, 2]"

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.resources
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,7 +31,7 @@ from rag_recipes.ingestion.pipeline.windows import (
 from rag_recipes.providers._observability import ProviderObservability, TraceContext
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.base import LLMProvider
-from rag_recipes.providers.llm.types import StructuredOutputRequest
+from rag_recipes.providers.llm.types import StructuredOutputRequest, StructuredOutputResponse
 from rag_recipes.storage.enums import ExtractionRunStatus
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 
@@ -45,8 +46,11 @@ __all__ = [
     "RecipeExtractionOutput",
     "RecipeFieldConfidence",
     "RecipeV1StructuredData",
-    "StepConfidence",
+    "WindowExtraction",
     "build_recipe_v1_json_schema",
+    "call_provider_for_window",
+    "find_cached_extraction",
+    "record_window_extraction",
     "run_extraction",
 ]
 
@@ -56,12 +60,23 @@ logger = logging.getLogger(__name__)
 # They feed ``compute_input_hash`` and every ``ExtractionRun`` row, so they must
 # travel atomically with the prompt template / schema code they describe. A
 # meaningful change to either the prompt or the schema shape must bump these.
-PROMPT_VERSION = "recipe-extraction-v1"
+PROMPT_VERSION = "recipe-extraction-v2"
+# Deliberately NOT bumped alongside PROMPT_VERSION for the TOKEN BUDGET trim.
+# This constant is the *payload* contract consumers read — it is the value
+# ``structured_data.schema`` carries, `evals.golden_schema` asserts, and the API
+# projections default to. That contract did not change: the trimmed fields were
+# derived (``ingredients_text``/``steps_text``) or unread (the four ingredient
+# confidences, both step confidences), and none appear in the golden key sets
+# (``STRUCTURED_KEYS``, ``STEP_KEYS``, ``INGREDIENT_SUB_FIELDS``). Bumping it
+# would rename the discriminator out from under 42 committed goldens for no
+# consumer-visible change. Cache invalidation is already total: PROMPT_VERSION
+# is part of ``compute_input_hash`` and of the ``_find_cached_run`` key, so no
+# pre-trim run can satisfy a post-trim lookup.
 SCHEMA_VERSION = "recipe.v1"
 
 _PROMPT_PLACEHOLDER = "{source_spans}"
 _PROMPT_PACKAGE = "rag_recipes.ingestion.prompts"
-_PROMPT_RESOURCE = "recipe_extraction_v1.md"
+_PROMPT_RESOURCE = "recipe_extraction_v2.md"
 
 
 def _load_prompt_template() -> str:
@@ -91,13 +106,23 @@ def _render_prompt(window_text: str) -> str:
     return _PROMPT_TEMPLATE.replace(_PROMPT_PLACEHOLDER, window_text)
 
 
+# TOKEN BUDGET — rationale lives in a comment, NOT a docstring: every class
+# docstring in this module is emitted as a ``description`` in
+# ``build_recipe_v1_json_schema`` and shipped to the model on every window. A
+# verbose docstring here is a per-call input-token cost forever.
+#
+# ``IngredientConfidence`` carried overall/quantity/unit/item alongside
+# normalization. Measured on a real 226-page cookbook ingest, the five floats
+# were 9.5% of all output tokens — and output volume is what sets both latency
+# and quota spend (a recipe-bearing window averaged 151s / ~2,700 output
+# tokens). Only ``normalization`` has a reader: ``validate_soft`` takes the
+# minimum across the list and warns below
+# ``extraction_min_normalization_confidence``. The other four reached exactly
+# one consumer — ``_confidence_pairs``, which range-checked them in [0, 1] and
+# discarded them. The model was paying to grade itself on axes nothing read.
 class IngredientConfidence(BaseModel):
-    """Per-ingredient confidence scores (doc 4 § Confidence Scores)."""
+    """How faithfully the normalized fields represent the raw line."""
 
-    overall: float
-    quantity: float
-    unit: float
-    item: float
     normalization: float
 
 
@@ -117,20 +142,16 @@ class ExtractedIngredient(BaseModel):
     confidence: IngredientConfidence
 
 
-class StepConfidence(BaseModel):
-    """Per-step confidence scores (doc 4 § Confidence Scores)."""
-
-    overall: float
-    ordering: float
-
-
+# TOKEN BUDGET: dropped ``confidence`` (overall + ordering). Unlike the
+# ingredient case, neither float had ANY reader beyond ``_confidence_pairs``'
+# range check — not validation, not ``compute_candidate_score``, not the review
+# API. (Comment, not docstring: see the note above ``IngredientConfidence``.)
 class ExtractedStep(BaseModel):
     """One method step (doc 4 § Strict Output Shape)."""
 
     step_number: int
     text: str
     source_span_ids: list[str]
-    confidence: StepConfidence
 
 
 class RecipeV1StructuredData(BaseModel):
@@ -152,9 +173,18 @@ class RecipeV1StructuredData(BaseModel):
     prep_time: str | None
     cook_time: str | None
     total_time: str | None
-    ingredients_text: str | None
+    # No ``ingredients_text`` / ``steps_text`` (TOKEN BUDGET): the model used to
+    # emit both — the ingredient lines glued with newlines, then the step texts
+    # glued with newlines — which is 12.5% of output tokens restating text it had
+    # already written per row. ``composition.resolve_ingredients_text`` /
+    # ``resolve_steps_text`` derive them from ``raw_text`` / ``text`` by exactly
+    # that rule, so the bytes were bought and then regenerated locally anyway.
+    #
+    # They remain valid *stored* keys: ``editing`` writes them back when a
+    # reviewer changes a line (mirroring the same join), and reads everywhere go
+    # through ``composition`` or ``dict.get``. Pydantic ignores them as extras,
+    # so pre-trim ``output_json`` still validates.
     ingredients: list[ExtractedIngredient]
-    steps_text: str | None
     steps: list[ExtractedStep]
 
 
@@ -281,103 +311,96 @@ async def _find_cached_run(
     return result
 
 
-async def run_extraction(
-    session: AsyncSession,
+@dataclass(frozen=True)
+class WindowExtraction:
+    """One window's provider outcome, captured *before* any database write.
+
+    The seam that makes concurrent extraction possible. An ``AsyncSession`` is
+    not safe for concurrent use, so windows cannot simply be gathered over
+    ``run_extraction`` — its flushes would interleave on one connection. Holding
+    the provider result in a plain object lets the slow part (the LLM call) fan
+    out while every write stays sequential on the caller's session.
+
+    ``error`` is a captured ``LLMTechnicalError`` rather than a raised one:
+    ``asyncio.gather`` would otherwise lose the other windows' results to the
+    first failure. ``record_window_extraction`` re-raises it after writing the
+    ``FAILED`` audit row, preserving ``run_extraction``'s contract.
+    """
+
+    window: Window
+    input_hash: str
+    response: StructuredOutputResponse | None
+    error: LLMTechnicalError | None
+
+
+async def call_provider_for_window(
     window: Window,
+    *,
+    provider: LLMProvider,
+    document_id: str,
+    observability: ProviderObservability | None = None,
+) -> WindowExtraction:
+    """Call the provider for ``window``. No session, no writes — safe to gather.
+
+    Deliberately takes no ``AsyncSession``: that is the whole point of the split.
+    """
+    input_hash = compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION)
+    request = StructuredOutputRequest(
+        provider=provider.provider,
+        model=provider.default_model,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+        input=_render_prompt(format_window_for_llm(window)),
+        json_schema=build_recipe_v1_json_schema(),
+    )
+    trace_context = TraceContext(
+        session_id=document_id,
+        input_hash=input_hash,
+        input_source_span_ids=window.span_ids,
+    )
+    try:
+        response = await provider.generate_structured_output(request, trace_context=trace_context)
+    except LLMTechnicalError as exc:
+        return WindowExtraction(window=window, input_hash=input_hash, response=None, error=exc)
+    return WindowExtraction(window=window, input_hash=input_hash, response=response, error=None)
+
+
+async def record_window_extraction(
+    session: AsyncSession,
+    outcome: WindowExtraction,
     *,
     source_version: int,
     document_id: str,
     provider: LLMProvider,
-    observability: ProviderObservability | None = None,
 ) -> ExtractionRun:
-    """Run one LLM extraction call for ``window`` and record an ``ExtractionRun``.
+    """Write ``outcome``'s ``ExtractionRun`` and resolve it to a terminal status.
 
-    Inserts a ``RUNNING`` row, calls the injected ``provider``, and resolves the
-    row to exactly one terminal status (DECISIONS #1):
-
-    - ``FAILED`` — the provider raised ``LLMTechnicalError`` (transport/system).
-      The ``FAILED`` row is recorded, then the error is re-raised so the job's
-      ``mark_failed`` path engages (DECISIONS #6).
-    - ``REJECTED`` — the provider returned ``output_json=None`` (parse / refusal /
-      truncation), OR the parsed object failed ``recipe.v1`` Pydantic validation.
-    - ``SUCCESS`` — a valid parsed ``recipe.v1`` object.
-
-    Only flushes; the caller owns the transaction (mirrors ``pdf_text``). The
-    ``provider``/``model`` labels come from the injected provider (DECISIONS #7).
+    The write half of the split — must run sequentially on the caller's session.
+    Statuses and the re-raise-after-recording behaviour match ``run_extraction``
+    exactly, because ``run_extraction`` is now implemented in terms of this.
     """
-    input_text = format_window_for_llm(window)
-    input_hash = compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION)
-    span_ids = window.span_ids
-    provider_name = provider.provider
-    model_name = provider.default_model
-
-    # Cache check (DECISIONS #2): reuse a prior SUCCESS run's output_json for an
-    # identical key, recording a new audit row and skipping the provider call.
-    # Ahead of the RUNNING insert so a hit never leaves a stray RUNNING row.
-    cached = await _find_cached_run(
-        session, input_hash=input_hash, provider=provider_name, model=model_name
-    )
-    if cached is not None:
-        logger.debug(
-            "extraction cache hit: reusing run %s for input_hash=%s provider=%s model=%s",
-            cached.id,
-            input_hash,
-            provider_name,
-            model_name,
-        )
-        cached_run = ExtractionRun(
-            document_id=document_id,
-            source_version=source_version,
-            provider=provider_name,
-            model=model_name,
-            prompt_version=PROMPT_VERSION,
-            schema_version=SCHEMA_VERSION,
-            input_source_span_ids=span_ids,
-            input_hash=input_hash,
-            status=ExtractionRunStatus.SUCCESS,
-            output_json=cached.output_json,
-            completed_at=datetime.now(tz=UTC),
-        )
-        session.add(cached_run)
-        await session.flush()
-        return cached_run
-
     run = ExtractionRun(
         document_id=document_id,
         source_version=source_version,
-        provider=provider_name,
-        model=model_name,
+        provider=provider.provider,
+        model=provider.default_model,
         prompt_version=PROMPT_VERSION,
         schema_version=SCHEMA_VERSION,
-        input_source_span_ids=span_ids,
-        input_hash=input_hash,
+        input_source_span_ids=outcome.window.span_ids,
+        input_hash=outcome.input_hash,
         status=ExtractionRunStatus.RUNNING,
         output_json=None,
     )
     session.add(run)
     await session.flush()
 
-    request = StructuredOutputRequest(
-        provider=provider_name,
-        model=model_name,
-        prompt_version=PROMPT_VERSION,
-        schema_version=SCHEMA_VERSION,
-        input=_render_prompt(input_text),
-        json_schema=build_recipe_v1_json_schema(),
-    )
-    trace_context = TraceContext(
-        session_id=document_id,
-        input_hash=input_hash,
-        input_source_span_ids=span_ids,
-    )
-
-    try:
-        response = await provider.generate_structured_output(request, trace_context=trace_context)
-    except LLMTechnicalError as exc:
-        _finalize(run, status=ExtractionRunStatus.FAILED, error=str(exc))
+    if outcome.error is not None:
+        _finalize(run, status=ExtractionRunStatus.FAILED, error=str(outcome.error))
         await session.flush()
-        raise
+        raise outcome.error
 
+    response = outcome.response
+    assert response is not None  # noqa: S101 - error is None, so response is set
     if response.output_json is None:
         _finalize(run, status=ExtractionRunStatus.REJECTED, error=response.parse_error)
         await session.flush()
@@ -398,3 +421,104 @@ async def run_extraction(
     _finalize(run, status=ExtractionRunStatus.SUCCESS, output_json=response.output_json)
     await session.flush()
     return run
+
+
+async def find_cached_extraction(
+    session: AsyncSession,
+    window: Window,
+    *,
+    source_version: int,
+    document_id: str,
+    provider: LLMProvider,
+) -> ExtractionRun | None:
+    """Record and return a cache-hit run for ``window``, or ``None`` on a miss.
+
+    Public so the concurrent path can run every cache check *before* dispatching
+    provider calls — a hit must never cost an LLM invocation just because the
+    lookup moved off the sequential path.
+    """
+    input_hash = compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION)
+    cached = await _find_cached_run(
+        session,
+        input_hash=input_hash,
+        provider=provider.provider,
+        model=provider.default_model,
+    )
+    if cached is None:
+        return None
+    logger.debug(
+        "extraction cache hit: reusing run %s for input_hash=%s provider=%s model=%s",
+        cached.id,
+        input_hash,
+        provider.provider,
+        provider.default_model,
+    )
+    cached_run = ExtractionRun(
+        document_id=document_id,
+        source_version=source_version,
+        provider=provider.provider,
+        model=provider.default_model,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+        input_source_span_ids=window.span_ids,
+        input_hash=input_hash,
+        status=ExtractionRunStatus.SUCCESS,
+        output_json=cached.output_json,
+        completed_at=datetime.now(tz=UTC),
+    )
+    session.add(cached_run)
+    await session.flush()
+    return cached_run
+
+
+async def run_extraction(
+    session: AsyncSession,
+    window: Window,
+    *,
+    source_version: int,
+    document_id: str,
+    provider: LLMProvider,
+    observability: ProviderObservability | None = None,
+) -> ExtractionRun:
+    """Run one LLM extraction call for ``window`` and record an ``ExtractionRun``.
+
+    The sequential composition of ``find_cached_extraction`` →
+    ``call_provider_for_window`` → ``record_window_extraction``. Kept as the
+    single-window entry point (``evals/extraction.py`` uses it); the ingestion
+    job drives the same three steps itself so the middle one can fan out.
+
+    Calls the injected ``provider`` and resolves a ``RUNNING`` row to exactly one
+    terminal status (DECISIONS #1):
+
+    - ``FAILED`` — the provider raised ``LLMTechnicalError`` (transport/system).
+      The ``FAILED`` row is recorded, then the error is re-raised so the job's
+      ``mark_failed`` path engages (DECISIONS #6).
+    - ``REJECTED`` — the provider returned ``output_json=None`` (parse / refusal /
+      truncation), OR the parsed object failed ``recipe.v1`` Pydantic validation.
+    - ``SUCCESS`` — a valid parsed ``recipe.v1`` object.
+
+    Only flushes; the caller owns the transaction (mirrors ``pdf_text``). The
+    ``provider``/``model`` labels come from the injected provider (DECISIONS #7).
+    """
+    # Cache check (DECISIONS #2) first: a hit reuses a prior SUCCESS run's
+    # output_json, records a fresh audit row, and never reaches the provider.
+    cached_run = await find_cached_extraction(
+        session,
+        window,
+        source_version=source_version,
+        document_id=document_id,
+        provider=provider,
+    )
+    if cached_run is not None:
+        return cached_run
+
+    outcome = await call_provider_for_window(
+        window, provider=provider, document_id=document_id, observability=observability
+    )
+    return await record_window_extraction(
+        session,
+        outcome,
+        source_version=source_version,
+        document_id=document_id,
+        provider=provider,
+    )

@@ -163,6 +163,7 @@ def test_worker_settings_have_expected_defaults(monkeypatch: pytest.MonkeyPatch)
     for var in (
         "WORKER_MAX_JOBS",
         "WORKER_JOB_TIMEOUT_SECONDS",
+        "DOCUMENT_JOB_TIMEOUT_SECONDS",
         "WORKER_KEEP_RESULT_SECONDS",
         "WORKER_HEALTH_CHECK_INTERVAL_SECONDS",
     ):
@@ -170,6 +171,9 @@ def test_worker_settings_have_expected_defaults(monkeypatch: pytest.MonkeyPatch)
     settings = Settings(_env_file=None)
     assert settings.worker_max_jobs == 1
     assert settings.worker_job_timeout_seconds == 600
+    # Hours, not minutes: process_document extracts a whole book's windows
+    # sequentially (see the field's comment).
+    assert settings.document_job_timeout_seconds == 14400
     assert settings.worker_keep_result_seconds == 60
     assert settings.worker_health_check_interval_seconds == 30
 
@@ -179,6 +183,7 @@ def test_worker_settings_have_expected_defaults(monkeypatch: pytest.MonkeyPatch)
     [
         "WORKER_MAX_JOBS",
         "WORKER_JOB_TIMEOUT_SECONDS",
+        "DOCUMENT_JOB_TIMEOUT_SECONDS",
         "WORKER_HEALTH_CHECK_INTERVAL_SECONDS",
     ],
 )

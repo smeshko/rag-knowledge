@@ -145,6 +145,20 @@ class Settings(BaseSettings):
     # rolls back the in-flight batch, so at most batch_size − 1 windows of
     # OpenAI spend are repeated on resume (DECISIONS #4).
     extraction_commit_batch_size: int = Field(default=5, ge=1)
+    # How many windows inside one commit batch may have a provider call in flight
+    # at once. 1 preserves the original strictly-sequential loop exactly.
+    #
+    # Only the provider call fans out; every database write stays sequential on
+    # the batch's single session (an AsyncSession is not concurrency-safe). The
+    # ceiling is therefore extraction_commit_batch_size — raise both together.
+    #
+    # Measured against the claude CLI: 4 concurrent calls sharing one cwd
+    # completed in the wall time of one (4.1s vs 3.6s solo) and every one of them
+    # READ the shared prompt cache (3,608 tokens) rather than re-creating it, so
+    # concurrency does not forfeit the cache win. The real cost is burst rate:
+    # N concurrent calls drain a subscription quota N times faster, and on a
+    # provider with no retry loop, exhaustion fails the document.
+    extraction_max_concurrent_windows: int = Field(default=1, ge=1)
 
     # ge=1 so the answer route's effective-limit fallback (and search's own clamp)
     # is guaranteed positive even with a bad env value — a ≤0 default would poison
@@ -179,6 +193,25 @@ class Settings(BaseSettings):
 
     worker_max_jobs: int = Field(default=1, ge=1)
     worker_job_timeout_seconds: int = Field(default=600, ge=1)
+    # Per-function timeout for `process_document` only, kept separate from the
+    # worker-wide default because the two bound very different work. A document
+    # is a whole book: windows are extracted sequentially, and a
+    # subscription-quota provider (claude_cli) spends ~35s per window against a
+    # ~pages/2 window count, so a 250-page cookbook runs over an hour. The 600s
+    # default would cancel it, and arq retries CancelledError up to max_tries, so
+    # such a book died as `max 3 retries exceeded` after ~30 minutes of progress.
+    #
+    # Liveness is NOT delegated to this timeout: sweep_stuck_jobs reaps on the
+    # per-batch `last_progress_at` heartbeat (every extraction_commit_batch_size
+    # windows), so a wedged document is still marked FAILED within
+    # stuck_job_timeout_minutes no matter how generous this is. This only bounds
+    # the arq task itself.
+    #
+    # Cost of a large value: arq derives its in-progress lock TTL from the
+    # largest registered timeout, so after a hard worker crash re-delivery of any
+    # job waits out that TTL. The document-level sweep plus
+    # POST /documents/{id}/reprocess cover that window; raise deliberately.
+    document_job_timeout_seconds: int = Field(default=14400, ge=1)
     worker_keep_result_seconds: int = Field(default=60, ge=0)
     worker_health_check_interval_seconds: int = Field(default=30, ge=1)
 

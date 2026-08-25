@@ -9,6 +9,7 @@ Epic 8 adds real ingestion jobs that reuse `langfuse_session_scope`.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Iterator
@@ -42,9 +43,12 @@ from rag_recipes.ingestion.pipeline.extraction import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
     RecipeExtractionOutput,
+    WindowExtraction,
     _render_prompt,
     build_recipe_v1_json_schema,
-    run_extraction,
+    call_provider_for_window,
+    find_cached_extraction,
+    record_window_extraction,
 )
 from rag_recipes.ingestion.pipeline.pdf_text import (
     EmptyPdfError,
@@ -281,8 +285,12 @@ async def _run_extraction_batches(
     windows = build_windows(spans, settings.pdf_window_size_pages, settings.pdf_overlap_pages)
     reextracted: set[str] = set()
 
+    semaphore = asyncio.Semaphore(settings.extraction_max_concurrent_windows)
+
     for batch in _chunked(windows, settings.extraction_commit_batch_size):
         async with session_factory() as session:
+            pending: list[Window] = []
+            cached_runs: dict[int, ExtractionRun] = {}
             for window in batch:
                 if compute_input_hash(window, PROMPT_VERSION, SCHEMA_VERSION) in done_hashes:
                     # Already extracted in a prior (interrupted) invocation; its
@@ -293,14 +301,50 @@ async def _run_extraction_batches(
                 # errors still counts as covered: this pass owns it either way, and
                 # a reuse must not carry the prior item forward on a failed retry.
                 reextracted.add(_window_key(list(window.span_ids)))
-                run = await run_extraction(
+                # Cache lookups stay here, ahead of any dispatch: a hit must never
+                # cost a provider call just because extraction went concurrent.
+                cached_run = await find_cached_extraction(
                     session,
                     window,
                     source_version=source_version,
                     document_id=document_id,
                     provider=provider,
-                    observability=observability,
                 )
+                if cached_run is not None:
+                    cached_runs[len(pending)] = cached_run
+                pending.append(window)
+
+            # Phase 1 — provider calls only, up to
+            # extraction_max_concurrent_windows in flight. No session touches
+            # here: an AsyncSession cannot be shared across concurrent tasks, and
+            # the LLM call is ~99% of a window's wall time anyway.
+            async def _call(window: Window) -> WindowExtraction:
+                async with semaphore:
+                    return await call_provider_for_window(
+                        window,
+                        provider=provider,
+                        document_id=document_id,
+                        observability=observability,
+                    )
+
+            to_call = [w for i, w in enumerate(pending) if i not in cached_runs]
+            outcomes = iter(await asyncio.gather(*(_call(w) for w in to_call)))
+
+            # Phase 2 — sequential writes in window order, exactly as before.
+            # record_window_extraction re-raises a captured LLMTechnicalError
+            # after writing its FAILED row, so a provider failure still aborts the
+            # job; gathering first only means the siblings' results are not lost
+            # to whichever window happened to fail first.
+            for index, window in enumerate(pending):
+                run = cached_runs.get(index)
+                if run is None:
+                    run = await record_window_extraction(
+                        session,
+                        next(outcomes),
+                        source_version=source_version,
+                        document_id=document_id,
+                        provider=provider,
+                    )
                 if run.status is not ExtractionRunStatus.SUCCESS or run.output_json is None:
                     continue
                 parsed = RecipeExtractionOutput.model_validate(run.output_json)
@@ -1243,7 +1287,15 @@ _SETTINGS = get_settings()
 class WorkerSettings:
     functions = [
         ping_job,
-        arq_func(process_document, name="process_document", max_tries=3),
+        arq_func(
+            process_document,
+            name="process_document",
+            max_tries=3,
+            # Its own timeout, not the worker-wide `job_timeout` below: a full
+            # book's sequential window loop outlives the default several times
+            # over (see Settings.document_job_timeout_seconds).
+            timeout=_SETTINGS.document_job_timeout_seconds,
+        ),
         arq_func(index_knowledge_item, name="index_knowledge_item", max_tries=3),
     ]
     cron_jobs = [

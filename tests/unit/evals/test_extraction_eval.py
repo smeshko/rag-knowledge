@@ -121,9 +121,12 @@ async def test_scored_entries_persist_extracted_recipes(tmp_path: Path) -> None:
     by_name = {entry["name"]: entry for entry in results["per_fixture"]}
     stew = by_name["bean-stew"]
     assert stew["scored_recipe_index"] == 0
-    assert stew["fixture_content_hash"] == RecipeFixture(
-        name="bean-stew", source_md=STEW_SOURCE, expected=STEW_EXPECTED
-    ).content_hash()
+    assert (
+        stew["fixture_content_hash"]
+        == RecipeFixture(
+            name="bean-stew", source_md=STEW_SOURCE, expected=STEW_EXPECTED
+        ).content_hash()
+    )
     (stew_recipe,) = stew["recipes"]
     assert stew_recipe["title"] == "Bean Stew"
     assert stew_recipe["source_span_ids"] == [synthetic_span_id("bean-stew")]
@@ -137,9 +140,12 @@ async def test_scored_entries_persist_extracted_recipes(tmp_path: Path) -> None:
     (soup_recipe,) = soup["recipes"]
     assert soup_recipe["title"] == "Tomato Soup"
     assert soup["scored_recipe_index"] == 0
-    assert soup["fixture_content_hash"] == RecipeFixture(
-        name="tomato-soup", source_md=SOUP_SOURCE, expected=SOUP_EXPECTED
-    ).content_hash()
+    assert (
+        soup["fixture_content_hash"]
+        == RecipeFixture(
+            name="tomato-soup", source_md=SOUP_SOURCE, expected=SOUP_EXPECTED
+        ).content_hash()
+    )
 
 
 def test_extraction_prompt_version_reflects_the_module_global(
@@ -151,8 +157,8 @@ def test_extraction_prompt_version_reflects_the_module_global(
     from evals.extraction import extraction_prompt_version
 
     assert extraction_prompt_version() == evals.extraction.PROMPT_VERSION
-    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v2")
-    assert extraction_prompt_version() == "recipe-extraction-v2"
+    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v3")
+    assert extraction_prompt_version() == "recipe-extraction-v3"
 
 
 async def test_summary_renders_doc12_extraction_report_shape(tmp_path: Path) -> None:
@@ -193,7 +199,7 @@ async def test_rejected_extraction_is_counted_not_crashed(tmp_path: Path) -> Non
         default_output=StructuredOutputResponse(
             output_json=None,
             parse_error="max_tokens truncation",
-            raw_text="{\"items\": [",
+            raw_text='{"items": [',
             usage=TokenUsage(input_tokens=10, output_tokens=10),
             provider="fake",
             model="fake-model",
@@ -323,9 +329,7 @@ async def test_a_fixture_split_across_items_is_counted_not_collapsed(tmp_path: P
     assert results["aggregate"]["recipes_extracted"] == 2
     assert results["aggregate"]["fixtures"] == 1
     assert results["aggregate"]["over_split_fixtures"] == 1
-    assert "Fixtures split across items: 1" in (run.path / "summary.md").read_text(
-        encoding="utf-8"
-    )
+    assert "Fixtures split across items: 1" in (run.path / "summary.md").read_text(encoding="utf-8")
 
 
 async def test_explicit_nulls_in_expected_json_score_as_misses_not_a_crash(
@@ -409,9 +413,7 @@ async def test_baseline_diff_is_invoked_and_printed(
 
 
 async def test_no_baseline_is_handled_without_error(tmp_path: Path) -> None:
-    run = await _run_smoke_eval(
-        tmp_path, baseline_path=tmp_path / "baselines" / "extraction.json"
-    )
+    run = await _run_smoke_eval(tmp_path, baseline_path=tmp_path / "baselines" / "extraction.json")
     assert (run.path / "results.json").is_file()
 
 
@@ -485,9 +487,7 @@ async def test_judge_error_counts_fixture_as_unrated(tmp_path: Path) -> None:
     fixtures_root = tmp_path / "fixtures"
     # A malformed verdict (the Anthropic path is non-strict, so reachable) must
     # surface as un-rated, never as a silent pass or fail.
-    provider = write_smoke_set(
-        fixtures_root, judge_output={"rating": "maybe", "critique": "Hmm."}
-    )
+    provider = write_smoke_set(fixtures_root, judge_output={"rating": "maybe", "critique": "Hmm."})
     write_judge_prompt(fixtures_root)
     run = await run_extraction_eval(
         "smoke",
@@ -744,7 +744,7 @@ async def test_extraction_prompt_version_bump_invalidates_cached_judge_rating(
     }
     await run_extraction_eval("smoke", "first", **kwargs)
     assert len(_judge_calls(provider)) == 2
-    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v2")
+    monkeypatch.setattr(evals.extraction, "PROMPT_VERSION", "recipe-extraction-v3")
     await run_extraction_eval("smoke", "second", **kwargs)
     assert len(_judge_calls(provider)) == 4  # both fixtures re-judged
 

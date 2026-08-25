@@ -64,9 +64,7 @@ def test_run_dir_is_timestamped_and_filesystem_safe(tmp_path: Path) -> None:
 
 
 def test_unsafe_label_is_slugified(tmp_path: Path) -> None:
-    run = ReportRun(
-        "Extraction (GPT-4.1)/v2", reports_root=tmp_path, settings=_SettingsStandIn()
-    )
+    run = ReportRun("Extraction (GPT-4.1)/v2", reports_root=tmp_path, settings=_SettingsStandIn())
     label_segment = RUN_DIR_PATTERN.sub("", run.path.name)
     assert run.path.is_dir()
     for forbidden in (" ", ":", "/", "(", ")"):
@@ -123,7 +121,7 @@ def test_results_json_embeds_full_metadata(tmp_path: Path) -> None:
     assert metadata["embedding_model"] == "text-embedding-3-small"
     assert metadata["llm_provider"] == "openai"
     assert metadata["llm_model"] == "gpt-4.1"
-    assert metadata["prompt_version"] == "recipe-extraction-v1"
+    assert metadata["prompt_version"] == "recipe-extraction-v2"
     assert metadata["schema_version"] == "recipe.v1"
     assert metadata["command_args"] == list(sys.argv)
     assert metadata["run_label"] == "extraction-gpt4-prompt-v3"

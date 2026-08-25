@@ -68,7 +68,6 @@ def _doc4_example() -> dict[str, Any]:
                             "step_number": 1,
                             "text": "Heat the oil in a large pot.",
                             "source_span_ids": ["span_043"],
-                            "confidence": {"overall": 0.92, "ordering": 0.9},
                         }
                     ],
                 },
@@ -112,16 +111,12 @@ def test_nullable_string_fields_accept_none() -> None:
     # All the nullable string fields are already ``None`` in the doc-4 example
     # (prep_time, total_time, ingredient preparation/notes, summary set below).
     payload["items"][0]["summary"] = None
-    payload["items"][0]["structured_data"]["ingredients_text"] = None
-    payload["items"][0]["structured_data"]["steps_text"] = None
 
     parsed = RecipeExtractionOutput.model_validate(payload)
     recipe = parsed.items[0]
     assert recipe.summary is None
     assert recipe.structured_data.prep_time is None
     assert recipe.structured_data.total_time is None
-    assert recipe.structured_data.ingredients_text is None
-    assert recipe.structured_data.steps_text is None
     assert recipe.structured_data.ingredients[0].preparation is None
     assert recipe.structured_data.ingredients[0].notes is None
 
@@ -203,8 +198,35 @@ def test_json_schema_uses_yield_alias_and_nullable_union() -> None:
 
 
 def test_version_constants() -> None:
-    assert PROMPT_VERSION == "recipe-extraction-v1"
+    # The two moved apart in the TOKEN BUDGET trim and that split is deliberate:
+    # the request schema shrank (bump PROMPT_VERSION, which invalidates the
+    # extraction cache) while the payload contract consumers read — the value in
+    # structured_data.schema, asserted by evals.golden_schema — did not.
+    assert PROMPT_VERSION == "recipe-extraction-v2"
     assert SCHEMA_VERSION == "recipe.v1"
+
+
+def test_pre_trim_payloads_still_validate() -> None:
+    # Every ExtractionRun committed before the trim carries ingredients_text,
+    # steps_text and the five-axis ingredient confidence. The extraction cache
+    # replays stored output_json through this model, so dropping the fields must
+    # be read-compatible: Pydantic ignores them as extras rather than raising.
+    payload = _doc4_example()
+    structured = payload["items"][0]["structured_data"]
+    structured["ingredients_text"] = "2 tbsp olive oil\n1 onion"
+    structured["steps_text"] = "Heat the oil."
+    structured["ingredients"][0]["confidence"] = {
+        "overall": 0.9,
+        "quantity": 0.9,
+        "unit": 0.9,
+        "item": 0.9,
+        "normalization": 0.8,
+    }
+    structured["steps"][0]["confidence"] = {"overall": 0.9, "ordering": 0.9}
+
+    parsed = RecipeExtractionOutput.model_validate(payload)
+    ingredient = parsed.items[0].structured_data.ingredients[0]
+    assert ingredient.confidence.normalization == 0.8
 
 
 def test_prompt_template_loads_non_empty() -> None:
