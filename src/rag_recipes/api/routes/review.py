@@ -161,6 +161,7 @@ async def list_review_items(
         locators_by_id = {row.id: row.locator for row in span_rows}
 
     review_items: list[ReviewItem] = []
+    thresholds = thresholds_from_settings()
     for item, doc_id, doc_title in rows:
         structured = item.structured_data or {}
         review_items.append(
@@ -183,7 +184,12 @@ async def list_review_items(
                         "confidence_overall": (item.confidence or {}).get("overall"),
                     }
                 ),
-                flags=build_review_reasons(item.status.value, structured),
+                flags=build_review_reasons(
+                    item.status.value,
+                    structured,
+                    confidence=item.confidence,
+                    thresholds=thresholds,
+                ),
                 edited_at=item.edited_at,
             )
         )

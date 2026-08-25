@@ -171,6 +171,7 @@ async def test_returns_full_structured_data_display_and_citations(
     assert body["source_citations"][0]["locator"]["page_start"] == 42
     # Ready items carry an empty review_reasons list (Epic 21.1, additive).
     assert ki["review_reasons"] == []
+    assert ki["review_thresholds"] is None
 
 
 @pytest.mark.asyncio
@@ -195,6 +196,11 @@ async def test_needs_review_item_carries_review_reasons(
     # Codes match the persisted warnings verbatim, with non-empty messages.
     assert [r["code"] for r in reasons] == ["no_ingredients", "low_overall_confidence"]
     assert all(r["message"] for r in reasons)
+    # Reviewer aids: current bounds ride along for needs_review items only.
+    thresholds = ki["review_thresholds"]
+    assert set(thresholds) == {"overall", "boundary", "normalization"}
+    assert all(0.0 <= v <= 1.0 for v in thresholds.values())
+    assert reasons[1]["threshold"] == thresholds["overall"]
     # The raw codes still round-trip verbatim in structured_data.
     assert ki["structured_data"]["warnings"] == [
         "no_ingredients",
@@ -218,7 +224,13 @@ async def test_needs_review_unknown_warning_projects_llm_warning_envelope(
     assert resp.status_code == 200, resp.text
     reasons = resp.json()["knowledge_item"]["review_reasons"]
     assert reasons == [
-        {"code": "llm_warning", "message": "model said something odd"}
+        {
+            "code": "llm_warning",
+            "message": "model said something odd",
+            "value": None,
+            "threshold": None,
+            "ingredient_positions": None,
+        }
     ]
 
 

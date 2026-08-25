@@ -225,3 +225,120 @@ def test_soft_warning_messages_covers_every_validate_soft_code() -> None:
         for warning in validate_soft(candidate, thresholds=_THRESHOLDS)
     }
     assert emitted == set(SOFT_WARNING_MESSAGES)
+
+
+# --- Reviewer aids: value / threshold / ingredient_positions ---
+
+
+def _ing(position: int | None, normalization: float) -> dict[str, object]:
+    row: dict[str, object] = {
+        "raw_text": f"ingredient {position}",
+        "confidence": {"overall": 0.9, "normalization": normalization},
+    }
+    if position is not None:
+        row["position"] = position
+    return row
+
+
+def test_without_confidence_and_thresholds_aids_stay_none() -> None:
+    reasons = build_review_reasons(
+        "needs_review",
+        {
+            "warnings": ["low_overall_confidence", "low_normalization_confidence"],
+            "ingredients": [_ing(1, 0.2)],
+        },
+    )
+    assert reasons[0].value is None and reasons[0].threshold is None
+    # The rule fired on the minimum, so the minimum row is named even blind.
+    assert reasons[1].value == 0.2
+    assert reasons[1].threshold is None
+    assert reasons[1].ingredient_positions == [1]
+
+
+def test_confidence_reasons_carry_observed_value_and_current_threshold() -> None:
+    reasons = build_review_reasons(
+        "needs_review",
+        {"warnings": ["low_overall_confidence", "low_boundary_confidence"]},
+        confidence={"overall": 0.41, "boundary": 0.33},
+        thresholds=_THRESHOLDS,
+    )
+    assert (reasons[0].value, reasons[0].threshold) == (0.41, 0.5)
+    assert (reasons[1].value, reasons[1].threshold) == (0.33, 0.5)
+    assert reasons[0].ingredient_positions is None
+
+
+def test_normalization_reason_names_every_row_below_threshold() -> None:
+    reasons = build_review_reasons(
+        "needs_review",
+        {
+            "warnings": ["low_normalization_confidence"],
+            "ingredients": [_ing(1, 0.9), _ing(2, 0.31), _ing(3, 0.45), _ing(4, 0.5)],
+        },
+        thresholds=_THRESHOLDS,
+    )
+    (reason,) = reasons
+    assert reason.value == 0.31
+    assert reason.threshold == 0.5
+    assert reason.ingredient_positions == [2, 3]  # 0.5 is not < 0.5
+
+
+def test_normalization_reason_falls_back_to_minimum_when_threshold_drifted() -> None:
+    """Thresholds are not persisted: if today's bound is lower than the one
+    ingest flagged against, no row is below it — the lowest is still named."""
+    reasons = build_review_reasons(
+        "needs_review",
+        {
+            "warnings": ["low_normalization_confidence"],
+            "ingredients": [_ing(1, 0.7), _ing(2, 0.6), _ing(3, 0.6)],
+        },
+        thresholds=_THRESHOLDS,
+    )
+    assert reasons[0].ingredient_positions == [2, 3]
+    assert reasons[0].value == 0.6
+
+
+def test_positions_fall_back_to_index_and_malformed_rows_are_skipped() -> None:
+    reasons = build_review_reasons(
+        "needs_review",
+        {
+            "warnings": ["low_normalization_confidence"],
+            "ingredients": [
+                _ing(None, 0.9),
+                "not a row",
+                {"raw_text": "no confidence"},
+                {"raw_text": "bad score", "confidence": {"normalization": "low"}},
+                _ing(None, 0.1),
+            ],
+        },
+        thresholds=_THRESHOLDS,
+    )
+    assert reasons[0].ingredient_positions == [4]
+    assert reasons[0].value == 0.1
+
+
+def test_malformed_confidence_leaves_value_none_never_raises() -> None:
+    for confidence in (None, "0.4", {"overall": "high"}, {"overall": True}, 7):
+        reasons = build_review_reasons(
+            "needs_review",
+            {"warnings": ["low_overall_confidence", "low_normalization_confidence"]},
+            confidence=confidence,  # type: ignore[arg-type]
+            thresholds=_THRESHOLDS,
+        )
+        assert reasons[0].value is None
+        assert reasons[0].threshold == 0.5
+        assert reasons[1].value is None
+        assert reasons[1].ingredient_positions is None
+
+
+def test_review_thresholds_only_for_needs_review() -> None:
+    from rag_recipes.api.review_reasons import build_review_thresholds
+
+    assert build_review_thresholds("ready", _THRESHOLDS) is None
+    assert build_review_thresholds("needs_review", None) is None
+    projected = build_review_thresholds("needs_review", _THRESHOLDS)
+    assert projected is not None
+    assert (projected.overall, projected.boundary, projected.normalization) == (
+        0.5,
+        0.5,
+        0.5,
+    )
