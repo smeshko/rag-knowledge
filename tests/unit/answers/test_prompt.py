@@ -101,3 +101,14 @@ def test_prompt_version_matches_settings_default(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     settings = Settings(_env_file=None)
     assert settings.answer_prompt_version == ANSWER_PROMPT_VERSION
+
+
+def test_every_style_states_the_text_format_contract() -> None:
+    # The frontend parses answer.text against a declared contract — GFM plus
+    # inline [cite_N] — not against whatever one model happens to emit.
+    from rag_recipes.answers.prompt import PROMPT_BY_STYLE
+
+    for text, version in PROMPT_BY_STYLE.values():
+        assert "GitHub-flavoured" in text, version
+        assert "[cite_2]" in text, version
+        assert version.endswith("-v2"), version

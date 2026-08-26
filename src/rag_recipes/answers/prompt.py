@@ -57,7 +57,10 @@ Grounding rules:
 
 Produce a structured answer that conforms to the answer.v1 schema:
 - answer.style is "{style}".
-- answer.text is a concise, source-backed response.
+- answer.text is a concise, source-backed response written in GitHub-flavoured \
+Markdown (short paragraphs, "-" bullet lists, **bold** for dish names; no headings, \
+no tables). Cite inline by placing the citation ID in square brackets, e.g. [cite_2], \
+immediately after the sentence it supports. Do not write citation IDs any other way.
 - answer.citations lists the citation IDs the answer relies on (at least one).
 - {recommendations_line}
 - citations[] maps each cited citation_id back to its knowledge_item_id, \
@@ -108,15 +111,17 @@ DIRECT_ANSWER_PROMPT = _build_prompt(
 )
 
 #: Mirrors ``Settings.answer_prompt_version`` default; a drift test guards the pair.
-ANSWER_PROMPT_VERSION = "answer-recommendation-v1"
+#: v2: the text-format contract (GFM + inline ``[cite_N]``) became part of the prompt —
+#: previously the frontend parsed whatever shape one model happened to emit.
+ANSWER_PROMPT_VERSION = "answer-recommendation-v2"
 
 #: Each answer style → ``(prompt_text, prompt_version)``. The version is resolved per
 #: style and flows into ``StructuredOutputRequest`` and the debug payload (doc 8 § 9).
 PROMPT_BY_STYLE: dict[str, tuple[str, str]] = {
     "recommendation": (RECOMMENDATION_PROMPT, ANSWER_PROMPT_VERSION),
-    "summary": (SUMMARY_PROMPT, "answer-summary-v1"),
-    "comparison": (COMPARISON_PROMPT, "answer-comparison-v1"),
-    "direct_answer": (DIRECT_ANSWER_PROMPT, "answer-direct-answer-v1"),
+    "summary": (SUMMARY_PROMPT, "answer-summary-v2"),
+    "comparison": (COMPARISON_PROMPT, "answer-comparison-v2"),
+    "direct_answer": (DIRECT_ANSWER_PROMPT, "answer-direct-answer-v2"),
 }
 
 #: Prompt text keyed by version (derived from ``PROMPT_BY_STYLE``).

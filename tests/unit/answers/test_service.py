@@ -599,7 +599,7 @@ async def test_generate_answer_unhashable_citation_ids_falls_back_no_crash(
     # The malformed-output fallback must still carry debug like every other path
     # (review #1, 17.3) — the route's T/T gate depends on it being non-None.
     assert out.debug is not None
-    assert out.debug.prompt_version == "answer-recommendation-v1"
+    assert out.debug.prompt_version == "answer-recommendation-v2"
 
 
 @pytest.mark.asyncio
@@ -669,7 +669,7 @@ async def test_generate_answer_summary_empty_recommendations_succeeds(
     assert out.recommendations == []
     assert out.citations[0].citation_id == "cite_1"
     assert out.debug is not None
-    assert out.debug.prompt_version == "answer-summary-v1"
+    assert out.debug.prompt_version == "answer-summary-v2"
 
 
 @pytest.mark.asyncio

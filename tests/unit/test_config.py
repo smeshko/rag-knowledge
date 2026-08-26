@@ -363,7 +363,7 @@ def test_answer_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
     settings = Settings(_env_file=None)
     assert settings.answer_llm_model is None
-    assert settings.answer_prompt_version == "answer-recommendation-v1"
+    assert settings.answer_prompt_version == "answer-recommendation-v2"
     assert settings.answer_schema_version == "answer.v1"
     assert settings.answer_context_item_limit == 6
     assert settings.answer_matched_chunks_per_item == 3

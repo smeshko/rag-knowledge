@@ -257,10 +257,10 @@ async def test_answers_missing_token_returns_401(db_session: AsyncSession) -> No
 @pytest.mark.parametrize(
     ("style", "version"),
     [
-        ("recommendation", "answer-recommendation-v1"),
-        ("summary", "answer-summary-v1"),
-        ("comparison", "answer-comparison-v1"),
-        ("direct_answer", "answer-direct-answer-v1"),
+        ("recommendation", "answer-recommendation-v2"),
+        ("summary", "answer-summary-v2"),
+        ("comparison", "answer-comparison-v2"),
+        ("direct_answer", "answer-direct-answer-v2"),
     ],
 )
 async def test_answers_each_style_routes_with_versioned_prompt(
@@ -336,7 +336,7 @@ async def test_answers_debug_gate_matrix(
         debug = body["debug"]
         assert debug["retrieval_mode"] == "hybrid"
         assert debug["model"] == "fake-model"
-        assert debug["prompt_version"] == "answer-recommendation-v1"
+        assert debug["prompt_version"] == "answer-recommendation-v2"
         assert debug["context_item_count"] == 1
         assert debug["citation_count"] == 1
         assert debug["retrieval_debug"]["retrieval_mode"] == "hybrid"

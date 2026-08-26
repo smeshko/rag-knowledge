@@ -254,7 +254,7 @@ class Settings(BaseSettings):
     # value is rejected at Settings load rather than silently including nearly all
     # results (negative) or forcing an empty context (zero).
     answer_llm_model: str | None = None
-    answer_prompt_version: str = "answer-recommendation-v1"
+    answer_prompt_version: str = "answer-recommendation-v2"
     answer_schema_version: str = "answer.v1"
     answer_context_item_limit: int = Field(default=6, ge=1)
     answer_matched_chunks_per_item: int = Field(default=3, ge=1)
