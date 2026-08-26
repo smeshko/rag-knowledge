@@ -24,12 +24,14 @@ from rag_recipes.ingestion.pipeline.extraction import (
 )
 from rag_recipes.ingestion.pipeline.windows import Window
 from rag_recipes.ingestion.validation import (
+    ASSEMBLY_RECIPE_NOTE,
     HardValidationError,
     HardValidationFailure,
     SoftValidationThresholds,
     SoftValidationWarning,
     validate_hard,
     validate_soft,
+    validation_notes,
 )
 from rag_recipes.storage.models.source_span import SourceSpan
 
@@ -262,6 +264,16 @@ def test_assembly_recipe_is_not_flagged() -> None:
     assert validate_soft(_assembly(), thresholds=_THRESHOLDS) == []
 
 
+def test_assembly_exemption_leaves_a_note() -> None:
+    # The waiver is audit data, not silence: the row must be distinguishable
+    # from a fully structured recipe so calibration/regression evals can bucket it.
+    assert validation_notes(_assembly(), thresholds=_THRESHOLDS) == [ASSEMBLY_RECIPE_NOTE]
+
+
+def test_no_note_when_the_exemption_did_not_fire() -> None:
+    assert validation_notes(_assembly(count=2), thresholds=_THRESHOLDS) == []
+
+
 def test_assembly_exemption_clears_both_size_rules_together() -> None:
     # An assembly recipe is short *because* it has no method, so waiving
     # no_steps while leaving recipe_too_short would park it in review anyway.
@@ -325,9 +337,7 @@ def test_assembly_exemption_does_not_mask_confidence_rules() -> None:
     # Only the two size-shaped rules are waived; a badly-cut recipe still says so.
     recipe = _assembly()
     recipe = recipe.model_copy(update={"confidence": _recipe_confidence(boundary=0.3)})
-    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == [
-        "low_boundary_confidence"
-    ]
+    assert _soft_codes(validate_soft(recipe, thresholds=_THRESHOLDS)) == ["low_boundary_confidence"]
 
 
 def test_low_overall_confidence() -> None:

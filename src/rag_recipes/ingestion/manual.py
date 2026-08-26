@@ -31,7 +31,12 @@ from typing import Any
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.ingestion.editing import RecipeEdit, apply_edit, warnings_for_item
+from rag_recipes.ingestion.editing import (
+    RecipeEdit,
+    apply_edit,
+    notes_for_item,
+    warnings_for_item,
+)
 from rag_recipes.ingestion.pipeline.composition import compose_body_text
 from rag_recipes.ingestion.pipeline.extraction import SCHEMA_VERSION
 from rag_recipes.ingestion.validation import SoftValidationThresholds
@@ -264,6 +269,15 @@ def authored_recipe(
     body_text = compose_body_text(title=edited.title, structured=structured)
     confidence = human_confidence()
     structured["warnings"] = warnings_for_item(
+        title=edited.title,
+        summary=edited.summary,
+        body_text=body_text,
+        source_span_ids=[],
+        structured_data=structured,
+        confidence=confidence,
+        thresholds=thresholds,
+    )
+    structured["validation_notes"] = notes_for_item(
         title=edited.title,
         summary=edited.summary,
         body_text=body_text,

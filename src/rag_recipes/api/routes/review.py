@@ -47,6 +47,7 @@ from rag_recipes.ingestion.editing import (
     RecipeEdit,
     Unset,
     apply_edit,
+    notes_for_item,
     warnings_for_item,
 )
 from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
@@ -280,6 +281,16 @@ async def update_knowledge_item(
     structured_after = {
         **edited.structured_data,
         "warnings": warnings_for_item(
+            title=edited.title,
+            summary=edited.summary,
+            body_text=edited.body_text,
+            source_span_ids=list(item.source_span_ids or []),
+            structured_data=edited.structured_data,
+            confidence=item.confidence,
+            thresholds=thresholds_from_settings(),
+            item_type=item.item_type,
+        ),
+        "validation_notes": notes_for_item(
             title=edited.title,
             summary=edited.summary,
             body_text=edited.body_text,

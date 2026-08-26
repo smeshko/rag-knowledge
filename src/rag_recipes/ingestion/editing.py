@@ -46,7 +46,11 @@ from rag_recipes.ingestion.pipeline.extraction import (
     RecipeConfidence,
     RecipeV1StructuredData,
 )
-from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
+from rag_recipes.ingestion.validation import (
+    SoftValidationThresholds,
+    validate_soft,
+    validation_notes,
+)
 
 __all__ = [
     "UNSET",
@@ -54,6 +58,7 @@ __all__ = [
     "RecipeEdit",
     "Unset",
     "apply_edit",
+    "notes_for_item",
     "warnings_for_item",
 ]
 
@@ -392,6 +397,9 @@ def warnings_for_item(
 ) -> list[str]:
     """Re-derive the soft-validation warning codes for a persisted item.
 
+    See ``_extracted_for_validation`` for the reconstruction; ``notes_for_item``
+    is the sibling for ``structured_data["validation_notes"]``.
+
     Reconstructs the ``ExtractedRecipe`` the ingest pipeline would have validated
     and runs ``validate_soft`` over it, so an edit's effect on the flags is
     decided by the same rules that raised them. Over an *unedited* row this
@@ -405,6 +413,58 @@ def warnings_for_item(
     correctly, and retyping an ingredient line does not attest to that. They are
     cleared by approving, not by fixing.
     """
+    extracted = _extracted_for_validation(
+        title=title,
+        summary=summary,
+        body_text=body_text,
+        source_span_ids=source_span_ids,
+        structured_data=structured_data,
+        confidence=confidence,
+        item_type=item_type,
+    )
+    return [warning.code for warning in validate_soft(extracted, thresholds=thresholds)]
+
+
+def notes_for_item(
+    *,
+    title: str,
+    summary: str | None,
+    body_text: str,
+    source_span_ids: list[str],
+    structured_data: dict[str, Any],
+    confidence: dict[str, Any] | None,
+    thresholds: SoftValidationThresholds,
+    item_type: str = "recipe",
+) -> list[str]:
+    """Re-derive ``structured_data["validation_notes"]`` for a persisted item.
+
+    Same reconstruction as ``warnings_for_item``, run through
+    ``validation_notes``: an edit that turns an assembly recipe into a full one
+    (or vice versa) moves the note with the warning it explains.
+    """
+    extracted = _extracted_for_validation(
+        title=title,
+        summary=summary,
+        body_text=body_text,
+        source_span_ids=source_span_ids,
+        structured_data=structured_data,
+        confidence=confidence,
+        item_type=item_type,
+    )
+    return validation_notes(extracted, thresholds=thresholds)
+
+
+def _extracted_for_validation(
+    *,
+    title: str,
+    summary: str | None,
+    body_text: str,
+    source_span_ids: list[str],
+    structured_data: dict[str, Any],
+    confidence: dict[str, Any] | None,
+    item_type: str,
+) -> ExtractedRecipe:
+    """Rebuild the ``ExtractedRecipe`` the ingest pipeline would have validated."""
     conf = confidence if isinstance(confidence, dict) else {}
     fields = conf.get("fields")
     fields = fields if isinstance(fields, dict) else {}
@@ -446,4 +506,4 @@ def warnings_for_item(
         ),
         warnings=[],
     )
-    return [warning.code for warning in validate_soft(extracted, thresholds=thresholds)]
+    return extracted

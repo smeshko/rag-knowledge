@@ -25,12 +25,14 @@ from rag_recipes.ingestion.pipeline.extraction import ExtractedRecipe
 from rag_recipes.ingestion.pipeline.windows import Window
 
 __all__ = [
+    "ASSEMBLY_RECIPE_NOTE",
     "HardValidationError",
     "HardValidationFailure",
     "SoftValidationThresholds",
     "SoftValidationWarning",
     "validate_hard",
     "validate_soft",
+    "validation_notes",
 ]
 
 
@@ -255,6 +257,30 @@ def _is_assembly_recipe(
         <= thresholds.assembly_max_ingredients
         and body_len <= thresholds.assembly_max_chars
     )
+
+
+ASSEMBLY_RECIPE_NOTE = "assembly_recipe"
+
+
+def validation_notes(
+    extracted: ExtractedRecipe,
+    *,
+    thresholds: SoftValidationThresholds,
+) -> list[str]:
+    """Return informational validation notes for ``extracted`` (empty = none).
+
+    Notes are the audit trail of rules that *waived* a warning rather than raised
+    one. They never affect status — a noted item is as ``ready`` as a clean one —
+    but without them a waived candidate is indistinguishable in the DB from a
+    fully structured recipe, and doc 12 §6/§9 (calibration buckets, regression
+    diffs of validation-rule changes) cannot see the population the exemption
+    created. Today the only note is ``assembly_recipe``: ``no_steps`` and
+    ``recipe_too_short`` were waived by ``_is_assembly_recipe``.
+    """
+    notes: list[str] = []
+    if _is_assembly_recipe(extracted, len(extracted.body_text), thresholds):
+        notes.append(ASSEMBLY_RECIPE_NOTE)
+    return notes
 
 
 def validate_soft(

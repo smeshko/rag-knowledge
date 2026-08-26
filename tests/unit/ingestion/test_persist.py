@@ -115,6 +115,7 @@ async def test_persist_clean_candidate_is_ready() -> None:
     )
     assert item.status == KnowledgeItemStatus.READY
     assert item.structured_data["warnings"] == []
+    assert item.structured_data["validation_notes"] == []
     assert item.normalized_title == "tomato and white bean soup"
     assert item.item_type == "recipe"
     assert item.extraction_run_id == "run_x"

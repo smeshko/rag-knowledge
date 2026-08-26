@@ -209,6 +209,7 @@ async def test_persist_three_outcomes_and_jsonb_round_trip(db_session: AsyncSess
     expected_structured = {
         **clean_recipe.structured_data.model_dump(mode="json", by_alias=True),
         "warnings": [],
+        "validation_notes": [],
     }
     expected_confidence = clean_recipe.confidence.model_dump(mode="json", by_alias=True)
     clean_id = clean.id

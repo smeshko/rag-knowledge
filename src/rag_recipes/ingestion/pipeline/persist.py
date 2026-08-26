@@ -38,6 +38,7 @@ from rag_recipes.ingestion.validation import (
     SoftValidationThresholds,
     validate_hard,
     validate_soft,
+    validation_notes,
 )
 from rag_recipes.storage.enums import KnowledgeItemStatus
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
@@ -108,6 +109,7 @@ async def persist_knowledge_item(
     if thresholds is None:
         thresholds = thresholds_from_settings()
     warnings = validate_soft(extracted, thresholds=thresholds)
+    notes = validation_notes(extracted, thresholds=thresholds)
 
     # Whole-object assembly (DECISIONS #1, #2): warning codes live alongside the
     # LLM's own warnings under structured_data; never mutated in place afterwards.
@@ -116,6 +118,9 @@ async def persist_knowledge_item(
     structured_data = {
         **extracted.structured_data.model_dump(mode="json", by_alias=True),
         "warnings": [w.code for w in warnings],
+        # Informational only — which rules waived a warning (e.g. the assembly
+        # exemption). Never read for status; kept so evals can bucket the rows.
+        "validation_notes": notes,
     }
     if staging:
         status = KnowledgeItemStatus.EXTRACTING

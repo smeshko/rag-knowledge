@@ -21,6 +21,7 @@ from rag_recipes.ingestion.editing import (
     UNSET,
     RecipeEdit,
     apply_edit,
+    notes_for_item,
     warnings_for_item,
 )
 from rag_recipes.ingestion.pipeline.composition import compose_body_text
@@ -742,3 +743,34 @@ def test_junk_in_a_persisted_row_never_raises(mutate: Any) -> None:
 
     assert isinstance(warnings, list)
     assert isinstance(edited.body_text, str)
+
+
+def test_notes_for_item_tracks_the_assembly_exemption() -> None:
+    from rag_recipes.ingestion.validation import ASSEMBLY_RECIPE_NOTE, SoftValidationThresholds
+
+    thresholds = SoftValidationThresholds(
+        min_overall_confidence=0.0,
+        min_boundary_confidence=0.0,
+        min_normalization_confidence=0.0,
+        min_recipe_chars=200,
+        max_recipe_chars=20000,
+        assembly_min_ingredients=3,
+        assembly_max_ingredients=12,
+        assembly_max_chars=400,
+    )
+    common = dict(
+        title="Cheese board",
+        summary=None,
+        body_text="Cheese board\n\nbrie\ngrapes\ncrackers",
+        source_span_ids=[],
+        confidence={"overall": 0.9, "boundary": 0.9, "fields": {}},
+        thresholds=thresholds,
+    )
+    assembly = {
+        "schema": "recipe.v1",
+        "ingredients": [{"raw_text": x} for x in ("brie", "grapes", "crackers")],
+        "steps": [],
+    }
+    assert notes_for_item(structured_data=assembly, **common) == [ASSEMBLY_RECIPE_NOTE]  # type: ignore[arg-type]
+    with_steps = {**assembly, "steps": [{"text": "Arrange on a board."}]}
+    assert notes_for_item(structured_data=with_steps, **common) == []  # type: ignore[arg-type]

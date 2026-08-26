@@ -136,9 +136,7 @@ def test_missing_sections_warn_exactly_as_an_extraction_would() -> None:
     recipe inside the assembly window is *exempt* from ``no_steps`` (next test),
     so a smaller list here would prove nothing about the wiring.
     """
-    no_steps = _authored(
-        steps=[], ingredients=[f"{n} g of ingredient {n}" for n in range(1, 14)]
-    )
+    no_steps = _authored(steps=[], ingredients=[f"{n} g of ingredient {n}" for n in range(1, 14)])
     assert "no_steps" in no_steps.structured_data["warnings"]
 
     no_ingredients = _authored(ingredients=[])
@@ -198,11 +196,11 @@ def test_output_matches_editing_the_same_lines_into_an_empty_item() -> None:
         ),
     )
 
-    # `warnings` is the one key the create path adds on top.
+    # `warnings` / `validation_notes` are the keys the create path adds on top.
     assert {
         key: value
         for key, value in created.structured_data.items()
-        if key != "warnings"
+        if key not in {"warnings", "validation_notes"}
     } == edited.structured_data
     assert created.title == edited.title
     assert created.normalized_title == edited.normalized_title
