@@ -289,7 +289,9 @@ def _patch_db_seams(
     result: SearchResult,
     chunk_inputs: dict[str, ChunkInput],
 ) -> None:
-    async def fake_search(session: Any, request: Any, *, provider: Any, settings: Any) -> Any:
+    async def fake_search(
+        session: Any, request: Any, *, provider: Any, settings: Any, reranker: Any = None
+    ) -> Any:
         return result
 
     async def fake_structured(session: Any, res: Any) -> dict[str, dict[str, Any]]:

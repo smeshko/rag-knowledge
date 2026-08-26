@@ -25,12 +25,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.answers.context_pack import ChunkInput, ContextPack, build_context_pack
 from rag_recipes.answers.prompt import render_answer_input, resolve_prompt_version
 from rag_recipes.answers.schema import build_answer_v1_json_schema
+from rag_recipes.answers.shared import (
+    as_list,
+    fetch_chunk_inputs,
+    previews_from_structured,
+)
 from rag_recipes.api.schemas.answers import (
     AnswerBody,
     AnswerCitation,
@@ -39,7 +43,6 @@ from rag_recipes.api.schemas.answers import (
 from rag_recipes.api.schemas.search import KnowledgeItemResult, RetrievalDebugInfo
 from rag_recipes.api.search_projection import (
     build_retrieval_debug,
-    build_structured_preview,
     fetch_item_structured_data,
     project_results,
 )
@@ -48,9 +51,9 @@ from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.errors import LLMTechnicalError
 from rag_recipes.providers.llm.base import LLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
+from rag_recipes.providers.reranker.base import RerankerProvider
 from rag_recipes.retrieval.search import search
 from rag_recipes.retrieval.types import SearchRequest
-from rag_recipes.storage.models.chunk import Chunk
 
 # doc 8 § 7 — the safe-fallback message shown when no citation-safe answer is possible.
 FALLBACK_WARNING = (
@@ -107,13 +110,18 @@ async def generate_answer(
     llm_provider: LLMProvider,
     embedding_provider: EmbeddingProvider,
     settings: Settings,
+    reranker: RerankerProvider | None = None,
 ) -> AnswerResult:
     """Run retrieval, synthesize a grounded answer, and validate its citations.
 
     ``request.limit`` is the route-normalized positive ``effective_limit``, so the
-    context-pack ``item_limit`` is always ≥ 1.
+    context-pack ``item_limit`` is always ≥ 1. ``reranker`` is threaded into
+    ``search`` exactly as ``/search`` and ``/menus`` do, so the three surfaces rank
+    the same query the same way.
     """
-    result = await search(session, request, provider=embedding_provider, settings=settings)
+    result = await search(
+        session, request, provider=embedding_provider, settings=settings, reranker=reranker
+    )
 
     # The resolved per-style prompt + version drive both the LLM request and the
     # debug payload, so traces and the debug `prompt_version` match the style used.
@@ -127,20 +135,13 @@ async def generate_answer(
 
     if not result.items:
         # Nothing to ground an answer on — fallback without an LLM call.
-        return _fallback(
-            request.query, style, results=[], warning=NO_RESULTS_WARNING, debug=debug
-        )
+        return _fallback(request.query, style, results=[], warning=NO_RESULTS_WARNING, debug=debug)
 
     item_limit = min(request.limit, settings.answer_context_item_limit)
     chunks_per_item = settings.answer_matched_chunks_per_item
 
     structured = await fetch_item_structured_data(session, result)
-    preview_by_item = {
-        item_id: build_structured_preview(extra.get("structured_data", {})).model_dump(
-            by_alias=True
-        )
-        for item_id, extra in structured.items()
-    }
+    preview_by_item = previews_from_structured(structured)
     chunk_input_by_id = await _fetch_chunk_inputs(
         session, result, item_limit=item_limit, chunks_per_item=chunks_per_item
     )
@@ -214,9 +215,7 @@ async def generate_answer(
         )
 
     results = (
-        await project_results(session, result, structured=structured)
-        if include_results
-        else []
+        await project_results(session, result, structured=structured) if include_results else []
     )
     return AnswerResult(
         query=request.query,
@@ -243,16 +242,14 @@ def _build_success_payload(
     raw_answer = answer_json.get("answer")
     answer_block = raw_answer if isinstance(raw_answer, dict) else {}
     recommendations_json = [
-        rec for rec in _as_list(answer_json.get("recommendations")) if isinstance(rec, dict)
+        rec for rec in as_list(answer_json.get("recommendations")) if isinstance(rec, dict)
     ]
     title_by_item = {item.knowledge_item_id: item.title for item in pack.items}
 
-    answer_citation_ids = [
-        c for c in _as_list(answer_block.get("citations")) if isinstance(c, str)
-    ]
+    answer_citation_ids = [c for c in as_list(answer_block.get("citations")) if isinstance(c, str)]
     used_cite_ids: list[str] = list(answer_citation_ids)
     for rec in recommendations_json:
-        for cid in _as_list(rec.get("citation_ids")):
+        for cid in as_list(rec.get("citation_ids")):
             if isinstance(cid, str) and cid not in used_cite_ids:
                 used_cite_ids.append(cid)
 
@@ -264,9 +261,7 @@ def _build_success_payload(
                 knowledge_item_id=item_id,
                 title=title_by_item.get(item_id, "") if isinstance(item_id, str) else "",
                 reason=rec.get("reason") or "",
-                citation_ids=[
-                    c for c in _as_list(rec.get("citation_ids")) if isinstance(c, str)
-                ],
+                citation_ids=[c for c in as_list(rec.get("citation_ids")) if isinstance(c, str)],
             )
         )
     answer_body = AnswerBody(
@@ -275,17 +270,6 @@ def _build_success_payload(
         citations=answer_citation_ids,
     )
     return answer_body, recommendations, build_response_citations(used_cite_ids, pack)
-
-
-def _as_list(value: Any) -> list[Any]:
-    """Coerce a model-supplied field to a list (``[]`` for anything non-list).
-
-    ``parse_error is None`` only guarantees a JSON *object*, not a schema-conforming
-    one — the provider does no post-parse JSON-Schema validation. So a wrong-typed
-    field (``null``, a string, …) must degrade to a validation failure, never an
-    ``AttributeError``/``TypeError`` that would escape ``generate_answer`` as a 500.
-    """
-    return value if isinstance(value, list) else []
 
 
 def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[str]:
@@ -325,7 +309,7 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
     # `isinstance(cid, str)` is checked *before* the membership lookup so an
     # unhashable nested value (e.g. a list) can never reach `cid in cite_owner` and
     # raise `TypeError` — it is reported as an invalid citation instead (review #3).
-    for cid in _as_list(answer_block.get("citations")):
+    for cid in as_list(answer_block.get("citations")):
         if not isinstance(cid, str) or cid not in cite_owner:
             errors.append(f"answer cites unknown citation_id {cid!r}")
         else:
@@ -340,18 +324,14 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
             errors.append(f"recommendation[{index}] is not an object")
             continue
         rec_item = rec.get("knowledge_item_id")
-        citation_ids = _as_list(rec.get("citation_ids"))
+        citation_ids = as_list(rec.get("citation_ids"))
         if not isinstance(rec_item, str) or rec_item not in pack_item_ids:
-            errors.append(
-                f"recommendation[{index}] cites unknown knowledge_item_id {rec_item!r}"
-            )
+            errors.append(f"recommendation[{index}] cites unknown knowledge_item_id {rec_item!r}")
         if not citation_ids:
             errors.append(f"recommendation[{index}] has no citations")
         for cid in citation_ids:
             if not isinstance(cid, str) or cid not in cite_owner:
-                errors.append(
-                    f"recommendation[{index}] cites unknown citation_id {cid!r}"
-                )
+                errors.append(f"recommendation[{index}] cites unknown citation_id {cid!r}")
             elif cite_owner[cid] != rec_item:
                 errors.append(
                     f"recommendation[{index}] cites {cid!r} which belongs to a "
@@ -366,9 +346,7 @@ def validate_citations(answer_json: dict[str, Any], pack: ContextPack) -> list[s
     return errors
 
 
-def build_response_citations(
-    used_cite_ids: list[str], pack: ContextPack
-) -> list[AnswerCitation]:
+def build_response_citations(used_cite_ids: list[str], pack: ContextPack) -> list[AnswerCitation]:
     """Reconstruct response ``citations[]`` from the pack (never from the LLM)."""
     detail: dict[str, AnswerCitation] = {}
     for item in pack.items:
@@ -389,29 +367,14 @@ async def _fetch_chunk_inputs(
     item_limit: int,
     chunks_per_item: int,
 ) -> dict[str, ChunkInput]:
-    """Batch-fetch ``text`` + ``source_span_ids`` for the chunks the pack will consider.
-
-    Only the chunks within the builder's cap window (top ``item_limit`` items, top
-    ``chunks_per_item`` matched chunks each) are fetched — the rest are never read.
-    """
+    """Fetch the chunks within the builder's cap window (top ``item_limit`` items,
+    top ``chunks_per_item`` matched chunks each) — the rest are never read."""
     chunk_ids = [
         mc.chunk_id
         for item in result.items[:item_limit]
         for mc in item.matched_chunks[:chunks_per_item]
     ]
-    if not chunk_ids:
-        return {}
-    rows = (
-        await session.execute(
-            select(Chunk.id, Chunk.text, Chunk.source_span_ids).where(
-                Chunk.id.in_(chunk_ids)
-            )
-        )
-    ).all()
-    return {
-        row.id: ChunkInput(text=row.text, source_span_ids=list(row.source_span_ids or []))
-        for row in rows
-    }
+    return await fetch_chunk_inputs(session, chunk_ids)
 
 
 def _fallback(

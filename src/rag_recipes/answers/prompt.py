@@ -21,6 +21,7 @@ import json
 from dataclasses import asdict
 
 from rag_recipes.answers.context_pack import ContextPack
+from rag_recipes.answers.shared import allowed_ids_footer
 
 __all__ = [
     "ANSWER_PROMPT_VERSION",
@@ -139,19 +140,9 @@ def render_answer_input(query: str, pack: ContextPack, *, style: str = _DEFAULT_
     prompt_text = PROMPT_BY_STYLE.get(style, PROMPT_BY_STYLE[_DEFAULT_STYLE])[0]
     pack_json = json.dumps(asdict(pack), indent=2, ensure_ascii=False)
 
-    allowed_citation_ids: list[str] = []
-    allowed_item_ids: list[str] = []
-    for item in pack.items:
-        if item.knowledge_item_id not in allowed_item_ids:
-            allowed_item_ids.append(item.knowledge_item_id)
-        for citation in item.citations:
-            if citation.citation_id not in allowed_citation_ids:
-                allowed_citation_ids.append(citation.citation_id)
-
     return (
         f"{prompt_text}\n\n"
         f"User query: {query}\n\n"
         f"Context pack:\n{pack_json}\n\n"
-        f"Allowed citation IDs: {', '.join(allowed_citation_ids) or '(none)'}\n"
-        f"Allowed knowledge_item_ids: {', '.join(allowed_item_ids) or '(none)'}"
+        f"{allowed_ids_footer(pack)}"
     )

@@ -26,15 +26,11 @@ from rag_recipes.api.dependencies import (
     get_session,
     get_settings,
 )
-from rag_recipes.providers._observability import TraceContext
+from rag_recipes.menus.schema import MENU_PLAN_SCHEMA_VERSION, MENU_SELECTION_SCHEMA_VERSION
 from rag_recipes.providers.embeddings.fake import FakeEmbeddingProvider
 from rag_recipes.providers.errors import LLMTechnicalError
-from rag_recipes.providers.llm.base import LLMProvider
-from rag_recipes.providers.llm.types import (
-    StructuredOutputRequest,
-    StructuredOutputResponse,
-    TokenUsage,
-)
+from rag_recipes.providers.llm.fake import FakeLLMProvider
+from rag_recipes.providers.llm.types import StructuredOutputResponse
 from tests.integration.conftest import AUTH_HEADERS, TEST_API_TOKEN
 from tests.integration.test_search import (
     _FAKE_MODEL,
@@ -53,51 +49,29 @@ _MAIN_QUERY = "hearty baked vegetable casserole"
 _DESSERT_QUERY = "no-bake chocolate mousse"
 
 
-class _ScriptedLLM(LLMProvider):
-    """Answers the plan and selection calls separately, keyed on ``schema_version``.
+def _ScriptedLLM(  # noqa: N802 — reads as the double it replaces
+    *,
+    plan: dict[str, Any] | None = None,
+    selection: dict[str, Any] | None = None,
+    fail_plan: bool = False,
+    fail_selection: bool = False,
+) -> FakeLLMProvider:
+    """The plan and selection calls answered separately, keyed on ``schema_version``.
 
     ``fail_plan`` / ``fail_selection`` raise ``LLMTechnicalError`` for that one call
-    so each safe-fallback path can be exercised independently.
+    so each safe-fallback path can be exercised independently. Built on the shared
+    ``FakeLLMProvider`` (tests/AGENTS.md: extend the fake, don't fork it).
     """
-
-    provider = "fake"
-
-    def __init__(
-        self,
-        *,
-        plan: dict[str, Any] | None = None,
-        selection: dict[str, Any] | None = None,
-        fail_plan: bool = False,
-        fail_selection: bool = False,
-    ) -> None:
-        self.default_model = "fake-model"
-        self._plan = plan
-        self._selection = selection
-        self._fail_plan = fail_plan
-        self._fail_selection = fail_selection
-        self.calls: list[StructuredOutputRequest] = []
-
-    async def generate_structured_output(
-        self,
-        request: StructuredOutputRequest,
-        *,
-        trace_context: TraceContext | None = None,
-    ) -> StructuredOutputResponse:
-        self.calls.append(request)
-        is_plan = request.schema_version.startswith("menu_plan")
-        if is_plan and self._fail_plan:
-            raise LLMTechnicalError("scripted plan failure")
-        if not is_plan and self._fail_selection:
-            raise LLMTechnicalError("scripted selection failure")
-        payload = self._plan if is_plan else self._selection
-        assert payload is not None, f"no scripted response for {request.schema_version}"
-        return StructuredOutputResponse(
-            output_json=payload,
-            raw_text="{}",
-            usage=TokenUsage(input_tokens=1, output_tokens=1),
-            provider=request.provider,
-            model=request.model,
-        )
+    responses: dict[str, dict[str, Any] | StructuredOutputResponse | LLMTechnicalError] = {}
+    if fail_plan:
+        responses[MENU_PLAN_SCHEMA_VERSION] = LLMTechnicalError("scripted plan failure")
+    elif plan is not None:
+        responses[MENU_PLAN_SCHEMA_VERSION] = plan
+    if fail_selection:
+        responses[MENU_SELECTION_SCHEMA_VERSION] = LLMTechnicalError("scripted selection failure")
+    elif selection is not None:
+        responses[MENU_SELECTION_SCHEMA_VERSION] = selection
+    return FakeLLMProvider(responses_by_schema_version=responses)
 
 
 _PLAN = {
@@ -113,7 +87,7 @@ _PLAN = {
 @asynccontextmanager
 async def _client(
     db_session: AsyncSession,
-    llm: LLMProvider,
+    llm: FakeLLMProvider,
     *,
     debug_enabled: bool = False,
     with_auth: bool = True,

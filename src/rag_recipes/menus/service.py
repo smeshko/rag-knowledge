@@ -40,11 +40,11 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.answers.context_pack import ChunkInput, ContextPack, build_context_pack
+from rag_recipes.answers.context_pack import ContextPack, build_context_pack
 from rag_recipes.answers.service import build_response_citations
+from rag_recipes.answers.shared import as_list, fetch_chunk_inputs, previews_from_structured
 from rag_recipes.api.schemas.answers import AnswerCitation
 from rag_recipes.api.schemas.menus import (
     CourseSelection,
@@ -54,7 +54,6 @@ from rag_recipes.api.schemas.menus import (
 from rag_recipes.api.schemas.search import KnowledgeItemResult, RetrievalDebugInfo
 from rag_recipes.api.search_projection import (
     build_retrieval_debug,
-    build_structured_preview,
     fetch_item_structured_data,
     project_results,
 )
@@ -77,7 +76,6 @@ from rag_recipes.retrieval.types import (
     SearchRequest,
     SearchResult,
 )
-from rag_recipes.storage.models.chunk import Chunk
 
 logger = logging.getLogger(__name__)
 
@@ -421,24 +419,8 @@ async def _build_menu_pack(
     one sentence when arguing that they go together.
     """
     chunk_ids = [ref.chunk_id for item in items for ref in item.matched_chunks[:chunks_per_item]]
-    chunk_input_by_id: dict[str, ChunkInput] = {}
-    if chunk_ids:
-        rows = (
-            await session.execute(
-                select(Chunk.id, Chunk.text, Chunk.source_span_ids).where(Chunk.id.in_(chunk_ids))
-            )
-        ).all()
-        chunk_input_by_id = {
-            row.id: ChunkInput(text=row.text, source_span_ids=list(row.source_span_ids or []))
-            for row in rows
-        }
-
-    previews = {
-        item_id: build_structured_preview(extra.get("structured_data", {})).model_dump(
-            by_alias=True
-        )
-        for item_id, extra in structured.items()
-    }
+    chunk_input_by_id = await fetch_chunk_inputs(session, chunk_ids)
+    previews = previews_from_structured(structured)
     return build_context_pack(
         query,
         items,
@@ -490,7 +472,7 @@ def validate_menu_selection(
         menu_block = {}
     # `isinstance` is checked before the membership lookup so an unhashable nested
     # value (e.g. a list) can never reach `cid in cite_owner` and raise TypeError.
-    for cid in _as_list(menu_block.get("citations")):
+    for cid in as_list(menu_block.get("citations")):
         if not isinstance(cid, str) or cid not in cite_owner:
             errors.append(f"menu cites unknown citation_id {cid!r}")
         else:
@@ -509,7 +491,7 @@ def validate_menu_selection(
             continue
         slot = entry.get("slot")
         item_id = entry.get("knowledge_item_id")
-        citation_ids = _as_list(entry.get("citation_ids"))
+        citation_ids = as_list(entry.get("citation_ids"))
 
         if not isinstance(slot, str) or slot not in planned_slots:
             errors.append(f"course[{index}] names unplanned slot {slot!r}")
@@ -572,11 +554,11 @@ def _build_success_payload(
     title_by_item = {item.knowledge_item_id: item.title for item in pack.items}
 
     entry_by_slot: dict[str, dict[str, Any]] = {}
-    for entry in _as_list(selection_json.get("courses")):
+    for entry in as_list(selection_json.get("courses")):
         if isinstance(entry, dict) and isinstance(entry.get("slot"), str):
             entry_by_slot.setdefault(entry["slot"], entry)
 
-    menu_citation_ids = [c for c in _as_list(menu_block.get("citations")) if isinstance(c, str)]
+    menu_citation_ids = [c for c in as_list(menu_block.get("citations")) if isinstance(c, str)]
     used_cite_ids: list[str] = list(menu_citation_ids)
 
     candidates_by_slot = {
@@ -594,7 +576,7 @@ def _build_success_payload(
         selection: CourseSelection | None = None
         if entry is not None:
             item_id = entry.get("knowledge_item_id", "")
-            citation_ids = [c for c in _as_list(entry.get("citation_ids")) if isinstance(c, str)]
+            citation_ids = [c for c in as_list(entry.get("citation_ids")) if isinstance(c, str)]
             for cid in citation_ids:
                 if cid not in used_cite_ids:
                     used_cite_ids.append(cid)
@@ -714,13 +696,3 @@ def _synthetic_debug(request: SearchRequest) -> SearchDebug:
         merged_chunks=0,
         grouped_items=0,
     )
-
-
-def _as_list(value: Any) -> list[Any]:
-    """Coerce a model-supplied field to a list (``[]`` for anything non-list).
-
-    ``parse_error is None`` guarantees a JSON *object*, not a schema-conforming one,
-    so a wrong-typed field must degrade to a validation failure rather than an
-    ``AttributeError``/``TypeError`` escaping as a 500.
-    """
-    return value if isinstance(value, list) else []

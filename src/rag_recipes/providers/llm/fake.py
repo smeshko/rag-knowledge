@@ -32,7 +32,8 @@ __all__ = ["FakeLLMProvider"]
 
 
 class FakeLLMProvider(LLMProvider):
-    """LLM provider returning canned structured output keyed on a request hash.
+    """LLM provider returning canned structured output keyed on a request hash,
+    then on ``schema_version``, then ``default_output``.
 
     Exposes ``provider`` (class attr) and ``default_model`` (instance attr) so it
     satisfies the same ``provider.provider`` / ``provider.default_model`` contract
@@ -50,6 +51,10 @@ class FakeLLMProvider(LLMProvider):
         fail_technically: bool = False,
         default_usage: TokenUsage | None = None,
         default_output: dict[str, Any] | StructuredOutputResponse | None = None,
+        responses_by_schema_version: dict[
+            str, dict[str, Any] | StructuredOutputResponse | LLMTechnicalError
+        ]
+        | None = None,
     ) -> None:
         self.default_model = default_model
         self._responses_by_hash: dict[str, dict[str, Any] | StructuredOutputResponse] = (
@@ -62,6 +67,13 @@ class FakeLLMProvider(LLMProvider):
         self._default_output: dict[str, Any] | StructuredOutputResponse | None = copy.deepcopy(
             default_output
         )
+        # Keyed on ``schema_version`` for consumers that make several differently
+        # shaped calls per operation (menus: plan, then selection). An
+        # ``LLMTechnicalError`` value raises for that call only, so each safe-
+        # fallback path can be exercised on its own. Exact-hash matches win.
+        self._responses_by_schema_version: dict[
+            str, dict[str, Any] | StructuredOutputResponse | LLMTechnicalError
+        ] = copy.deepcopy(responses_by_schema_version or {})
         self._calls: list[StructuredOutputRequest] = []
 
     @staticmethod
@@ -94,7 +106,12 @@ class FakeLLMProvider(LLMProvider):
         if self._fail_technically:
             raise LLMTechnicalError("fake technical failure")
 
+        canned: dict[str, Any] | StructuredOutputResponse | LLMTechnicalError | None
         canned = self._responses_by_hash.get(self.request_hash(request))
+        if canned is None:
+            canned = self._responses_by_schema_version.get(request.schema_version)
+        if isinstance(canned, LLMTechnicalError):
+            raise canned
         if canned is None:
             if self._default_output is None:
                 raise LookupError(

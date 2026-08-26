@@ -23,6 +23,7 @@ from rag_recipes.answers.service import generate_answer
 from rag_recipes.api.dependencies import (
     get_embedding_provider,
     get_llm_provider,
+    get_reranker_provider,
     get_session,
     get_settings,
 )
@@ -35,6 +36,7 @@ from rag_recipes.api.schemas.answers import (
 from rag_recipes.config import Settings
 from rag_recipes.providers.embeddings.base import EmbeddingProvider
 from rag_recipes.providers.llm.base import LLMProvider
+from rag_recipes.providers.reranker.base import RerankerProvider
 from rag_recipes.retrieval.types import SearchRequest
 
 router = APIRouter(tags=["answers"])
@@ -51,6 +53,7 @@ async def answer(
     settings: Settings = Depends(get_settings),  # noqa: B008
     embedding_provider: EmbeddingProvider = Depends(get_embedding_provider),  # noqa: B008
     llm_provider: LLMProvider = Depends(get_llm_provider),  # noqa: B008
+    reranker: RerankerProvider | None = Depends(get_reranker_provider),  # noqa: B008
 ) -> Any:
     if not body.query.strip():
         raise ApiError(
@@ -98,6 +101,7 @@ async def answer(
         llm_provider=llm_provider,
         embedding_provider=embedding_provider,
         settings=settings,
+        reranker=reranker,
     )
 
     # Dev-only answer debug, gated exactly like the search debug (doc 8 § 11): present

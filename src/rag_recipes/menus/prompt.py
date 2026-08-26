@@ -27,6 +27,7 @@ from dataclasses import asdict
 
 from rag_recipes.answers.context_pack import ContextPack
 from rag_recipes.answers.prompt import GROUNDING_RULES
+from rag_recipes.answers.shared import allowed_ids_footer
 from rag_recipes.menus.types import Course, MenuPlan
 
 __all__ = [
@@ -129,15 +130,6 @@ def render_menu_selection_input(
         candidates = ", ".join(ids) if ids else "(no candidates)"
         lines.append(f'- {course.slot}: searched "{course.query}"{note} — candidates: {candidates}')
 
-    allowed_citation_ids: list[str] = []
-    allowed_item_ids: list[str] = []
-    for item in pack.items:
-        if item.knowledge_item_id not in allowed_item_ids:
-            allowed_item_ids.append(item.knowledge_item_id)
-        for citation in item.citations:
-            if citation.citation_id not in allowed_citation_ids:
-                allowed_citation_ids.append(citation.citation_id)
-
     theme_line = f"Menu theme: {plan.theme}\n" if plan.theme else ""
     return (
         f"{MENU_SELECTION_PROMPT}\n\n"
@@ -145,8 +137,7 @@ def render_menu_selection_input(
         f"{theme_line}\n"
         f"Courses to fill (in order):\n" + "\n".join(lines) + "\n\n"
         f"Context pack:\n{pack_json}\n\n"
-        f"Allowed citation IDs: {', '.join(allowed_citation_ids) or '(none)'}\n"
-        f"Allowed knowledge_item_ids: {', '.join(allowed_item_ids) or '(none)'}"
+        f"{allowed_ids_footer(pack)}"
     )
 
 
