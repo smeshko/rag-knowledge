@@ -1,9 +1,8 @@
 # Deploying Stove to recipes.ivot.dev
 
-Home-server deployment: the whole app is published through the existing
-`adw-webhook` cloudflared tunnel as `https://recipes.ivot.dev`, gated by
-Cloudflare Access. **The backend is not exposed** — it is reachable only via
-Caddy, on loopback.
+Home-server deployment: the whole app is published through a cloudflared
+tunnel as `https://recipes.ivot.dev`, gated by Cloudflare Access. **The
+backend is not exposed** — it is reachable only via Caddy, on loopback.
 
 ## Shape
 
@@ -13,13 +12,12 @@ browser
   ▼
 Cloudflare edge ── Access policy (email allow-list) ── denies anonymous requests here
   │
-  ▼  tunnel: adw-webhook
-cloudflared (this machine, ~/.cloudflared/config.yml)
+  ▼  cloudflared tunnel (this machine)
   │  http://127.0.0.1:8090      ← the ONLY origin for this hostname
   ▼
 Caddy (deploy/Caddyfile, bound to 127.0.0.1)
   ├── /api/*  → 127.0.0.1:8004   + Authorization: Bearer <token> injected here
-  └── /*      → rag-recipes-fe/dist  (SPA, index.html fallback)
+  └── /*      → the frontend's dist/  (SPA, index.html fallback)
                      │
                      ▼
               uvicorn :8004  ─ postgres 127.0.0.1:5435
@@ -32,38 +30,46 @@ no CORS and no preflight, and Access's redirect-to-login never breaks an XHR
 a 302). It also means the token is injected server-side and never ships in the
 bundle.
 
-## Ports on this machine
+## Ports
 
 | Port | Owner | Exposed? |
 |---|---|---|
-| 8090 | Caddy (recipes front) | yes — the tunnel origin for `recipes.ivot.dev` |
-| 8004 | rag-recipes API (uvicorn) | no — loopback only, absent from the tunnel ingress |
-| 5435 | recipes Postgres | no |
-| 6379 | recipes Redis | no |
+| 8090 | Caddy (front) | yes — the tunnel origin for `recipes.ivot.dev` |
+| 8004 | API (uvicorn) | no — loopback only, absent from the tunnel ingress |
+| 5435 | Postgres | no |
+| 6379 | Redis | no |
 | 3002 / 9090 / 9091 | Langfuse, MinIO (opt-in) | no |
 
-Two collisions were designed around, both live:
+Make sure nothing else on the machine is bound to these before starting. In
+particular, **never put the API's port in the tunnel ingress** — anything
+routed there is published without Access in front, and the API's own bearer
+check is the only thing behind it.
 
-- **8001** is `webhook.ivot.dev` in the tunnel (adw). Anything listening there
-  is published to the internet with no Access in front, so the API moved to
-  **8004**.
-- **5433** is `life-organizer-db`, started earlier by `start-services.sh`, so
-  the recipes Postgres moved to **5435**.
+## Files
+
+- `deploy/Caddyfile` — the tunnel origin. Machine-specific paths come from the
+  environment: `RAG_RECIPES_FE_DIST` (the frontend build) and
+  `RAG_RECIPES_LOG_DIR` (its log). Nothing in the file is host-specific.
+- `deploy/start-recipes.sh` — starts (or confirms) postgres + redis, the API,
+  the worker and Caddy; idempotent; writes `recipes-{be,worker,caddy}.{log,pid}`
+  into `RAG_RECIPES_LOG_DIR`. Its header lists every variable it reads and
+  the defaults.
 
 ## Secrets
 
 One secret, in two places that must agree:
 
 - `PERSONAL_API_TOKEN` in `rag-knowledge/.env` — what the API checks.
-- login keychain item `rag-recipes-token` — what `start-services.sh` reads and
-  hands to Caddy as `RAG_RECIPES_TOKEN`.
+- `RAG_RECIPES_TOKEN` in Caddy's environment — what it injects.
+  `start-recipes.sh` takes it from the environment, or falls back to the macOS
+  login keychain item `rag-recipes-token`.
 
 Rotate both together:
 
 ```sh
 TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 security add-generic-password -a "$USER" -s rag-recipes-token -w "$TOKEN" -U
-# then set PERSONAL_API_TOKEN=$TOKEN in rag-knowledge/.env and restart both
+# then set PERSONAL_API_TOKEN=$TOKEN in rag-knowledge/.env and restart the API + Caddy
 ```
 
 For local development the frontend's Vite proxy plays Caddy's role, injecting
@@ -80,8 +86,8 @@ export RAG_RECIPES_TOKEN="$(security find-generic-password -a "$USER" -s rag-rec
 cd rag-recipes-fe && just build          # Caddy serves dist/ directly; no restart needed
 
 # backend
-kill "$(cat ~/Developer/logs/recipes-be.pid)"
-~/Developer/start-services.sh            # idempotent; restarts only what is down
+kill "$(cat "${RAG_RECIPES_LOG_DIR:-$HOME/Developer/logs}/recipes-be.pid")"
+rag-knowledge/deploy/start-recipes.sh    # idempotent; restarts only what is down
 ```
 
 Migrations: `cd rag-knowledge && uv run alembic upgrade head`.
@@ -105,18 +111,19 @@ Migrations: `cd rag-knowledge && uv run alembic upgrade head`.
 
   The dropzone in the UI is the convenience path for when you are away from
   home, not the only way in.
-- **100 s origin timeout** (error 524). `/answers` is a synchronous LLM call;
-  a slow generation can trip this. Ingestion is unaffected — uploads return
-  immediately and the arq worker does the extraction out of band.
-- Access sessions are per-application; the policy on `recipes.ivot.dev` does
-  not affect `webhook.ivot.dev`, `ssh.ivot.dev` or the other hostnames.
+- **100 s origin timeout** (error 524). `/answers` and `/menus` are
+  synchronous LLM calls; a slow generation can trip this. Ingestion is
+  unaffected — uploads return immediately and the arq worker does the
+  extraction out of band.
+- Access sessions are per-application: the policy on this hostname affects
+  only this hostname.
 
 ## If it breaks
 
 | Symptom | Cause |
 |---|---|
-| 502 from the edge | Caddy is down — `tail ~/Developer/logs/recipes-caddy.log` |
+| 502 from the edge | Caddy is down — `tail $RAG_RECIPES_LOG_DIR/recipes-caddy.log` |
 | App loads, every API call 401 | Caddy started without `RAG_RECIPES_TOKEN`, or it drifted from `.env` |
 | 400 on every request | Caddy site address regressed to a host-matching form; it must stay `:8090` + `bind 127.0.0.1`, because cloudflared forwards `Host: recipes.ivot.dev` |
-| Uploads never finish | arq worker is down — `tail ~/Developer/logs/recipes-worker.log` |
-| Whole site unreachable | laptop asleep or off the network; `caffeinate` only covers sleep |
+| Uploads never finish | arq worker is down — `tail $RAG_RECIPES_LOG_DIR/recipes-worker.log` |
+| Whole site unreachable | machine asleep or off the network; `caffeinate` only covers sleep |

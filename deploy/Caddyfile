@@ -22,8 +22,10 @@
 :8090 {
 	bind 127.0.0.1
 
+	# Paths come from the environment (deploy/start-recipes.sh exports them),
+	# so this file carries nothing machine-specific. See DEPLOY.md.
 	log {
-		output file /Users/itsonev/Developer/logs/recipes-caddy.log
+		output file {$RAG_RECIPES_LOG_DIR}/recipes-caddy.log
 		format console
 	}
 
@@ -32,7 +34,7 @@
 	# Backend. `header_up` SETS the header, so a client-supplied Authorization
 	# is replaced rather than passed through — the browser never sees or
 	# supplies the token. Caddy reads it from its own environment; start it
-	# with RAG_RECIPES_TOKEN exported (see ~/Developer/start-services.sh).
+	# with RAG_RECIPES_TOKEN exported (deploy/start-recipes.sh does).
 	#
 	# Only /api/* is routed here, which also means /openapi.json, /docs and
 	# /redoc stay unreachable through the tunnel — FastAPI registers those as
@@ -53,7 +55,7 @@
 	# SPA fallback — /library and /recipes/:id are client-side routes with no
 	# file behind them, and would 404 without it.
 	handle {
-		root * /Users/itsonev/Developer/Projects/recipes/rag-recipes-fe/dist
+		root * {$RAG_RECIPES_FE_DIST}
 
 		# Vite content-hashes everything under /assets, so it is safe to cache
 		# forever; index.html must not be, or a deploy never reaches the browser.
