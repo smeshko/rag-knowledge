@@ -206,6 +206,49 @@ def test_version_constants() -> None:
     assert SCHEMA_VERSION == "recipe.v1"
 
 
+# Fingerprint of the model-facing schema under PROMPT_VERSION "recipe-extraction-v2":
+# every (path, type) leaf of build_recipe_v1_json_schema(). A change here means the
+# model sees a different request, which must bump PROMPT_VERSION (the cache key)
+# and then update this pin — see the comment block above PROMPT_VERSION.
+def _schema_leaves(node: object, path: str = "") -> set[str]:
+    leaves: set[str] = set()
+    if isinstance(node, dict):
+        props = node.get("properties")
+        if isinstance(props, dict):
+            for name, sub in props.items():
+                leaves |= _schema_leaves(sub, f"{path}/{name}")
+        elif "items" in node:
+            leaves |= _schema_leaves(node["items"], f"{path}[]")
+        elif "anyOf" in node:
+            for sub in node["anyOf"]:
+                leaves |= _schema_leaves(sub, path)
+        elif "$ref" in node:
+            leaves.add(f"{path}:{node['$ref']}")
+        else:
+            leaves.add(f"{path}:{node.get('type')}")
+        for name, sub in (node.get("$defs") or {}).items():
+            leaves |= _schema_leaves(sub, f"$defs/{name}")
+    return leaves
+
+
+_MODEL_FACING_SCHEMA_FINGERPRINT_V2 = (
+    "recipe-extraction-v2",
+    "cf47001b65b115da",
+)
+
+
+def test_model_facing_schema_is_pinned_to_prompt_version() -> None:
+    import hashlib
+
+    leaves = "\n".join(sorted(_schema_leaves(build_recipe_v1_json_schema())))
+    fingerprint = hashlib.sha256(leaves.encode()).hexdigest()[:16]
+    assert (PROMPT_VERSION, fingerprint) == _MODEL_FACING_SCHEMA_FINGERPRINT_V2, (
+        "the model-facing JSON schema changed: bump PROMPT_VERSION (it is the "
+        "extraction cache key) and re-pin _MODEL_FACING_SCHEMA_FINGERPRINT_V2 to "
+        f"({PROMPT_VERSION!r}, {fingerprint!r})"
+    )
+
+
 def test_pre_trim_payloads_still_validate() -> None:
     # Every ExtractionRun committed before the trim carries ingredients_text,
     # steps_text and the five-axis ingredient confidence. The extraction cache
@@ -227,6 +270,17 @@ def test_pre_trim_payloads_still_validate() -> None:
     parsed = RecipeExtractionOutput.model_validate(payload)
     ingredient = parsed.items[0].structured_data.ingredients[0]
     assert ingredient.confidence.normalization == 0.8
+
+
+def test_retired_v1_template_is_kept_but_not_loaded() -> None:
+    from importlib.resources import files
+
+    from rag_recipes.ingestion.pipeline import extraction
+
+    retired = files(extraction._PROMPT_PACKAGE).joinpath("recipe_extraction_v1.md")
+    assert retired.is_file()
+    assert "recipe-extraction-v1" in retired.read_text()
+    assert extraction._PROMPT_RESOURCE == "recipe_extraction_v2.md"
 
 
 def test_prompt_template_loads_non_empty() -> None:

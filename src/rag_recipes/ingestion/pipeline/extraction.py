@@ -58,8 +58,21 @@ logger = logging.getLogger(__name__)
 
 # LLM API contract versions — module constants, NOT ``Settings`` (DECISIONS #3).
 # They feed ``compute_input_hash`` and every ``ExtractionRun`` row, so they must
-# travel atomically with the prompt template / schema code they describe. A
-# meaningful change to either the prompt or the schema shape must bump these.
+# travel atomically with the prompt template / schema code they describe.
+#
+# The two constants version two DIFFERENT things (DECISIONS.md #18):
+#
+# - ``PROMPT_VERSION`` versions everything the MODEL sees: the template text AND
+#   the model-facing JSON schema (``build_recipe_v1_json_schema()``). Any change
+#   to either — instructions, field set, descriptions, nullability — bumps it.
+#   ``test_model_facing_schema_is_pinned_to_prompt_version`` fails on a schema
+#   change until this is bumped.
+# - ``SCHEMA_VERSION`` versions the PAYLOAD consumers read: the value in
+#   ``structured_data.schema``. It bumps only when what a reader of stored items
+#   can rely on changes.
+#
+# Retired templates stay in ``prompts/`` (``recipe_extraction_v1.md``) so rows
+# carrying an older ``prompt_version`` can be re-rendered from source.
 PROMPT_VERSION = "recipe-extraction-v2"
 # Deliberately NOT bumped alongside PROMPT_VERSION for the TOKEN BUDGET trim.
 # This constant is the *payload* contract consumers read — it is the value
