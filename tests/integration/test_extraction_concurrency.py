@@ -288,8 +288,26 @@ async def test_provider_failure_still_raises_under_concurrency(
             observability=None,
         )
 
-    # Siblings were dispatched rather than abandoned to the first failure.
+    # Siblings were dispatched rather than abandoned to the first failure...
     assert len(provider.calls) == 4
+    # ...and their results were *committed*, not rolled back with the failure:
+    # a SUCCESS row only feeds the extraction cache once it survives a commit,
+    # so a resume must find three cached windows plus the one FAILED audit row.
+    async with session_factory() as session:
+        runs = (
+            (
+                await session.execute(
+                    select(ExtractionRun).where(ExtractionRun.document_id == document_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    failed = sum(1 for r in runs if r.status is ExtractionRunStatus.FAILED)
+    succeeded = sum(1 for r in runs if r.status is ExtractionRunStatus.SUCCESS)
+    expected_failures = sum(1 for call in provider.calls if "Page 3" in call)
+    assert failed == expected_failures >= 1
+    assert succeeded == len(provider.calls) - expected_failures >= 1
 
 
 async def test_cache_hits_never_reach_the_provider(

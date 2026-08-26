@@ -331,20 +331,27 @@ async def _run_extraction_batches(
             outcomes = iter(await asyncio.gather(*(_call(w) for w in to_call)))
 
             # Phase 2 — sequential writes in window order, exactly as before.
-            # record_window_extraction re-raises a captured LLMTechnicalError
-            # after writing its FAILED row, so a provider failure still aborts the
-            # job; gathering first only means the siblings' results are not lost
-            # to whichever window happened to fail first.
+            # A provider failure still aborts the job, but only *after* the whole
+            # batch is recorded and committed: the siblings' SUCCESS rows are
+            # paid for, and they only enter the extraction cache once committed.
+            # Raising mid-loop would roll them back with the transaction and
+            # spend them again on resume — the exact waste gathering was meant
+            # to avoid. The first captured error is re-raised after the commit.
+            first_error: LLMTechnicalError | None = None
             for index, window in enumerate(pending):
                 run = cached_runs.get(index)
                 if run is None:
+                    outcome = next(outcomes)
                     run = await record_window_extraction(
                         session,
-                        next(outcomes),
+                        outcome,
                         source_version=source_version,
                         document_id=document_id,
                         provider=provider,
+                        raise_on_error=False,
                     )
+                    if outcome.error is not None and first_error is None:
+                        first_error = outcome.error
                 if run.status is not ExtractionRunStatus.SUCCESS or run.output_json is None:
                     continue
                 parsed = RecipeExtractionOutput.model_validate(run.output_json)
@@ -380,6 +387,8 @@ async def _run_extraction_batches(
                 .values(last_progress_at=func.now())
             )
             await session.commit()
+            if first_error is not None:
+                raise first_error
     return frozenset(reextracted)
 
 

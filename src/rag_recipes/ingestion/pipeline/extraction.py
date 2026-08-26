@@ -323,8 +323,12 @@ class WindowExtraction:
 
     ``error`` is a captured ``LLMTechnicalError`` rather than a raised one:
     ``asyncio.gather`` would otherwise lose the other windows' results to the
-    first failure. ``record_window_extraction`` re-raises it after writing the
-    ``FAILED`` audit row, preserving ``run_extraction``'s contract.
+    first failure. ``record_window_extraction`` writes the ``FAILED`` audit row
+    and, by default, re-raises it — ``run_extraction``'s contract. The batch loop
+    passes ``raise_on_error=False`` so every sibling's row (SUCCESS included) is
+    recorded and committed first, and the failure is re-raised only after the
+    batch commit; otherwise the paid-for sibling results would roll back with
+    the transaction and never reach the extraction cache.
     """
 
     window: Window
@@ -372,12 +376,17 @@ async def record_window_extraction(
     source_version: int,
     document_id: str,
     provider: LLMProvider,
+    raise_on_error: bool = True,
 ) -> ExtractionRun:
     """Write ``outcome``'s ``ExtractionRun`` and resolve it to a terminal status.
 
     The write half of the split — must run sequentially on the caller's session.
     Statuses and the re-raise-after-recording behaviour match ``run_extraction``
     exactly, because ``run_extraction`` is now implemented in terms of this.
+
+    ``raise_on_error=False`` returns the ``FAILED`` run instead of raising, for a
+    caller that must finish recording a whole batch before it aborts; the caller
+    then owns re-raising ``outcome.error``.
     """
     run = ExtractionRun(
         document_id=document_id,
@@ -397,7 +406,9 @@ async def record_window_extraction(
     if outcome.error is not None:
         _finalize(run, status=ExtractionRunStatus.FAILED, error=str(outcome.error))
         await session.flush()
-        raise outcome.error
+        if raise_on_error:
+            raise outcome.error
+        return run
 
     response = outcome.response
     assert response is not None  # noqa: S101 - error is None, so response is set
