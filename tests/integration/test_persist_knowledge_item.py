@@ -20,7 +20,7 @@ from rag_recipes.ingestion.pipeline.extraction import (
 )
 from rag_recipes.ingestion.pipeline.persist import persist_knowledge_item
 from rag_recipes.ingestion.pipeline.windows import Window, compute_input_hash
-from rag_recipes.ingestion.validation import HardValidationError, SoftValidationThresholds
+from rag_recipes.ingestion.validation import HardValidationError
 from rag_recipes.storage.enums import (
     DocumentStatus,
     ExtractionRunStatus,
@@ -33,6 +33,7 @@ from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 from rag_recipes.storage.models.source_span import SourceSpan
 from rag_recipes.storage.repositories.documents import DocumentRepository
+from tests.thresholds import thresholds
 from tests.unit.ingestion.test_validation import (
     _make_recipe,
     _make_step,
@@ -44,16 +45,7 @@ pytestmark = pytest.mark.asyncio
 
 SOURCE_VERSION = 1
 
-_THRESHOLDS = SoftValidationThresholds(
-    min_overall_confidence=0.5,
-    min_boundary_confidence=0.5,
-    min_normalization_confidence=0.5,
-    min_recipe_chars=200,
-    max_recipe_chars=20000,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
-    assembly_max_chars=400,
-)
+_THRESHOLDS = thresholds()
 
 
 def _make_span(document_id: str, page: int, text: str) -> SourceSpan:
@@ -195,9 +187,9 @@ async def test_persist_three_outcomes_and_jsonb_round_trip(db_session: AsyncSess
 
     # Exactly the two valid candidates were inserted (hard-fail added nothing).
     count = await db_session.scalar(
-        select(func.count()).select_from(KnowledgeItem).where(
-            KnowledgeItem.document_id == document_id
-        )
+        select(func.count())
+        .select_from(KnowledgeItem)
+        .where(KnowledgeItem.document_id == document_id)
     )
     assert count == 2
 

@@ -22,20 +22,11 @@ from rag_recipes.ingestion.pipeline.extraction import (
     build_recipe_v1_json_schema,
 )
 from rag_recipes.ingestion.pipeline.windows import format_window_for_llm
-from rag_recipes.ingestion.validation import SoftValidationThresholds
 from rag_recipes.providers.llm.fake import FakeLLMProvider
 from rag_recipes.providers.llm.types import StructuredOutputRequest
+from tests.thresholds import thresholds
 
-THRESHOLDS = SoftValidationThresholds(
-    min_overall_confidence=0.5,
-    min_boundary_confidence=0.5,
-    min_normalization_confidence=0.5,
-    min_recipe_chars=50,
-    max_recipe_chars=20_000,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
-    assembly_max_chars=400,
-)
+THRESHOLDS = thresholds(min_recipe_chars=50)
 
 JUDGE_PROMPT = (
     "# Summary quality judge\n"

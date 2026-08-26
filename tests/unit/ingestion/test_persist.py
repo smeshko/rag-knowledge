@@ -17,9 +17,10 @@ from sqlalchemy import inspect
 from sqlalchemy.orm.attributes import set_committed_value
 
 from rag_recipes.ingestion.pipeline.persist import normalize_title, persist_knowledge_item
-from rag_recipes.ingestion.validation import HardValidationError, SoftValidationThresholds
+from rag_recipes.ingestion.validation import HardValidationError
 from rag_recipes.storage.enums import KnowledgeItemStatus
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
+from tests.thresholds import thresholds
 from tests.unit.ingestion.test_validation import (
     _make_recipe,
     _make_structured_data,
@@ -27,16 +28,7 @@ from tests.unit.ingestion.test_validation import (
     _recipe_confidence,
 )
 
-_THRESHOLDS = SoftValidationThresholds(
-    min_overall_confidence=0.5,
-    min_boundary_confidence=0.5,
-    min_normalization_confidence=0.5,
-    min_recipe_chars=200,
-    max_recipe_chars=20000,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
-    assembly_max_chars=400,
-)
+_THRESHOLDS = thresholds()
 
 
 # --- normalize_title -------------------------------------------------------

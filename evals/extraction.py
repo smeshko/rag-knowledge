@@ -553,7 +553,7 @@ async def run_extraction_eval(
             fixture_set,
         )
     if thresholds is None or settings is None:
-        from rag_recipes.config import get_settings
+        from rag_recipes.config import Settings, get_settings
 
         real_settings = get_settings()
         if settings is None:
@@ -562,8 +562,12 @@ async def run_extraction_eval(
             # Delegate rather than re-list the fields: this block drifted out of
             # sync the moment ingest grew a threshold (the assembly-recipe
             # bounds), and an eval scoring against different thresholds than
-            # ingest uses is measuring the wrong pipeline.
-            thresholds = thresholds_from_settings()
+            # ingest uses is measuring the wrong pipeline. A caller passing a
+            # real Settings is honoured; a report-only SettingsLike stand-in
+            # (no extraction_* fields) falls back to the environment.
+            thresholds = thresholds_from_settings(
+                settings if isinstance(settings, Settings) else None
+            )
 
     fixtures = load_recipe_fixtures(fixture_set, root=fixtures_root)
     if not fixtures:

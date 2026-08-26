@@ -27,13 +27,13 @@ from rag_recipes.ingestion.validation import (
     ASSEMBLY_RECIPE_NOTE,
     HardValidationError,
     HardValidationFailure,
-    SoftValidationThresholds,
     SoftValidationWarning,
     validate_hard,
     validate_soft,
     validation_notes,
 )
 from rag_recipes.storage.models.source_span import SourceSpan
+from tests.thresholds import thresholds
 
 
 def _make_span(page: int, text: str | None = None) -> SourceSpan:
@@ -204,16 +204,7 @@ def test_hard_validation_error_carries_failures() -> None:
 # --- soft validation -------------------------------------------------------
 
 # Defaults mirror Settings: 0.5 confidence floors, 200..20000 char bounds.
-_THRESHOLDS = SoftValidationThresholds(
-    min_overall_confidence=0.5,
-    min_boundary_confidence=0.5,
-    min_normalization_confidence=0.5,
-    min_recipe_chars=200,
-    max_recipe_chars=20000,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
-    assembly_max_chars=400,
-)
+_THRESHOLDS = thresholds()
 
 
 def _soft_codes(warnings: list[SoftValidationWarning]) -> list[str]:

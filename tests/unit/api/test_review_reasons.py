@@ -29,7 +29,8 @@ from rag_recipes.ingestion.pipeline.extraction import (
     RecipeFieldConfidence,
     RecipeV1StructuredData,
 )
-from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
+from rag_recipes.ingestion.validation import validate_soft
+from tests.thresholds import thresholds
 
 
 def test_needs_review_known_codes_project_code_and_message() -> None:
@@ -125,16 +126,7 @@ def test_soft_warning_messages_covers_every_declared_code() -> None:
     assert declared == set(SOFT_WARNING_MESSAGES)
 
 
-_THRESHOLDS = SoftValidationThresholds(
-    min_overall_confidence=0.5,
-    min_boundary_confidence=0.5,
-    min_normalization_confidence=0.5,
-    min_recipe_chars=10,
-    max_recipe_chars=50,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
-    assembly_max_chars=400,
-)
+_THRESHOLDS = thresholds(min_recipe_chars=10, max_recipe_chars=50)
 
 
 def _confidence(overall: float, boundary: float) -> RecipeConfidence:

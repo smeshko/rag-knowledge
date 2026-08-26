@@ -61,7 +61,7 @@ curl -H "Authorization: Bearer $PERSONAL_API_TOKEN" http://localhost:8004/api/v1
 
 - **Auth is `claude /login`, not a key.** Whoever runs the worker must have a logged-in CLI on `PATH` (or set `CLAUDE_CLI_BINARY`). `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are stripped from the subprocess env so an exported key can never silently bill these calls to the API.
 - **Pin an exact model.** `CLAUDE_CLI_MODEL` is part of the extraction cache key; an alias like `opus` that drifts to a new version invalidates every cached window.
-- **Windows extract sequentially**, roughly 35 s each on `claude-opus-5`, against about `pages / 2` windows per book. Budget hours per cookbook and keep `DOCUMENT_JOB_TIMEOUT_SECONDS` above that; the per-batch heartbeat keeps `sweep_stuck_jobs` from reaping a healthy long run.
+- **Windows extract sequentially by default** (`EXTRACTION_MAX_CONCURRENT_WINDOWS=1`; raising it fans out the provider call inside each commit batch, up to `EXTRACTION_COMMIT_BATCH_SIZE`), roughly 35 s each on `claude-opus-5`, against about `pages / 2` windows per book. Budget hours per cookbook and keep `DOCUMENT_JOB_TIMEOUT_SECONDS` above that; the per-batch heartbeat keeps `sweep_stuck_jobs` from reaping a healthy long run.
 - **Quota exhaustion fails the document** rather than retrying — arq only re-drives on cancellation. Resume with `POST /documents/{id}/reprocess`; the extraction cache means already-extracted windows are not re-sent.
 - **`POST /documents/batch` returns 409** under this provider — the batch path is Anthropic-only. Ingest through `POST /documents`.
 

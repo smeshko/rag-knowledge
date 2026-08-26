@@ -13,16 +13,13 @@ from __future__ import annotations
 from rag_recipes.ingestion.editing import RecipeEdit, apply_edit
 from rag_recipes.ingestion.manual import authored_recipe, human_confidence
 from rag_recipes.ingestion.pipeline.composition import compose_body_text
-from rag_recipes.ingestion.validation import SoftValidationThresholds
+from tests.thresholds import thresholds
 
-THRESHOLDS = SoftValidationThresholds(
+THRESHOLDS = thresholds(
     min_overall_confidence=0.6,
     min_boundary_confidence=0.6,
     min_normalization_confidence=0.6,
     min_recipe_chars=50,
-    max_recipe_chars=20000,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
     assembly_max_chars=260,
 )
 

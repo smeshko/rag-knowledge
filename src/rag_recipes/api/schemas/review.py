@@ -74,9 +74,15 @@ class ReviewItemListResponse(BaseModel):
     review_items: list[ReviewItem]
 
 
-#: The same row, named for the surface that is not a review queue. One model,
-#: so a card rendered from either listing cannot drift.
-KnowledgeItemSummary = ReviewItem
+class KnowledgeItemSummary(ReviewItem):
+    """The same row as ``ReviewItem``, named for the surfaces that are not a
+    review queue (per-book listing, favourites).
+
+    A subclass rather than an alias so OpenAPI emits its own component: the
+    generated frontend types then name the row for what it is instead of
+    aliasing a schema named for the queue. No fields are added — one row shape,
+    so a card rendered from any listing cannot drift.
+    """
 
 
 class KnowledgeItemListResponse(BaseModel):

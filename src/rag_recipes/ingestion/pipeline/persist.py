@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.config import get_settings
+from rag_recipes.config import Settings, get_settings
 from rag_recipes.ingestion.pipeline.composition import normalize_title
 from rag_recipes.ingestion.pipeline.extraction import ExtractedRecipe
 from rag_recipes.ingestion.pipeline.windows import Window
@@ -49,15 +49,16 @@ from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 __all__ = ["normalize_title", "persist_knowledge_item", "thresholds_from_settings"]
 
 
-def thresholds_from_settings() -> SoftValidationThresholds:
-    """Build soft-validation thresholds from the application ``Settings``.
+def thresholds_from_settings(settings: Settings | None = None) -> SoftValidationThresholds:
+    """Build soft-validation thresholds from ``settings`` (default: the app ``Settings``).
 
     Used when the caller does not pass ``thresholds`` explicitly, and by the
     Epic 22.2 edit endpoint, which must re-derive warnings against exactly the
     thresholds ingest used. Tests pass their own value object, so they exercise
     ``persist_knowledge_item`` without needing a populated environment.
     """
-    settings = get_settings()
+    if settings is None:
+        settings = get_settings()
     return SoftValidationThresholds(
         min_overall_confidence=settings.extraction_min_overall_confidence,
         min_boundary_confidence=settings.extraction_min_boundary_confidence,

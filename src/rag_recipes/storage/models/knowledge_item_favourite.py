@@ -37,7 +37,9 @@ from rag_recipes.storage.base import Base
 class KnowledgeItemFavourite(Base):
     __tablename__ = "knowledge_item_favourites"
     __table_args__ = (
-        # Backs the GET /favourites ordering (created_at DESC, id DESC).
+        # Backs the GET /favourites ordering. The listing sorts by
+        # (created_at DESC, knowledge_item_id DESC); this single-column index
+        # serves the leading key and the PK breaks the (rare) timestamp ties.
         sa.Index(
             "ix_knowledge_item_favourites_created_at",
             sa.text("created_at DESC"),

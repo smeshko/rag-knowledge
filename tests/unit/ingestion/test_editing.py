@@ -34,17 +34,14 @@ from rag_recipes.ingestion.pipeline.extraction import (
     RecipeFieldConfidence,
     RecipeV1StructuredData,
 )
-from rag_recipes.ingestion.validation import SoftValidationThresholds, validate_soft
+from rag_recipes.ingestion.validation import validate_soft
+from tests.thresholds import thresholds
 
-THRESHOLDS = SoftValidationThresholds(
+THRESHOLDS = thresholds(
     min_overall_confidence=0.6,
     min_boundary_confidence=0.6,
-    min_normalization_confidence=0.5,
     min_recipe_chars=80,
     max_recipe_chars=600,
-    assembly_min_ingredients=3,
-    assembly_max_ingredients=12,
-    assembly_max_chars=400,
 )
 
 LONG_BODY = "Tomato Soup\n\n" + ("a rich, slow-simmered tomato soup for a cold evening. " * 3)
@@ -746,17 +743,10 @@ def test_junk_in_a_persisted_row_never_raises(mutate: Any) -> None:
 
 
 def test_notes_for_item_tracks_the_assembly_exemption() -> None:
-    from rag_recipes.ingestion.validation import ASSEMBLY_RECIPE_NOTE, SoftValidationThresholds
+    from rag_recipes.ingestion.validation import ASSEMBLY_RECIPE_NOTE
 
-    thresholds = SoftValidationThresholds(
-        min_overall_confidence=0.0,
-        min_boundary_confidence=0.0,
-        min_normalization_confidence=0.0,
-        min_recipe_chars=200,
-        max_recipe_chars=20000,
-        assembly_min_ingredients=3,
-        assembly_max_ingredients=12,
-        assembly_max_chars=400,
+    bounds = thresholds(
+        min_overall_confidence=0.0, min_boundary_confidence=0.0, min_normalization_confidence=0.0
     )
     common = dict(
         title="Cheese board",
@@ -764,7 +754,7 @@ def test_notes_for_item_tracks_the_assembly_exemption() -> None:
         body_text="Cheese board\n\nbrie\ngrapes\ncrackers",
         source_span_ids=[],
         confidence={"overall": 0.9, "boundary": 0.9, "fields": {}},
-        thresholds=thresholds,
+        thresholds=bounds,
     )
     assembly = {
         "schema": "recipe.v1",
