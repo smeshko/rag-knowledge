@@ -86,3 +86,4 @@ just lint         # ruff + mypy
 
 - Architecture overview: [`docs/architecture/01-big-picture.md`](docs/architecture/01-big-picture.md)
 - Epic-by-epic implementation plan: [`docs/implementation/EPICS.md`](docs/implementation/EPICS.md)
+- Decisions made since `docs/` stopped being tracked: [`DECISIONS.md`](DECISIONS.md)
