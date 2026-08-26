@@ -196,11 +196,12 @@ def test_output_matches_editing_the_same_lines_into_an_empty_item() -> None:
         ),
     )
 
-    # `warnings` / `validation_notes` are the keys the create path adds on top.
+    # `warnings` / `validation_notes` / `validation_thresholds` are the keys the
+    # create path adds on top.
     assert {
         key: value
         for key, value in created.structured_data.items()
-        if key not in {"warnings", "validation_notes"}
+        if key not in {"warnings", "validation_notes", "validation_thresholds"}
     } == edited.structured_data
     assert created.title == edited.title
     assert created.normalized_title == edited.normalized_title

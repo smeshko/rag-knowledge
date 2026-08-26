@@ -17,7 +17,7 @@ return ``needs_review`` items — they are never chunked, and retrieval floors a
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from rag_recipes.api.schemas.knowledge_items import ReviewReason, ReviewThresholds
 from rag_recipes.ingestion.validation import SoftValidationThresholds
@@ -91,8 +91,33 @@ def _normalization_detail(
     return lowest, below
 
 
+ThresholdSource = Literal["recorded", "current"]
+
+
+def thresholds_for_item(
+    structured_data: dict[str, Any] | None,
+    *,
+    current: SoftValidationThresholds,
+) -> tuple[SoftValidationThresholds, ThresholdSource]:
+    """The bounds this item's warnings were judged against, and where they came from.
+
+    ``recorded`` — read back from ``structured_data["validation_thresholds"]``,
+    the snapshot persist/edit wrote when the warnings were derived. ``current`` —
+    the row predates the snapshot (or it is malformed), so the live Settings
+    stand in; a reason's ``threshold`` may then differ from the one that fired.
+    """
+    recorded = SoftValidationThresholds.from_record(
+        (structured_data or {}).get("validation_thresholds")
+    )
+    if recorded is not None:
+        return recorded, "recorded"
+    return current, "current"
+
+
 def build_review_thresholds(
-    status: str, thresholds: SoftValidationThresholds | None
+    status: str,
+    thresholds: SoftValidationThresholds | None,
+    source: ThresholdSource = "current",
 ) -> ReviewThresholds | None:
     """The bounds a reviewer is judging against; only for ``needs_review``."""
     if status != "needs_review" or thresholds is None:
@@ -101,6 +126,7 @@ def build_review_thresholds(
         overall=thresholds.min_overall_confidence,
         boundary=thresholds.min_boundary_confidence,
         normalization=thresholds.min_normalization_confidence,
+        source=source,
     )
 
 

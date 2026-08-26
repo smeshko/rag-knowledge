@@ -342,3 +342,35 @@ def test_review_thresholds_only_for_needs_review() -> None:
         0.5,
         0.5,
     )
+
+
+def test_thresholds_for_item_prefers_the_recorded_snapshot() -> None:
+    from dataclasses import replace
+
+    from rag_recipes.api.review_reasons import thresholds_for_item
+
+    current = replace(_THRESHOLDS, min_overall_confidence=0.9)
+    recorded = replace(_THRESHOLDS, min_overall_confidence=0.5)
+    structured = {"warnings": ["low_overall_confidence"]}
+
+    # Legacy row: no snapshot → current Settings, and the wire says so.
+    assert thresholds_for_item(structured, current=current) == (current, "current")
+    # Snapshot present → the bounds that actually fired win.
+    structured["validation_thresholds"] = recorded.to_record()
+    assert thresholds_for_item(structured, current=current) == (recorded, "recorded")
+    # Malformed snapshot degrades to current rather than 500ing the endpoint.
+    structured["validation_thresholds"] = {"min_overall_confidence": "x"}
+    assert thresholds_for_item(structured, current=current)[1] == "current"
+    structured["validation_thresholds"] = ["nope"]
+    assert thresholds_for_item(structured, current=current)[1] == "current"
+
+
+def test_review_thresholds_carry_their_source() -> None:
+    from rag_recipes.api.review_reasons import build_review_thresholds
+
+    built = build_review_thresholds("needs_review", _THRESHOLDS, "recorded")
+    assert built is not None
+    assert built.source == "recorded"
+    default = build_review_thresholds("needs_review", _THRESHOLDS)
+    assert default is not None
+    assert default.source == "current"

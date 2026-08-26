@@ -286,6 +286,7 @@ def authored_recipe(
         confidence=confidence,
         thresholds=thresholds,
     )
+    structured["validation_thresholds"] = thresholds.to_record()
     return AuthoredRecipe(
         title=edited.title,
         normalized_title=edited.normalized_title,

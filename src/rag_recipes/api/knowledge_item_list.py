@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rag_recipes.api.review_reasons import build_review_reasons
+from rag_recipes.api.review_reasons import build_review_reasons, thresholds_for_item
 from rag_recipes.api.schemas.review import (
     KnowledgeItemSummary,
     ReviewItemDocument,
@@ -75,7 +75,7 @@ async def build_summaries(
     # Resolved once per page, not per row: the bounds are settings-derived and
     # identical for every item, and `build_review_reasons` needs them to attach
     # the observed value/threshold aids to the three confidence codes.
-    thresholds = thresholds_from_settings()
+    current_thresholds = thresholds_from_settings()
     page_span_ids = {
         span_id for item, _, _ in rows for span_id in (item.source_span_ids or [])
     }
@@ -136,7 +136,7 @@ async def build_summaries(
                     item.status.value,
                     structured,
                     confidence=item.confidence,
-                    thresholds=thresholds,
+                    thresholds=thresholds_for_item(structured, current=current_thresholds)[0],
                 ),
                 edited_at=item.edited_at,
                 favourited_at=favourited_at_by_id.get(item.id),

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_recipes.api.review_reasons import (
     build_review_reasons,
     build_review_thresholds,
+    thresholds_for_item,
 )
 from rag_recipes.api.schemas.knowledge_items import (
     KnowledgeItemDetail,
@@ -98,9 +99,11 @@ async def build_knowledge_item_response(
     doc_title = document.title if document is not None else ""
     subtitle = f"{doc_title} · {primary_label}" if primary_label else (doc_title or None)
 
-    # Current bounds, not the ones ingest used (those are not persisted) — the
-    # reasons say so on the wire via `threshold`.
-    thresholds = thresholds_from_settings()
+    # The bounds the warnings were judged against — recorded with the item, or
+    # the current Settings for rows that predate the snapshot (`source` says).
+    thresholds, source = thresholds_for_item(
+        item.structured_data, current=thresholds_from_settings()
+    )
     return KnowledgeItemResponse(
         knowledge_item=KnowledgeItemDetail(
             id=item.id,
@@ -118,7 +121,7 @@ async def build_knowledge_item_response(
                 confidence=item.confidence,
                 thresholds=thresholds,
             ),
-            review_thresholds=build_review_thresholds(item.status.value, thresholds),
+            review_thresholds=build_review_thresholds(item.status.value, thresholds, source),
             edited_at=item.edited_at,
             favourited_at=favourited_at,
         ),

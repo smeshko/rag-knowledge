@@ -121,6 +121,9 @@ async def persist_knowledge_item(
         # Informational only — which rules waived a warning (e.g. the assembly
         # exemption). Never read for status; kept so evals can bucket the rows.
         "validation_notes": notes,
+        # The bounds these warnings were judged against, so the review surface
+        # can show what actually fired even after the tunables move.
+        "validation_thresholds": thresholds.to_record(),
     }
     if staging:
         status = KnowledgeItemStatus.EXTRACTING

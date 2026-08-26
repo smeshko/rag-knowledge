@@ -278,6 +278,7 @@ async def update_knowledge_item(
         structured_data=structured_before,
         edit=edit,
     )
+    thresholds = thresholds_from_settings()
     structured_after = {
         **edited.structured_data,
         "warnings": warnings_for_item(
@@ -287,7 +288,7 @@ async def update_knowledge_item(
             source_span_ids=list(item.source_span_ids or []),
             structured_data=edited.structured_data,
             confidence=item.confidence,
-            thresholds=thresholds_from_settings(),
+            thresholds=thresholds,
             item_type=item.item_type,
         ),
         "validation_notes": notes_for_item(
@@ -297,9 +298,11 @@ async def update_knowledge_item(
             source_span_ids=list(item.source_span_ids or []),
             structured_data=edited.structured_data,
             confidence=item.confidence,
-            thresholds=thresholds_from_settings(),
+            thresholds=thresholds,
             item_type=item.item_type,
         ),
+        # Re-judged now, so the snapshot moves to the bounds used now.
+        "validation_thresholds": thresholds.to_record(),
     }
 
     # The original extraction, captured on the FIRST edit only — COALESCE, not a

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -20,8 +20,10 @@ class ReviewReason(BaseModel):
     message: str
     # Reviewer aids (additive, all optional). ``value`` is the observed score the
     # rule fired on (overall / boundary / lowest ingredient normalization);
-    # ``threshold`` is the CURRENT configured bound it is compared against —
-    # thresholds are not persisted, so this may differ from the one ingest used.
+    # ``threshold`` is the bound it was compared against: the snapshot persisted
+    # with the item when its warnings were derived, or — for rows that predate
+    # the snapshot — the current configured value (``review_thresholds.source``
+    # says which).
     # ``ingredient_positions`` names the ingredient rows (their ``position``)
     # that sit below the normalization threshold, so the UI can mark them.
     value: float | None = None
@@ -30,13 +32,18 @@ class ReviewReason(BaseModel):
 
 
 class ReviewThresholds(BaseModel):
-    """The current soft-validation bounds, so the UI can mark per-line scores
-    (steps, fields) the item-level reasons do not individually name. Shipped
-    only on ``needs_review`` items."""
+    """The soft-validation bounds this item's reasons were judged against, so
+    the UI can mark per-line scores (steps, fields) the item-level reasons do
+    not individually name. Shipped only on ``needs_review`` items.
+
+    ``source`` is ``recorded`` when the bounds were read back from the snapshot
+    persisted with the item, ``current`` when the row predates that snapshot
+    and the live Settings stand in."""
 
     overall: float
     boundary: float
     normalization: float
+    source: Literal["recorded", "current"] = "current"
 
 
 class KnowledgeItemDetail(BaseModel):
@@ -55,7 +62,7 @@ class KnowledgeItemDetail(BaseModel):
     # Mapped from structured_data["warnings"] for needs_review items; [] otherwise
     # (Epic 21.1, D3).
     review_reasons: list[ReviewReason] = []
-    # Current thresholds for needs_review items; null otherwise.
+    # Thresholds the reasons were judged against, for needs_review items; null otherwise.
     review_thresholds: ReviewThresholds | None = None
     # When a reviewer last corrected this item in place; null means never edited
     # (Epic 22.2). Lets the queue mark an item as already corrected.

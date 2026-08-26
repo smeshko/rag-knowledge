@@ -198,8 +198,10 @@ async def test_needs_review_item_carries_review_reasons(
     assert all(r["message"] for r in reasons)
     # Reviewer aids: current bounds ride along for needs_review items only.
     thresholds = ki["review_thresholds"]
-    assert set(thresholds) == {"overall", "boundary", "normalization"}
-    assert all(0.0 <= v <= 1.0 for v in thresholds.values())
+    assert set(thresholds) == {"overall", "boundary", "normalization", "source"}
+    assert all(0.0 <= v <= 1.0 for k, v in thresholds.items() if k != "source")
+    # This row was seeded without a snapshot, so the live Settings stood in.
+    assert thresholds["source"] == "current"
     assert reasons[1]["threshold"] == thresholds["overall"]
     # The raw codes still round-trip verbatim in structured_data.
     assert ki["structured_data"]["warnings"] == [
@@ -287,11 +289,37 @@ async def test_missing_token_returns_401(
     app.dependency_overrides[get_session] = _override_session
     transport = httpx.ASGITransport(app=app)
     try:
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as c:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
             resp = await c.get(f"/api/v1/knowledge-items/{item_id}")
     finally:
         app.dependency_overrides.pop(get_session, None)
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_recorded_thresholds_win_over_current_settings(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """The bounds persisted with the item are what the reviewer sees, even
+    when the tunables have since moved (doc 11 §6)."""
+    from rag_recipes.ingestion.pipeline.persist import thresholds_from_settings
+
+    current = thresholds_from_settings()
+    recorded = current.to_record()
+    recorded["min_overall_confidence"] = 0.123  # deliberately not a live value
+    structured = dict(_FULL_STRUCTURED)
+    structured["warnings"] = ["low_overall_confidence"]
+    structured["validation_thresholds"] = recorded
+    item_id = await _seed_item(
+        db_session,
+        status=KnowledgeItemStatus.NEEDS_REVIEW,
+        structured_data=structured,
+    )
+    async with client:
+        resp = await client.get(f"/api/v1/knowledge-items/{item_id}")
+    assert resp.status_code == 200, resp.text
+    ki = resp.json()["knowledge_item"]
+    assert ki["review_thresholds"]["source"] == "recorded"
+    assert ki["review_thresholds"]["overall"] == 0.123
+    assert ki["review_reasons"][0]["threshold"] == 0.123

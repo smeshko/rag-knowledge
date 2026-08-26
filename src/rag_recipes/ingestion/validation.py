@@ -19,7 +19,7 @@ and the caller see every reason a candidate was dropped.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 
 from rag_recipes.ingestion.pipeline.extraction import ExtractedRecipe
 from rag_recipes.ingestion.pipeline.windows import Window
@@ -203,6 +203,30 @@ class SoftValidationThresholds:
     assembly_min_ingredients: int
     assembly_max_ingredients: int
     assembly_max_chars: int
+
+    def to_record(self) -> dict[str, float | int]:
+        """The snapshot persisted as ``structured_data["validation_thresholds"]``.
+
+        Thresholds are tunables (doc 11 §5) and so drift; the reasons an item
+        carries were judged against the values in force *then*. Recording them
+        with the item (doc 11 §6: make what changed visible) lets the review
+        surface show the bound that actually fired instead of today's.
+        """
+        return dict(asdict(self))
+
+    @classmethod
+    def from_record(cls, record: object) -> SoftValidationThresholds | None:
+        """Rebuild from a persisted snapshot; ``None`` if absent or malformed.
+
+        Legacy rows (persisted before the snapshot existed) have no record and
+        fall back to the current Settings at read time.
+        """
+        if not isinstance(record, dict):
+            return None
+        try:
+            return cls(**{f.name: record[f.name] for f in fields(cls)})
+        except (KeyError, TypeError):
+            return None
 
 
 def _is_assembly_recipe(
