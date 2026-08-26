@@ -41,7 +41,7 @@ __all__ = ["OpenAIEmbeddingProvider"]
 # symbol-heavy) and could still pack an over-limit request; the byte bound is safe
 # across all scripts at the cost of over-splitting plain ASCII. It only governs how
 # inputs are packed into requests — it never touches returned vectors.
-_MAX_TOKENS_PER_INPUT = 8192
+MAX_TOKENS_PER_INPUT = 8192
 _MAX_TOKENS_PER_REQUEST = 300_000
 
 
@@ -199,10 +199,10 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             # earlier paid chunks.
             for i in non_empty_indices:
                 est = self._token_upper_bound(texts[i])
-                if est > _MAX_TOKENS_PER_INPUT:
+                if est > MAX_TOKENS_PER_INPUT:
                     raise EmbeddingTechnicalError(
                         f"input {i} is ~{est} tokens, exceeding the "
-                        f"{_MAX_TOKENS_PER_INPUT}-token per-input limit"
+                        f"{MAX_TOKENS_PER_INPUT}-token per-input limit"
                     )
             vectors: dict[int, list[float]] = {}
             # Aggregate token usage across internal chunks so the single batch

@@ -30,6 +30,20 @@ matching ``pipeline/pdf_text._sha256_text``.
 The per-type text resolution itself lives in ``pipeline/composition`` (Epic
 22.1), shared with the ``body_text`` rebuild an edit performs, so the chunked
 text and the stored ``body_text`` cannot drift apart.
+
+**Size cap.** A chunk is an embedding input, and every embedding backend caps a
+single input. Nothing here used to bound chunk text, so a long enough recipe
+produced a chunk the embedder had to reject -- and because that rejection is a
+whole-request failure, one oversized chunk failed its entire document at the
+embedding stage (a 10,434-byte gluten-free croissant recipe did exactly that,
+with the next-largest chunk in the same book landing one byte under the limit).
+``build_chunks`` now splits any over-cap text into consecutive same-type chunks
+instead. Splitting rather than truncating keeps every word retrievable; the
+alternative silently drops the tail of long recipes and lets chunk text drift
+from the ``body_text`` it was composed from. Parts are cut on paragraph, then
+line, then character boundaries -- never mid-codepoint -- and carry ``part`` /
+``part_count`` metadata. Items under the cap are unaffected and still yield
+exactly one chunk per type.
 """
 
 from __future__ import annotations
@@ -49,14 +63,93 @@ from rag_recipes.storage.enums import ChunkParentType, ChunkType, KnowledgeItemS
 from rag_recipes.storage.models.chunk import Chunk
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
-__all__ = ["build_chunks", "persist_chunks_for_ready_items"]
+__all__ = ["MAX_CHUNK_BYTES", "build_chunks", "persist_chunks_for_ready_items"]
+
+# Budget for one chunk's text, in UTF-8 bytes. The OpenAI embedding provider
+# bounds an input's token count by its UTF-8 byte length (cl100k_base is
+# byte-level BPE, so tokens can never exceed bytes) and rejects anything over
+# 8192. We cap below that rather than at it: the margin absorbs the provider's
+# per-input accounting without this module having to import a provider constant,
+# which would couple the pure chunking stage to one backend.
+MAX_CHUNK_BYTES = 8000
 
 
 def _sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
+def _byte_len(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+
+def _hard_split(text: str, max_bytes: int) -> list[str]:
+    """Split on character boundaries when a single line still exceeds the cap.
+
+    Accumulates codepoints and measures the encoded length, so a multi-byte
+    character is never cut in half.
+    """
+    parts: list[str] = []
+    current = ""
+    current_bytes = 0
+    for ch in text:
+        ch_bytes = _byte_len(ch)
+        if current and current_bytes + ch_bytes > max_bytes:
+            parts.append(current)
+            current = ""
+            current_bytes = 0
+        current += ch
+        current_bytes += ch_bytes
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _pack(segments: list[str], joiner: str, max_bytes: int) -> list[str]:
+    """Greedily join segments into runs that each fit the byte budget.
+
+    A segment that does not fit on its own is yielded alone, for the caller to
+    break down further.
+    """
+    parts: list[str] = []
+    current = ""
+    for segment in segments:
+        candidate = segment if not current else current + joiner + segment
+        if current and _byte_len(candidate) > max_bytes:
+            parts.append(current)
+            current = segment
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _split_text(text: str, max_bytes: int) -> list[str]:
+    """Break ``text`` into consecutive pieces that each fit ``max_bytes``.
+
+    Prefers the largest natural boundary that works -- paragraphs, then lines,
+    then characters -- so a split lands between steps or ingredients rather than
+    mid-sentence wherever the text allows it.
+    """
+    if _byte_len(text) <= max_bytes:
+        return [text]
+
+    out: list[str] = []
+    for block in _pack(text.split("\n\n"), "\n\n", max_bytes):
+        if _byte_len(block) <= max_bytes:
+            out.append(block)
+            continue
+        for line_run in _pack(block.split("\n"), "\n", max_bytes):
+            if _byte_len(line_run) <= max_bytes:
+                out.append(line_run)
+            else:
+                out.extend(_hard_split(line_run, max_bytes))
+    return [p for p in out if p.strip()]
+
+
+def build_chunks(
+    item: KnowledgeItem, *, category: str, max_bytes: int = MAX_CHUNK_BYTES
+) -> list[Chunk]:
     """Build the canonical recipe chunks for a ``READY`` ``KnowledgeItem``.
 
     Returns up to five ``Chunk`` instances in canonical order
@@ -66,6 +159,11 @@ def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
     ``NEEDS_REVIEW`` / ``SUPERSEDED`` items produce no chunks. ``category`` is
     injected by the caller (it lives on ``Document``); ``build_chunks`` never
     loads ``item.document``.
+
+    A type whose text exceeds ``max_bytes`` (UTF-8) yields several consecutive
+    chunks of that same type instead of one, so an item can return more than
+    five chunks. Ordering is still canonical, with a split type's parts adjacent
+    and in reading order.
     """
     if item.status is not KnowledgeItemStatus.READY:
         return []
@@ -93,22 +191,30 @@ def build_chunks(item: KnowledgeItem, *, category: str) -> list[Chunk]:
     for chunk_type, text in candidates:
         if not is_present(text):
             continue
-        chunks.append(
-            Chunk(
-                document_id=item.document_id,
-                parent_type=ChunkParentType.KNOWLEDGE_ITEM,
-                parent_id=item.id,
-                chunk_type=chunk_type,
-                text=text,
-                text_hash=_sha256_text(text),
-                source_span_ids=list(item.source_span_ids),
-                chunk_metadata={
-                    "category": category,
-                    "item_type": item.item_type,
-                    "title": item.title,
-                },
+        parts = _split_text(text, max_bytes)
+        for index, part in enumerate(parts):
+            metadata: dict[str, object] = {
+                "category": category,
+                "item_type": item.item_type,
+                "title": item.title,
+            }
+            # Only stamped on split types, so an under-cap item's metadata is
+            # byte-identical to what it was before the cap existed.
+            if len(parts) > 1:
+                metadata["part"] = index + 1
+                metadata["part_count"] = len(parts)
+            chunks.append(
+                Chunk(
+                    document_id=item.document_id,
+                    parent_type=ChunkParentType.KNOWLEDGE_ITEM,
+                    parent_id=item.id,
+                    chunk_type=chunk_type,
+                    text=part,
+                    text_hash=_sha256_text(part),
+                    source_span_ids=list(item.source_span_ids),
+                    chunk_metadata=metadata,
+                )
             )
-        )
     return chunks
 
 

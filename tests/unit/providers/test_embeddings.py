@@ -263,7 +263,7 @@ async def test_embed_batch_rejects_oversized_input_before_any_call(
 ) -> None:
     # A single over-limit input is rejected in preflight, naming its slot, with
     # no API call spent (so earlier chunks in a real batch aren't paid-for then lost).
-    monkeypatch.setattr(openai_provider, "_MAX_TOKENS_PER_INPUT", 4)
+    monkeypatch.setattr(openai_provider, "MAX_TOKENS_PER_INPUT", 4)
     fake = _client()
     provider = _provider(fake=fake)
     with pytest.raises(EmbeddingTechnicalError, match="input 1 is .* per-input limit"):
@@ -292,7 +292,7 @@ async def test_token_bound_counts_multibyte_text_by_bytes(
     # Token-dense input: 4 CJK chars = 12 UTF-8 bytes. A char/4 average would
     # estimate ~1 token and pass a 6-token limit; the byte upper bound rejects it,
     # so token-dense text can't slip an over-limit request past preflight.
-    monkeypatch.setattr(openai_provider, "_MAX_TOKENS_PER_INPUT", 6)
+    monkeypatch.setattr(openai_provider, "MAX_TOKENS_PER_INPUT", 6)
     fake = _client()
     provider = _provider(fake=fake)
     with pytest.raises(EmbeddingTechnicalError, match="per-input limit"):

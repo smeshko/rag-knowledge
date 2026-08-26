@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from rag_recipes.ingestion.pipeline.chunking import build_chunks
+from rag_recipes.ingestion.pipeline.chunking import MAX_CHUNK_BYTES, build_chunks
 from rag_recipes.storage.enums import ChunkParentType, ChunkType, KnowledgeItemStatus
 from rag_recipes.storage.models.knowledge_item import KnowledgeItem
 
@@ -156,9 +156,7 @@ def test_text_hash_is_sha256_of_text_and_deterministic() -> None:
     for chunk in first:
         assert chunk.text_hash == hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
     # Deterministic across calls: same text → same hash, per chunk type.
-    assert {c.chunk_type: c.text_hash for c in first} == {
-        c.chunk_type: c.text_hash for c in second
-    }
+    assert {c.chunk_type: c.text_hash for c in first} == {c.chunk_type: c.text_hash for c in second}
 
 
 def test_chunk_fields_match_parent_item() -> None:
@@ -180,3 +178,80 @@ def test_metadata_block_is_populated() -> None:
             "item_type": "recipe",
             "title": "Tomato and White Bean Soup",
         }
+
+
+# --- size cap (oversized chunk splitting) -----------------------------------
+#
+# One over-cap chunk used to fail its whole document at the embedding stage,
+# because an embedding request rejects wholesale on a single over-limit input.
+
+
+def _bytes(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+
+def test_text_under_the_cap_is_not_split() -> None:
+    chunks = build_chunks(_make_item(), category=CATEGORY)
+    assert len(chunks) == 5
+    assert all("part" not in c.chunk_metadata for c in chunks)
+
+
+def test_oversized_text_splits_into_several_chunks_of_the_same_type() -> None:
+    body = "\n\n".join(f"Paragraph {i} " + "word " * 200 for i in range(20))
+    chunks = build_chunks(_make_item(body_text=body), category=CATEGORY)
+    full = [c for c in chunks if c.chunk_type is ChunkType.RECIPE_FULL]
+    assert len(full) > 1
+    assert all(_bytes(c.text) <= MAX_CHUNK_BYTES for c in full)
+
+
+def test_split_parts_are_contiguous_and_lossless() -> None:
+    body = "\n\n".join(f"Step {i}: " + "cook " * 300 for i in range(12))
+    chunks = build_chunks(_make_item(body_text=body), category=CATEGORY)
+    full = [c for c in chunks if c.chunk_type is ChunkType.RECIPE_FULL]
+    rejoined = "".join(c.text for c in full)
+    assert rejoined.replace("\n", "") == body.replace("\n", "")
+
+
+def test_split_parts_carry_part_metadata_in_order() -> None:
+    body = "\n\n".join("x" * 3000 for _ in range(5))
+    chunks = build_chunks(_make_item(body_text=body), category=CATEGORY)
+    full = [c for c in chunks if c.chunk_type is ChunkType.RECIPE_FULL]
+    count = len(full)
+    assert [c.chunk_metadata["part"] for c in full] == list(range(1, count + 1))
+    assert all(c.chunk_metadata["part_count"] == count for c in full)
+
+
+def test_split_never_cuts_a_multibyte_character() -> None:
+    body = "é" * 12000
+    chunks = build_chunks(_make_item(body_text=body), category=CATEGORY)
+    full = [c for c in chunks if c.chunk_type is ChunkType.RECIPE_FULL]
+    assert len(full) > 1
+    assert all(_bytes(c.text) <= MAX_CHUNK_BYTES for c in full)
+    assert "".join(c.text for c in full) == body
+
+
+def test_a_single_unbroken_line_over_the_cap_still_splits() -> None:
+    body = "z" * 20000
+    chunks = build_chunks(_make_item(body_text=body), category=CATEGORY)
+    full = [c for c in chunks if c.chunk_type is ChunkType.RECIPE_FULL]
+    assert len(full) == 3
+    assert all(_bytes(c.text) <= MAX_CHUNK_BYTES for c in full)
+
+
+def test_each_split_part_hashes_its_own_text() -> None:
+    # Distinct content per block: identical parts SHOULD collide, since the hash
+    # is content-addressed, so unique blocks are what makes this assertion mean
+    # "the hash follows the part" rather than "the parts happen to differ".
+    body = "\n\n".join(f"block{i} " + "y" * 3000 for i in range(5))
+    chunks = build_chunks(_make_item(body_text=body), category=CATEGORY)
+    full = [c for c in chunks if c.chunk_type is ChunkType.RECIPE_FULL]
+    assert len(full) > 1
+    for c in full:
+        assert c.text_hash == hashlib.sha256(c.text.encode("utf-8")).hexdigest()
+    assert len({c.text_hash for c in full}) == len(full)
+
+
+def test_cap_is_below_the_embedding_providers_per_input_limit() -> None:
+    from rag_recipes.providers.embeddings.openai import MAX_TOKENS_PER_INPUT
+
+    assert MAX_CHUNK_BYTES <= MAX_TOKENS_PER_INPUT
