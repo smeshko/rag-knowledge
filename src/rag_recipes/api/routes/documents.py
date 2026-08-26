@@ -615,6 +615,23 @@ async def delete_document(
             message="Document is not in a terminal state.",
             details={"document_id": document_id, "status": document.status.value},
         )
+    # The handwritten shelf is one document holding every hand-typed recipe;
+    # one 204 here would drop all of them. Recipes on it are removed one at a
+    # time through DELETE /knowledge-items/{item_id}. Same refusal shape as the
+    # reprocess guard: permanent, so 400 rather than 409.
+    if document.source_type is SourceType.MANUAL:
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message=(
+                "The handwritten shelf cannot be deleted as a whole; "
+                "delete its recipes individually."
+            ),
+            details={
+                "document_id": document_id,
+                "source_type": document.source_type.value,
+            },
+        )
 
     deletion = await DocumentRepository(session).delete_document_cascade(document_id)
     # The row is locked and was just found — the cascade cannot miss it.
@@ -784,6 +801,22 @@ async def reprocess_document(
             code=ErrorCode.DOCUMENT_NOT_FOUND,
             message=f"Document {document_id!r} not found.",
             details={"document_id": document_id},
+        )
+    # Before the status transition, because this refusal is permanent rather
+    # than a matter of timing: a MANUAL document is the handwritten shelf, and
+    # there is no PDF to re-extract. Requeuing one would run the pipeline over
+    # nothing, land the document FAILED, and — on the new-source-version path —
+    # supersede every hand-typed recipe on it in favour of a generation with no
+    # items. 400, not 409: waiting does not make it possible.
+    if document.source_type is SourceType.MANUAL:
+        raise ApiError(
+            status_code=400,
+            code=ErrorCode.INVALID_REQUEST,
+            message="Hand-written recipes have no source to reprocess.",
+            details={
+                "document_id": document_id,
+                "source_type": document.source_type.value,
+            },
         )
     previous = document.active_source_version
 

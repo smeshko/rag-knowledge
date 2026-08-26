@@ -7,6 +7,13 @@ from enum import StrEnum
 
 class SourceType(StrEnum):
     PDF = "pdf"
+    # A source with no file behind it: the handwritten shelf, whose one
+    # SourceAsset row exists only to satisfy documents.asset_id and whose
+    # knowledge items are typed by a human rather than extracted. Load-bearing
+    # beyond provenance — ``POST /documents/{id}/reprocess`` refuses a MANUAL
+    # document, because re-extracting a book with no PDF would supersede every
+    # hand-typed recipe in it with nothing.
+    MANUAL = "manual"
 
 
 class UploadStatus(StrEnum):

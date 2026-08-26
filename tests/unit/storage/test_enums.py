@@ -28,7 +28,9 @@ from rag_recipes.storage.models import (  # noqa: F401 — register tables on Ba
 
 def test_source_type_members() -> None:
     assert issubclass(SourceType, StrEnum)
-    assert {member.value for member in SourceType} == {"pdf"}
+    # "manual" is the handwritten shelf: a Document with no file behind it,
+    # whose items are typed rather than extracted (ingestion/manual.py).
+    assert {member.value for member in SourceType} == {"pdf", "manual"}
 
 
 def test_upload_status_members() -> None:

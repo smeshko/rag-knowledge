@@ -137,7 +137,7 @@ def test_debug_routes_stay_out_of_the_schema() -> None:
     paths = set(openapi["paths"])
     assert not any("extraction-runs" in p for p in paths)
     assert not any("source-spans" in p for p in paths)
-    # Baseline: 15 documented paths / 20 operations (GET+POST on /documents;
+    # Baseline: 16 documented paths / 21 operations (GET+POST on /documents;
     # GET+DELETE on /documents/{document_id} since Phase 21.2's delete route;
     # +1/+1 for Phase 21.3's GET /review-items and +1/+1 for its POST
     # /knowledge-items/{item_id}/review; +0/+1 for Phase 22.2's PATCH, which
@@ -146,15 +146,17 @@ def test_debug_routes_stay_out_of_the_schema() -> None:
     # per-recipe DELETE /knowledge-items/{item_id}, which shares that path;
     # +1/+1 for POST /menus, the multi-course menu endpoint; +1/+1 for the
     # favourites listing GET /favourites and +1/+2 for PUT and DELETE on
-    # /knowledge-items/{item_id}/favourite, which share one path).
-    assert len(paths) == 15
+    # /knowledge-items/{item_id}/favourite, which share one path; +1/+1 for the
+    # manual POST /knowledge-items, which is its own collection path rather than
+    # a second operation on the item path).
+    assert len(paths) == 16
     operations = sum(
         1
         for item in openapi["paths"].values()
         for method in _HTTP_METHODS
         if method in item
     )
-    assert operations == 20
+    assert operations == 21
 
 
 def test_204_no_content_operation_is_exempted_not_failed() -> None:

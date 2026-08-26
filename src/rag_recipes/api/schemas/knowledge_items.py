@@ -83,6 +83,74 @@ class KnowledgeItemResponse(BaseModel):
     source_citations: list[KnowledgeItemSourceCitation]
 
 
+def _reject_blank_lines(value: list[str] | None) -> list[str] | None:
+    """A blank line would violate the ingest-time non-empty ``raw_text`` rule.
+
+    Rejected rather than silently dropped: dropping a line the author can still
+    see in the form is the kind of surprise that costs trust. Shared by the
+    update and create requests so the two cannot disagree about what a usable
+    line is.
+    """
+    if value is not None and any(not line.strip() for line in value):
+        raise ValueError("lines must not be blank")
+    return value
+
+
+class KnowledgeItemCreateRequest(BaseModel):
+    """A recipe a human typed rather than one an extractor found.
+
+    The create-side twin of ``KnowledgeItemUpdateRequest``, with deliberately
+    the same field set and the same rules — a recipe you can author is exactly
+    a recipe you can correct, and a field that appears here but not there would
+    be one nobody could ever fix.
+
+    Two differences, both forced by there being no existing row:
+
+    - ``title`` is required, not optional. Absent means nothing to leave alone.
+    - the two lists default to empty rather than to absent. Whole-array
+      replacement has no "unchanged" to express on a row that does not exist
+      yet, so an omitted list is an empty section.
+
+    Same exclusions as the update request, for the same reason: ``confidence``,
+    ``source_span_ids``, ``schema``, ``item_type`` and ``warnings`` are
+    machine-owned provenance. Here the machine that owns them is
+    ``ingestion/manual.authored_recipe``, which derives every one of them from
+    the text below.
+
+    Note what is NOT required: a recipe with no ingredients and no steps is
+    accepted, because ``PATCH`` accepts emptying both and a create rule the edit
+    rule does not share would just be a trap on the way in.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    summary: str | None = None
+    yield_: str | None = Field(default=None, alias="yield")
+    prep_time: str | None = None
+    cook_time: str | None = None
+    total_time: str | None = None
+    ingredients: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+
+    @field_validator("title")
+    @classmethod
+    def _title_must_not_be_blank(cls, value: str) -> str:
+        """``knowledge_items.title`` is NOT NULL and non-empty at ingest, and an
+        untitled recipe is unfindable — the title is its own chunk."""
+        if not value.strip():
+            raise ValueError("title must be a non-empty string")
+        return value
+
+    @field_validator("ingredients", "steps")
+    @classmethod
+    def _lines_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        result = _reject_blank_lines(value)
+        # `value` is non-optional here, so the shared helper cannot return None.
+        assert result is not None
+        return result
+
+
 class KnowledgeItemUpdateRequest(BaseModel):
     """A reviewer's in-place correction of a ``needs_review`` item (Epic 22.2).
 
@@ -136,11 +204,4 @@ class KnowledgeItemUpdateRequest(BaseModel):
     @field_validator("ingredients", "steps")
     @classmethod
     def _lines_must_not_be_blank(cls, value: list[str] | None) -> list[str] | None:
-        """A blank line would violate the ingest-time non-empty ``raw_text`` rule.
-
-        Rejected rather than silently dropped: dropping a line the reviewer can
-        still see in the form is the kind of surprise that costs trust.
-        """
-        if value is not None and any(not line.strip() for line in value):
-            raise ValueError("lines must not be blank")
-        return value
+        return _reject_blank_lines(value)
