@@ -13,6 +13,7 @@ re-exported here as ``KnowledgeItemSummary`` and wrapped by
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 
@@ -71,7 +72,10 @@ class ReviewItem(BaseModel):
 
 
 class ReviewItemListResponse(BaseModel):
-    review_items: list[ReviewItem]
+    # ``Sequence`` (covariant) rather than ``list``: the rows are built once by
+    # ``build_summaries`` as ``KnowledgeItemSummary`` — a field-identical
+    # subclass — and this queue projects them as ``ReviewItem``.
+    review_items: Sequence[ReviewItem]
 
 
 class KnowledgeItemSummary(ReviewItem):
