@@ -105,3 +105,34 @@ favourites, citations — keeps its "item → run → document → asset" chain 
   is produced by the *edit* layer (`apply_edit`, `compose_body_text`,
   `warnings_for_item`), so a typed recipe and an extracted one are validated
   and projected identically.
+
+## 21. A recipe count on each document in the list (2026-11-01, LIFE-28)
+
+**Decision**: `GET /documents` rows carry `knowledge_items: int`, the same
+number `DocumentCounts.knowledge_items` reports on `GET /documents/{id}`: every
+item of the book that is not `rejected`, including `superseded` and in-flight
+(`extracting`, `indexing`) rows.
+
+- **Options**: `ready_items` (ready only, the number the shelf already labels
+  "recipes"); `knowledge_items` (all non-rejected); and a new count equal to
+  what the unfiltered book listing shows (non-superseded, non-rejected).
+- **Why `knowledge_items`**: it is the only option that is the detail field
+  under its own name, so the shelf and the book page are the same aggregate.
+  It is also the closest to the book listing: the two differ only by
+  `superseded` rows, which the listing hides and the count keeps. `ready_items`
+  would drop every `needs_review` recipe, which the listing shows and which is
+  the common case during review. The third option would make the list disagree
+  with the detail for any reprocessed book, which breaks the list-equals-detail
+  rule.
+- **Known gap, accepted**: after a reprocess, a book's count includes its
+  superseded generation, so the shelf can show more than the unfiltered book
+  page. `test_recipe_count_includes_superseded_rows_the_listing_hides` pins this.
+  Changing `DocumentCounts.knowledge_items` to drop superseded rows would close
+  it, but that field's meaning is recorded in the Phase 21.3 D5 comment and is
+  not changed here.
+- **Mechanism**: one grouped `COUNT` over the page's ids replaces the
+  review-only grouping (`pending_review_counts`). It serves both the D3 status
+  derivation and this count, and `count_knowledge_items` delegates to it, so the
+  list and detail cannot diverge by construction. The list costs two statements
+  whatever N is; `test_list_query_count_does_not_grow_with_the_number_of_books`
+  pins that.
