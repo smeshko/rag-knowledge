@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Iterator
 
 import httpx
 import pytest
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag_recipes.api.app import app
@@ -134,7 +135,9 @@ async def test_list_returns_doc_section_3_shape(
         "source_type",
         "status",
         "active_source_version",
+        "knowledge_items",
     }
+    assert item["knowledge_items"] == 0
     assert item["title"] == "Recipe Book"
     assert item["author"] == "Alice"
     assert item["category"] == "recipes"
@@ -506,3 +509,111 @@ async def test_non_terminal_and_failed_statuses_pass_through_underived(
     # Other status filters keep the plain column semantics.
     assert {d["id"] for d in queued_resp.json()["documents"]} == {queued.id}
     assert {d["id"] for d in failed_resp.json()["documents"]} == {failed.id}
+
+
+# ---------------------------------------------------------------------------
+# Recipe count per book (LIFE-28)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_recipe_mix(session: AsyncSession, document: Document) -> None:
+    """Five counted items and one rejected one: 2 ready, 1 needs_review,
+    1 extracting, 1 superseded, 1 rejected."""
+    for status in (
+        KnowledgeItemStatus.READY,
+        KnowledgeItemStatus.READY,
+        KnowledgeItemStatus.NEEDS_REVIEW,
+        KnowledgeItemStatus.EXTRACTING,
+        KnowledgeItemStatus.SUPERSEDED,
+        KnowledgeItemStatus.REJECTED,
+    ):
+        await _seed_item_with_status(session, document=document, status=status)
+
+
+async def _get_list_recording_sql(
+    client: httpx.AsyncClient, session: AsyncSession
+) -> tuple[httpx.Response, list[str]]:
+    """GET the list and return the response with every SQL statement it issued."""
+    statements: list[str] = []
+
+    def _record(*args: object) -> None:
+        statements.append(str(args[2]))
+
+    connection = (await session.connection()).sync_connection
+    event.listen(connection, "before_cursor_execute", _record)
+    try:
+        response = await client.get("/api/v1/documents")
+    finally:
+        event.remove(connection, "before_cursor_execute", _record)
+    return response, statements
+
+
+@pytest.mark.asyncio
+async def test_list_recipe_count_equals_the_detail_count_for_every_book(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    mixed = await _seed_document(db_session, content_hash="hash-rc-1", title="Mixed")
+    await _seed_recipe_mix(db_session, mixed)
+    empty = await _seed_document(db_session, content_hash="hash-rc-2", title="Empty")
+    only_rejected = await _seed_document(
+        db_session, content_hash="hash-rc-3", title="Only rejected"
+    )
+    await _seed_item_with_status(
+        db_session, document=only_rejected, status=KnowledgeItemStatus.REJECTED
+    )
+    async with client:
+        listing = await client.get("/api/v1/documents")
+        details = {
+            doc.id: await client.get(f"/api/v1/documents/{doc.id}")
+            for doc in (mixed, empty, only_rejected)
+        }
+    assert listing.status_code == 200
+    by_id = {d["id"]: d["knowledge_items"] for d in listing.json()["documents"]}
+    for doc_id, detail in details.items():
+        assert detail.status_code == 200
+        assert by_id[doc_id] == detail.json()["counts"]["knowledge_items"]
+    assert by_id == {mixed.id: 5, empty.id: 0, only_rejected.id: 0}
+
+
+@pytest.mark.asyncio
+async def test_recipe_count_includes_superseded_rows_the_listing_hides(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    # Documents the known divergence (DECISIONS.md #21): the count is the detail's
+    # knowledge_items, which keeps superseded rows; the unfiltered book listing
+    # hides them. Rejected rows are excluded from both.
+    book = await _seed_document(db_session, content_hash="hash-sup-1")
+    await _seed_recipe_mix(db_session, book)
+    async with client:
+        listing = await client.get("/api/v1/documents")
+        shelf_count = listing.json()["documents"][0]["knowledge_items"]
+        book_page = await client.get(f"/api/v1/documents/{book.id}/knowledge-items")
+    assert shelf_count == 5
+    shown = {item["status"] for item in book_page.json()["knowledge_items"]}
+    assert "superseded" not in shown
+    assert len(book_page.json()["knowledge_items"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_list_query_count_does_not_grow_with_the_number_of_books(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    first = await _seed_document(db_session, content_hash="hash-qc-1", title="Book 1")
+    await _seed_recipe_mix(db_session, first)
+    async with client:
+        one_book, one_book_sql = await _get_list_recording_sql(client, db_session)
+        for index in range(2, 6):
+            book = await _seed_document(
+                db_session, content_hash=f"hash-qc-{index}", title=f"Book {index}"
+            )
+            await _seed_recipe_mix(db_session, book)
+        several, several_sql = await _get_list_recording_sql(client, db_session)
+    assert one_book.status_code == 200
+    assert several.status_code == 200
+    assert len(one_book.json()["documents"]) == 1
+    assert len(several.json()["documents"]) == 5
+    assert all(d["knowledge_items"] == 5 for d in several.json()["documents"])
+    # Non-vacuous: the listener really saw the page query and the grouped count.
+    assert len(one_book_sql) >= 2, one_book_sql
+    # Constant: a per-book query would add one statement per extra book.
+    assert len(several_sql) == len(one_book_sql), (one_book_sql, several_sql)

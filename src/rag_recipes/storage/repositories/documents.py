@@ -248,26 +248,38 @@ class DocumentRepository:
         result = await self._session.execute(stmt)
         return result.scalars().all()
 
-    async def pending_review_counts(
+    async def knowledge_item_counts_for_documents(
         self, document_ids: Sequence[str]
-    ) -> dict[str, int]:
-        """Count ``needs_review`` items per document for one list page (D3).
+    ) -> dict[str, KnowledgeItemCounts]:
+        """Per-document item counts for a set of books, in one grouped SELECT.
 
-        One grouped SELECT over the page's ids (≤200), riding
-        ``ix_knowledge_items_document_id`` + ``ix_knowledge_items_status``.
-        Documents with no pending items are simply absent from the map.
+        Serves the list page (D3 review derivation and LIFE-28's recipe count)
+        and ``count_knowledge_items`` alike, so a listing row and the detail
+        page cannot disagree about a book. REJECTED is excluded (Phase 21.3 D5).
+        Rides ``ix_knowledge_items_document_id``; the page is <=200 ids. Documents
+        with no counted items are absent from the map.
         """
         if not document_ids:
             return {}
         result = await self._session.execute(
-            select(KnowledgeItem.document_id, func.count())
+            select(KnowledgeItem.document_id, KnowledgeItem.status, func.count())
             .where(
                 KnowledgeItem.document_id.in_(document_ids),
-                KnowledgeItem.status == KnowledgeItemStatus.NEEDS_REVIEW,
+                KnowledgeItem.status != KnowledgeItemStatus.REJECTED,
             )
-            .group_by(KnowledgeItem.document_id)
+            .group_by(KnowledgeItem.document_id, KnowledgeItem.status)
         )
-        return {document_id: count for document_id, count in result.all()}
+        by_document: dict[str, dict[KnowledgeItemStatus, int]] = {}
+        for document_id, status, count in result.all():
+            by_document.setdefault(document_id, {})[status] = count
+        return {
+            document_id: KnowledgeItemCounts(
+                total=sum(by_status.values()),
+                ready=by_status.get(KnowledgeItemStatus.READY, 0),
+                needs_review=by_status.get(KnowledgeItemStatus.NEEDS_REVIEW, 0),
+            )
+            for document_id, by_status in by_document.items()
+        }
 
     async def count_source_spans(self, document_id: str) -> int:
         result = await self._session.execute(
@@ -488,24 +500,11 @@ class DocumentRepository:
         return counts
 
     async def count_knowledge_items(self, document_id: str) -> KnowledgeItemCounts:
-        # Single GROUP BY query — one round-trip for total / ready / needs_review.
-        # Phase 21.3 (plan D5): REJECTED is excluded from the aggregate so
-        # `total` — and therefore DocumentCounts.knowledge_items — drops on
-        # rejection ("excluded from all counts"). superseded/extracting stay in
-        # `total` (pre-existing semantics, untouched).
-        result = await self._session.execute(
-            select(KnowledgeItem.status, func.count())
-            .where(
-                KnowledgeItem.document_id == document_id,
-                KnowledgeItem.status != KnowledgeItemStatus.REJECTED,
-            )
-            .group_by(KnowledgeItem.status)
-        )
-        by_status: dict[KnowledgeItemStatus, int] = {
-            status: count for status, count in result.all()
-        }
-        return KnowledgeItemCounts(
-            total=sum(by_status.values()),
-            ready=by_status.get(KnowledgeItemStatus.READY, 0),
-            needs_review=by_status.get(KnowledgeItemStatus.NEEDS_REVIEW, 0),
+        # Phase 21.3 (plan D5): REJECTED is excluded so `total` — and therefore
+        # DocumentCounts.knowledge_items — drops on rejection ("excluded from all
+        # counts"). superseded/extracting stay in `total` (pre-existing semantics,
+        # untouched). The rule lives in knowledge_item_counts_for_documents.
+        counts = await self.knowledge_item_counts_for_documents([document_id])
+        return counts.get(
+            document_id, KnowledgeItemCounts(total=0, ready=0, needs_review=0)
         )
