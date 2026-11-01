@@ -74,7 +74,15 @@ class BatchUploadResponse(BaseModel):
 
 class DocumentListItem(BaseModel):
     """The doc §3 list item — smaller than ``DocumentResponse`` (no
-    ``asset_id``/``language``/timestamps)."""
+    ``asset_id``/``language``/timestamps).
+
+    ``knowledge_items`` is the book's recipe count (LIFE-28), defined as
+    ``DocumentCounts.knowledge_items`` on the detail endpoint: every item not
+    ``rejected``, including ``superseded`` and in-flight rows. It is the
+    unfiltered ``GET /documents/{id}/knowledge-items`` count except that the
+    listing also hides ``superseded`` rows, so the two differ on a book that has
+    been reprocessed. See DECISIONS.md #21.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -86,6 +94,7 @@ class DocumentListItem(BaseModel):
     source_type: str
     status: str
     active_source_version: int | None
+    knowledge_items: int
 
 
 class DocumentListResponse(BaseModel):

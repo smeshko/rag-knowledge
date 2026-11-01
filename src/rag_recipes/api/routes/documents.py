@@ -64,7 +64,10 @@ from rag_recipes.storage.ids import new_id
 from rag_recipes.storage.models.document import Document
 from rag_recipes.storage.models.extraction_run import ExtractionRun
 from rag_recipes.storage.models.source_asset import SourceAsset
-from rag_recipes.storage.repositories.documents import DocumentRepository
+from rag_recipes.storage.repositories.documents import (
+    DocumentRepository,
+    KnowledgeItemCounts,
+)
 from rag_recipes.storage.repositories.failures import FailuresRepository
 
 router = APIRouter(tags=["documents"])
@@ -523,20 +526,33 @@ async def list_documents(
         limit=limit_int,
         offset=offset_int,
     )
-    # Read-time review derivation (D3): one grouped count over the page's ids;
-    # only `status` is overridden, every other field byte-identical.
-    pending_counts = await repo.pending_review_counts([doc.id for doc in documents])
+    # One grouped count over the page's ids, however many books it holds (D3
+    # review derivation and the LIFE-28 recipe count share it), so the list
+    # costs two queries whatever N is.
+    item_counts = await repo.knowledge_item_counts_for_documents(
+        [doc.id for doc in documents]
+    )
     return DocumentListResponse(
-        documents=[
-            DocumentListItem.model_validate(doc).model_copy(
-                update={
-                    "status": _derived_status(
-                        doc.status, pending_counts.get(doc.id, 0)
-                    )
-                }
-            )
-            for doc in documents
-        ],
+        documents=[_list_item(doc, item_counts.get(doc.id)) for doc in documents],
+    )
+
+
+def _list_item(
+    document: Any, item_counts: KnowledgeItemCounts | None
+) -> DocumentListItem:
+    """Project one list row. Read-time review derivation (D3) overrides only
+    ``status``; a book with no counted items has no entry in the count map."""
+    counts = item_counts or KnowledgeItemCounts(total=0, ready=0, needs_review=0)
+    return DocumentListItem(
+        id=document.id,
+        category=document.category,
+        subcategory=document.subcategory,
+        title=document.title,
+        author=document.author,
+        source_type=document.source_type,
+        status=_derived_status(document.status, counts.needs_review),
+        active_source_version=document.active_source_version,
+        knowledge_items=counts.total,
     )
 
 
